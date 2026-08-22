@@ -1,0 +1,31 @@
+# Add to ~/.zshrc or ~/.bashrc
+export DOCKER_HOME="$HOME/docker"
+
+# Jump to docker home
+alias dhome='cd $DOCKER_HOME'
+
+# Jump to specific app and optionally run command
+d() {
+  if [ -z "$1" ]; then
+    cd "$DOCKER_HOME" && ls -la
+    return
+  fi
+
+  cd "$DOCKER_HOME/$1" || return
+
+  # If second argument provided, run docker compose command
+  if [ -n "$2" ]; then
+    shift
+    docker compose "$@"
+  fi
+}
+
+# Quick docker compose commands (run from app directory)
+alias dcu='docker compose up -d'
+alias dcdown='docker compose down'
+alias dcl='docker compose logs -f'
+alias dcp='docker compose pull'
+alias dcr='docker compose restart'
+
+# List all docker apps
+dls() { ls -1 "$DOCKER_HOME"; }

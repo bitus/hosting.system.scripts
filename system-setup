@@ -1,0 +1,2382 @@
+#!/usr/bin/env bash
+#
+# system-setup - basic configuration for freshly deployed Debian 12 VMs
+#
+# Spec: 01-system-setup-Description.md
+# Plan: 10-Implementation-Plan.md
+#
+# Build state: phases 0-5 complete (skeleton, helpers, validation layer,
+# router + help, pre-checks/elevate/host-facts, cmd_tz), plus the full
+# argument-parsing and validation layer for every command. Command bodies
+# for ip/hdd/docker/ntp/file/setup land in phases 6-13.
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# ---------------------------------------------------------------------------
+# 2. Constants
+# ---------------------------------------------------------------------------
+
+# shellcheck disable=SC2034  # E_OK documents the full exit-code space; success needs no explicit exit
+readonly E_OK=0 E_PRECHECK=1 E_ARGS=2 E_IO=3 E_EXISTS=4 E_NOTFOUND=5
+
+readonly IFACE="ens192"
+readonly INTERFACES_FILE="/etc/network/interfaces"
+readonly INTERFACES_DIR="/etc/network/interfaces.d"
+readonly HOSTS_FILE="/etc/hosts"
+readonly RESOLV_FILE="/etc/resolv.conf"
+readonly RESOLV_HEAD="/etc/resolv.conf.head"
+readonly FSTAB_FILE="/etc/fstab"
+readonly TIMESYNCD_FILE="/etc/systemd/timesyncd.conf"
+readonly TIMESYNCD_BAK="/etc/systemd/timesyncd.conf.bak"
+readonly DOCKER_DAEMON_FILE="/etc/docker/daemon.json"
+readonly SYSCTL_IPV6_FILE="/etc/sysctl.d/99-system-setup-ipv6.conf"
+readonly SHORTCUTS_NAME="docker-shortcuts"
+readonly ZONEINFO_DIR="/usr/share/zoneinfo"
+
+readonly DEFAULT_DEVICE="/dev/sdb"
+readonly DEFAULT_MOUNT="/data"
+readonly DEFAULT_FSTYPE="ext4"
+readonly DEFAULT_MASK_BITS=24
+readonly DEFAULT_POOL_SIZE=24
+readonly GATEWAY_LAST_OCTET=254
+readonly MASK_MIN_BITS=8
+readonly MASK_MAX_BITS=30
+
+# Arrays, not space-separated strings: this script's IFS is $'\n\t', so an
+# unquoted "$DOCKER_PKGS" would NOT word-split on spaces and apt would be
+# handed one long nonexistent package name.
+readonly -a DOCKER_PKGS=(docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin)
+readonly -a DOCKER_CONFLICTS=(docker.io docker-doc docker-compose podman-docker containerd runc)
+readonly DOCKER_GPG_URL="https://download.docker.com/linux/debian/gpg"
+readonly DOCKER_REPO_URL="https://download.docker.com/linux/debian"
+readonly DOCKER_KEYRING="/etc/apt/keyrings/docker.asc"
+readonly DOCKER_SOURCES="/etc/apt/sources.list.d/docker.list"
+
+declare -A DEP_PACKAGE=(
+    [jq]="jq"
+    [realpath]="coreutils"
+    [sfdisk]="util-linux"
+    [blkid]="util-linux"
+    [mkfs.ext4]="e2fsprogs"
+    [mkfs.xfs]="xfsprogs"
+    [mkfs.vfat]="dosfstools"
+    [mkfs.ntfs]="ntfs-3g"
+)
+
+# Filesystem table, keyed by the --type value, so cmd_hdd has one flow.
+# MKFS_FORCE for ntfs is "-F -f": -F forces, -f is fast-format (skip the
+# full zeroing pass). They come from different concerns despite looking alike.
+declare -A MKFS_CMD=(   [ext4]="mkfs.ext4" [xfs]="mkfs.xfs" [vfat]="mkfs.vfat" [ntfs]="mkfs.ntfs" )
+declare -A MKFS_FORCE=( [ext4]="-F"        [xfs]="-f"       [vfat]=""          [ntfs]="-F -f"    )
+declare -A FSTAB_TYPE=( [ext4]="ext4"      [xfs]="xfs"      [vfat]="vfat"      [ntfs]="ntfs3"    )
+declare -A FSTAB_OPTS=(
+    [ext4]="defaults,nofail"
+    [xfs]="defaults,nofail"
+    [vfat]="defaults,nofail,umask=0022"
+    [ntfs]="defaults,nofail"
+)
+declare -A FSTAB_PASS=( [ext4]="2" [xfs]="2" [vfat]="0" [ntfs]="0" )
+
+VERBOSE=0
+FORCE=0
+declare -a ORIG_ARGS=()
+declare -a CLEANUP_TMPFILES=()
+
+# Resolved real path of this script, taken before any directory change.
+# realpath is preferred (it resolves the sbin symlink, which is how the
+# docker command finds its sibling docker-shortcuts); the cd/pwd form is a
+# fallback for the rare host without coreutils, and does not follow symlinks.
+if command -v realpath >/dev/null 2>&1; then
+    SELF="$(realpath "${BASH_SOURCE[0]}")"
+else
+    SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")"
+fi
+readonly SELF
+
+# ---------------------------------------------------------------------------
+# 3. Output helpers
+# ---------------------------------------------------------------------------
+
+# Each of these joins "$*" with a local IFS=' '. The global IFS is $'\n\t',
+# and "$*" joins on IFS[0] - so without this a multi-argument `info foo bar`
+# would print across two lines instead of one.
+info() { local IFS=' '; printf '%s\n' "$*"; }
+warn() { local IFS=' '; printf 'warning: %s\n' "$*" >&2; }
+
+debug() {
+    if [ "$VERBOSE" = "1" ]; then
+        local IFS=' '
+        printf 'debug: %s\n' "$*"
+    fi
+    return 0
+}
+
+die() {
+    local code="$1"; shift
+    local IFS=' '
+    printf 'error: %s\n' "$*" >&2
+    exit "$code"
+}
+
+# join_sp <word...> -- join with single spaces.
+# "${array[*]}" joins on IFS[0], and this script's IFS is $'\n\t', so a bare
+# "${array[*]}" would join on a NEWLINE. Always join through this helper.
+join_sp() {
+    local IFS=' '
+    printf '%s' "$*"
+}
+
+confirm() {
+    local prompt="$1" reply
+    if [ "$FORCE" = "1" ]; then
+        return 0
+    fi
+    if [ ! -t 0 ]; then
+        die "$E_ARGS" "confirmation required but stdin is not a TTY (use --force)"
+    fi
+    read -r -p "$prompt [Y/n] " reply || reply=""
+    case "$reply" in
+        [nN]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# 4. File helpers
+# ---------------------------------------------------------------------------
+
+# One process-wide EXIT trap, never a RETURN trap: a `trap ... RETURN` set
+# inside a helper is not reliable across nested function calls in bash. The
+# explicit `return 0` matters too - without it the trap's own exit status can
+# silently override an exit code already set by die().
+cleanup_tmpfiles() {
+    local f
+    for f in ${CLEANUP_TMPFILES[@]+"${CLEANUP_TMPFILES[@]}"}; do
+        rm -f "$f"
+    done
+    return 0
+}
+trap cleanup_tmpfiles EXIT
+
+ensure_trailing_newline() {
+    local file="$1"
+    # The -s guard matters: on an empty file `tail -c1` yields nothing and
+    # `wc -l` returns 0, so without it every fresh file gets a leading blank line.
+    if [ -s "$file" ] && [ "$(tail -c1 "$file" | wc -l)" -eq 0 ]; then
+        printf '\n' >> "$file"
+    fi
+}
+
+atomic_write() {
+    local file="$1" mode="$2" tmp
+    tmp="$(mktemp "${file}.XXXXXX")"
+    CLEANUP_TMPFILES+=("$tmp")
+    cat > "$tmp"
+    chmod "$mode" "$tmp"
+    mv "$tmp" "$file"
+}
+
+block_marker_open() {
+    local id="${1:-}"
+    if [ -n "$id" ]; then
+        printf '# >>> system-setup %s >>>' "$id"
+    else
+        printf '# >>> system-setup >>>'
+    fi
+}
+
+block_marker_close() {
+    local id="${1:-}"
+    if [ -n "$id" ]; then
+        printf '# <<< system-setup %s <<<' "$id"
+    else
+        printf '# <<< system-setup <<<'
+    fi
+}
+
+# block_upsert <file> <sentinel_id> <content>
+# <content> is the full block text, sentinel lines included.
+block_upsert() {
+    local file="$1" sentinel_id="$2" content="$3"
+    local open close_marker tmp mode
+
+    open="$(block_marker_open "$sentinel_id")"
+    close_marker="$(block_marker_close "$sentinel_id")"
+
+    if [ -e "$file" ]; then
+        mode="$(stat -c '%a' "$file")"
+    else
+        : > "$file"
+        mode="644"
+    fi
+    ensure_trailing_newline "$file"
+
+    tmp="$(mktemp "${file}.XXXXXX")"
+    CLEANUP_TMPFILES+=("$tmp")
+
+    if grep -qF "$open" "$file"; then
+        awk -v open="$open" -v close_marker="$close_marker" -v content="$content" '
+            $0 == open { print content; skip=1; next }
+            $0 == close_marker { skip=0; next }
+            skip { next }
+            { print }
+        ' "$file" > "$tmp"
+    else
+        cat "$file" > "$tmp"
+        printf '%s\n' "$content" >> "$tmp"
+    fi
+
+    chmod "$mode" "$tmp"
+    mv "$tmp" "$file"
+}
+
+# block_delete <file> <sentinel_id>  -- silent no-op if the block is absent
+block_delete() {
+    local file="$1" sentinel_id="$2"
+    local open close esc_open esc_close tmp mode
+
+    [ -f "$file" ] || return 0
+
+    open="$(block_marker_open "$sentinel_id")"
+    close="$(block_marker_close "$sentinel_id")"
+    esc_open="$(printf '%s' "$open" | sed 's/[.[\*^$/]/\\&/g')"
+    esc_close="$(printf '%s' "$close" | sed 's/[.[\*^$/]/\\&/g')"
+
+    mode="$(stat -c '%a' "$file")"
+    tmp="$(mktemp "${file}.XXXXXX")"
+    CLEANUP_TMPFILES+=("$tmp")
+
+    sed "/^${esc_open}\$/,/^${esc_close}\$/d" "$file" > "$tmp" \
+        || die "$E_IO" "failed to update $file"
+
+    chmod "$mode" "$tmp"
+    mv "$tmp" "$file"
+}
+
+# backup_once <file> -- pristine backup, written once, never overwritten, so
+# <file>.bak always holds the file as the VM was deployed.
+backup_once() {
+    local file="$1"
+    [ -e "$file" ] || return 0
+    [ -e "$file.bak" ] && return 0
+    debug "backup: $file -> $file.bak"
+    cp -p "$file" "$file.bak" || die "$E_IO" "failed to back up $file"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# 5. Pre-check helpers
+# ---------------------------------------------------------------------------
+
+require_cmds() {
+    local missing=() cmd
+    # Search the sbin directories too. This pre-check deliberately runs BEFORE
+    # elevation, and a non-root PATH on Debian excludes /usr/sbin - where
+    # sfdisk, blkid and the mkfs.* family live. The question is "will this be
+    # available once we are root", not "is it on the invoking user's PATH".
+    # `local PATH` shadows the global and is restored automatically on return.
+    local PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin"
+    for cmd in "$@"; do
+        command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+    done
+    [ "${#missing[@]}" -eq 0 ] && return 0
+
+    local missing_str="" pkgs=() seen="" pkg
+    for cmd in "${missing[@]}"; do
+        if [ -z "$missing_str" ]; then missing_str="$cmd"; else missing_str="$missing_str, $cmd"; fi
+        pkg="${DEP_PACKAGE[$cmd]:-$cmd}"
+        case " $seen " in
+            *" $pkg "*) ;;
+            *) pkgs+=("$pkg"); seen="$seen $pkg" ;;
+        esac
+    done
+    local pkgs_str="" p
+    for p in "${pkgs[@]}"; do
+        if [ -z "$pkgs_str" ]; then pkgs_str="$p"; else pkgs_str="$pkgs_str $p"; fi
+    done
+
+    printf 'error: those commands not available: %s\n' "$missing_str" >&2
+    printf 'please run "sudo apt install %s -y" to install\n' "$pkgs_str" >&2
+    exit "$E_PRECHECK"
+}
+
+require_sudo() {
+    if [ "$EUID" -ne 0 ]; then
+        command -v sudo >/dev/null 2>&1 \
+            || die "$E_PRECHECK" "root privileges required and sudo is not available"
+    fi
+    return 0
+}
+
+# Read-only environment pre-checks for ip/network. All exit 1.
+precheck_net_env() {
+    [ -e "/sys/class/net/$IFACE" ] \
+        || die "$E_PRECHECK" "network interface '$IFACE' not found on this host"
+
+    local f
+    for f in "$INTERFACES_FILE" "$HOSTS_FILE" "$RESOLV_FILE"; do
+        [ -f "$f" ] || die "$E_PRECHECK" "$f not found (this script targets Debian 12 with ifupdown)"
+    done
+
+    # A symlinked resolv.conf means systemd-resolved or resolvconf owns the
+    # file; anything written here would be silently reverted.
+    [ -L "$RESOLV_FILE" ] \
+        && die "$E_PRECHECK" "$RESOLV_FILE is a symlink - a resolver manager (systemd-resolved/resolvconf) owns it"
+
+    # A stanza for our interface under interfaces.d/ would shadow ours.
+    if [ -d "$INTERFACES_DIR" ]; then
+        if grep -rlqE "^[[:space:]]*(iface|auto|allow-hotplug)[[:space:]]+$IFACE\b" "$INTERFACES_DIR" 2>/dev/null; then
+            die "$E_PRECHECK" "$IFACE is already declared under $INTERFACES_DIR - refusing to create a duplicate stanza"
+        fi
+    fi
+    return 0
+}
+
+precheck_timesync() {
+    local p
+    for p in chrony ntpsec ntp; do
+        if pkg_installed "$p"; then
+            die "$E_PRECHECK" "'$p' is installed and conflicts with systemd-timesyncd - remove it first"
+        fi
+    done
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# 6. Privilege elevation
+# ---------------------------------------------------------------------------
+
+# elevate <original argv...> -- re-exec the whole script under sudo.
+# Deliberately NOT used by cmd_setup, which writes ~/.bashrc and must stay
+# as the invoking user.
+elevate() {
+    if [ "$EUID" -eq 0 ]; then
+        return 0
+    fi
+    command -v sudo >/dev/null 2>&1 \
+        || die "$E_PRECHECK" "root privileges required and sudo is not available"
+    debug "re-exec under sudo: $SELF $(join_sp "$@")"
+    exec sudo -- "$SELF" "$@"
+}
+
+# ---------------------------------------------------------------------------
+# 7. Validation layer (pure - no system calls, no output, 0/1 only)
+# ---------------------------------------------------------------------------
+
+ip_valid() {
+    local ip="$1" o
+    [[ "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+    for o in "${BASH_REMATCH[@]:1:4}"; do
+        # Reject leading zeros before any numeric comparison: (( 010 )) is octal.
+        if [ "${#o}" -gt 1 ] && [ "${o:0:1}" = "0" ]; then return 1; fi
+        if [ "$o" -gt 255 ]; then return 1; fi
+    done
+    return 0
+}
+
+# Split without read/IFS: the global IFS is $'\n\t', which does NOT include
+# space, so `read -a` on a space-separated string would not split at all.
+ip_to_int() {
+    local ip="$1" a b c d rest
+    a="${ip%%.*}"; rest="${ip#*.}"
+    b="${rest%%.*}"; rest="${rest#*.}"
+    c="${rest%%.*}"; d="${rest##*.}"
+    printf '%s' "$(( (a << 24) + (b << 16) + (c << 8) + d ))"
+}
+
+int_to_ip() {
+    local n="$1"
+    printf '%d.%d.%d.%d' \
+        "$(( (n >> 24) & 255 ))" "$(( (n >> 16) & 255 ))" \
+        "$(( (n >> 8) & 255 ))" "$(( n & 255 ))"
+}
+
+# mask_to_bits <24|255.255.255.0> -- echoes bits, returns 1 if invalid
+mask_to_bits() {
+    local m="$1" n bits=0 i
+    if [[ "$m" =~ ^[0-9]+$ ]]; then
+        if [ "$m" -lt "$MASK_MIN_BITS" ] || [ "$m" -gt "$MASK_MAX_BITS" ]; then return 1; fi
+        printf '%s' "$m"
+        return 0
+    fi
+    ip_valid "$m" || return 1
+    n="$(ip_to_int "$m")"
+    for (( i = 31; i >= 0; i-- )); do
+        if (( (n >> i) & 1 )); then bits=$(( bits + 1 )); else break; fi
+    done
+    # Reject non-contiguous masks such as 255.0.255.0, which have a plausible
+    # leading-ones count but are not valid masks.
+    if (( n != ( (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF ) )); then return 1; fi
+    if [ "$bits" -lt "$MASK_MIN_BITS" ] || [ "$bits" -gt "$MASK_MAX_BITS" ]; then return 1; fi
+    printf '%s' "$bits"
+}
+
+bits_to_mask() { int_to_ip "$(( (0xFFFFFFFF << (32 - $1)) & 0xFFFFFFFF ))"; }
+
+net_addr() {
+    local ip_i mask_i
+    ip_i="$(ip_to_int "$1")"
+    mask_i="$(ip_to_int "$(bits_to_mask "$2")")"
+    int_to_ip "$(( ip_i & mask_i ))"
+}
+
+bcast_addr() {
+    local ip_i mask_i
+    ip_i="$(ip_to_int "$1")"
+    mask_i="$(ip_to_int "$(bits_to_mask "$2")")"
+    int_to_ip "$(( ip_i | (~mask_i & 0xFFFFFFFF) ))"
+}
+
+same_net() { [ "$(net_addr "$1" "$3")" = "$(net_addr "$2" "$3")" ]; }
+
+# dns_name_valid <name> -- syntactically valid DNS name, 1+ labels.
+# Shape only; never resolves.
+dns_name_valid() {
+    local name="$1" label rest last=""
+    [ -n "$name" ] || return 1
+    [ "${#name}" -le 253 ] || return 1
+    case "$name" in
+        .*|*.|*..*) return 1 ;;
+    esac
+    rest="$name"
+    while [ -n "$rest" ]; do
+        label="${rest%%.*}"
+        if [ "$label" = "$rest" ]; then rest=""; else rest="${rest#*.}"; fi
+        [ "${#label}" -le 63 ] || return 1
+        [[ "$label" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || return 1
+        last="$label"
+    done
+    # An all-digit last label means a malformed IP address, not a name.
+    if [[ "$last" =~ ^[0-9]+$ ]]; then return 1; fi
+    return 0
+}
+
+# fqdn_valid <name> -- dns_name_valid AND at least two labels
+fqdn_valid() {
+    local name="$1"
+    dns_name_valid "$name" || return 1
+    case "$name" in
+        *.*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# cidr_valid <a.b.c.d/bits>
+cidr_valid() {
+    local cidr="$1" addr bits
+    case "$cidr" in
+        */*) ;;
+        *) return 1 ;;
+    esac
+    addr="${cidr%%/*}"
+    bits="${cidr#*/}"
+    ip_valid "$addr" || return 1
+    [[ "$bits" =~ ^[0-9]+$ ]] || return 1
+    if [ "$bits" -lt "$MASK_MIN_BITS" ] || [ "$bits" -gt "$MASK_MAX_BITS" ]; then return 1; fi
+    return 0
+}
+
+tz_valid() {
+    local tz="$1"
+    [ -n "$tz" ] || return 1
+    case "$tz" in
+        /*|*..*) return 1 ;;
+    esac
+    [[ "$tz" =~ ^[A-Za-z0-9_+/-]+$ ]] || return 1
+    [ -f "$ZONEINFO_DIR/$tz" ] || return 1
+    return 0
+}
+
+# pool_size_valid <size_bits> <base_bits>
+pool_size_valid() {
+    local size="$1" base="$2"
+    [[ "$size" =~ ^[0-9]+$ ]] || return 1
+    [ "$size" -ge "$base" ] || return 1
+    [ "$size" -le 30 ] || return 1
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# 8. Host-facts layer (impure - reads live system state, no validation logic)
+# ---------------------------------------------------------------------------
+
+pkg_installed() {
+    dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q "^install ok installed$"
+}
+
+iface_exists() { [ -e "/sys/class/net/$IFACE" ]; }
+
+host_addrs() {
+    ip -4 -o addr show 2>/dev/null | awk '{split($4,a,"/"); print a[1]}'
+}
+
+default_gw() {
+    ip route show default 0.0.0.0/0 2>/dev/null | awk '{print $3; exit}'
+}
+
+static_hostname() { hostnamectl --static 2>/dev/null || true; }
+
+dev_exists() { [ -b "$1" ]; }
+
+part_fstype() { blkid -s TYPE -o value "$1" 2>/dev/null || true; }
+
+part_uuid() { blkid -s UUID -o value "$1" 2>/dev/null || true; }
+
+mount_point_of() { findmnt -nro TARGET -S "$1" 2>/dev/null | head -1 || true; }
+
+user_home() {
+    local u="$1" home
+    home="$(getent passwd "$u" 2>/dev/null | cut -d: -f6)"
+    [ -n "$home" ] || return 1
+    printf '%s' "$home"
+}
+
+docker_installed() {
+    command -v docker >/dev/null 2>&1 && pkg_installed docker-ce
+}
+
+# restart_unit <unit> -- clear any failed state, then restart.
+#
+# systemd rate-limits unit starts (systemd-timesyncd ships StartLimitBurst=5
+# per StartLimitIntervalUSec=10s). Once tripped, the unit sits in
+# Result=start-limit-hit and EVERY later `systemctl restart` fails until the
+# failure is reset. Without the reset, a re-run of this script writes a
+# correct config and then dies on the restart, leaving the daemon dead with
+# valid configuration - time synchronisation silently off. `reset-failed` is
+# a no-op on a healthy unit, so it is always safe to call first.
+restart_unit() {
+    local unit="$1"
+    systemctl reset-failed "$unit" >/dev/null 2>&1 || true
+    systemctl restart "$unit" || die "$E_IO" "failed to restart $unit"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# 10. Commands
+# ---------------------------------------------------------------------------
+
+not_implemented() {
+    die "$E_PRECHECK" "'$1' is not implemented in this build (planned for phase $2)"
+}
+
+# --- ip / network ----------------------------------------------------------
+
+# block_extract <file> <id> -- the sentinel block including its markers
+block_extract() {
+    local file="$1" id="$2" open close
+    [ -f "$file" ] || return 1
+    open="$(block_marker_open "$id")"
+    close="$(block_marker_close "$id")"
+    awk -v open="$open" -v close_marker="$close" '
+        $0 == open { inb = 1 }
+        inb        { print }
+        $0 == close_marker && inb { exit }
+    ' "$file"
+}
+
+ip_interfaces_block() {
+    cat <<EOF
+$(block_marker_open "$IFACE")
+allow-hotplug $IFACE
+iface $IFACE inet static
+  address $IP_ADDR/$IP_BITS
+  gateway $IP_GW
+  dns-domain $IP_DOMAIN
+  dns-nameservers $(join_sp "${IP_DNS[@]}")
+$(block_marker_close "$IFACE")
+EOF
+}
+
+ip_hosts_block() {
+    cat <<EOF
+$(block_marker_open)
+127.0.1.1	$IP_FQDN	$IP_SHORT
+$(block_marker_close)
+EOF
+}
+
+ip_resolv_block() {
+    local out d
+    out="$(block_marker_open)"$'\n'"search $IP_DOMAIN"
+    for d in "${IP_DNS[@]}"; do
+        out="$out"$'\n'"nameserver $d"
+    done
+    printf '%s\n%s\n' "$out" "$(block_marker_close)"
+}
+
+ip_sysctl_content() {
+    cat <<'EOF'
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+EOF
+}
+
+# True when a stanza for $IFACE exists OUTSIDE our sentinel block.
+ip_conflicting_stanza() {
+    awk -v ifc="$IFACE" \
+        -v open="$(block_marker_open "$IFACE")" \
+        -v close_marker="$(block_marker_close "$IFACE")" '
+        $0 == open  { inb = 1; next }
+        $0 == close_marker { inb = 0; next }
+        inb         { next }
+        ($1 == "iface" && $2 == ifc) { found = 1 }
+        ($1 == "auto" || $1 == "allow-hotplug" || $1 == "allow-auto") {
+            for (i = 2; i <= NF; i++) if ($i == ifc) found = 1
+        }
+        END { exit(found ? 0 : 1) }
+    ' "$INTERFACES_FILE"
+}
+
+# Remove every stanza for $IFACE that lives outside our block. Leaving the
+# installer's original stanza in place would hand ifup two competing
+# definitions of the same interface and it would refuse to bring it up.
+#
+# A stanza runs from its keyword line until the next NON-INDENTED line; a
+# blank line ends it too, so separator formatting survives. An `auto` line
+# naming several interfaces is rewritten without ours rather than deleted -
+# deleting `auto lo ens192` wholesale would take the loopback with it.
+ip_strip_iface_stanzas() {
+    local tmp
+    tmp="$(mktemp "${INTERFACES_FILE}.XXXXXX")"
+    CLEANUP_TMPFILES+=("$tmp")
+    awk -v ifc="$IFACE" \
+        -v open="$(block_marker_open "$IFACE")" \
+        -v close_marker="$(block_marker_close "$IFACE")" '
+        $0 == open  { inb = 1; print; next }
+        $0 == close_marker { inb = 0; print; next }
+        inb         { print; next }
+        {
+            if (skip) {
+                if ($0 ~ /^[ \t]/) { next }
+                skip = 0
+            }
+            if ($1 == "iface" && $2 == ifc) { skip = 1; next }
+            if ($1 == "auto" || $1 == "allow-hotplug" || $1 == "allow-auto") {
+                has = 0
+                for (i = 2; i <= NF; i++) if ($i == ifc) has = 1
+                if (has) {
+                    out = $1; kept = 0
+                    for (i = 2; i <= NF; i++) if ($i != ifc) { out = out " " $i; kept++ }
+                    if (kept > 0) print out
+                    next
+                }
+            }
+            print
+        }
+    ' "$INTERFACES_FILE" > "$tmp"
+    cat "$tmp" > "$INTERFACES_FILE"
+}
+
+# Drop 127.0.1.1 lines outside our block, and guarantee a localhost entry.
+ip_strip_hosts_lines() {
+    local tmp
+    tmp="$(mktemp "${HOSTS_FILE}.XXXXXX")"
+    CLEANUP_TMPFILES+=("$tmp")
+    awk -v open="$(block_marker_open)" -v close_marker="$(block_marker_close)" '
+        $0 == open  { inb = 1; print; next }
+        $0 == close_marker { inb = 0; print; next }
+        inb         { print; next }
+        $1 == "127.0.1.1" { next }
+        { print }
+    ' "$HOSTS_FILE" > "$tmp"
+    cat "$tmp" > "$HOSTS_FILE"
+    if ! grep -qE '^[[:space:]]*127\.0\.0\.1[[:space:]]+localhost' "$HOSTS_FILE"; then
+        sed -i '1i 127.0.0.1\tlocalhost' "$HOSTS_FILE"
+    fi
+    return 0
+}
+
+ip_strip_resolv_lines() {
+    local tmp
+    tmp="$(mktemp "${RESOLV_FILE}.XXXXXX")"
+    CLEANUP_TMPFILES+=("$tmp")
+    awk -v open="$(block_marker_open)" -v close_marker="$(block_marker_close)" '
+        $0 == open  { inb = 1; print; next }
+        $0 == close_marker { inb = 0; print; next }
+        inb         { print; next }
+        ($1 == "nameserver" || $1 == "search" || $1 == "domain") { next }
+        { print }
+    ' "$RESOLV_FILE" > "$tmp"
+    cat "$tmp" > "$RESOLV_FILE"
+    return 0
+}
+
+# True when something other than us may regenerate /etc/resolv.conf.
+ip_resolv_is_managed() {
+    if command -v dhcpcd >/dev/null 2>&1; then return 0; fi
+    if command -v dhclient >/dev/null 2>&1; then return 0; fi
+    if pkg_installed resolvconf; then return 0; fi
+    return 1
+}
+
+# Seed /etc/resolv.conf.head so our servers survive any regeneration.
+#
+# dhcpcd and resolvconf rebuild /etc/resolv.conf from resolv.conf.head plus
+# whatever the current lease says, and they do it on EVERY lease change -
+# including the release at shutdown. With --no-restart the interface keeps its
+# lease until the reboot, so that shutdown rewrite lands after our own write
+# and would otherwise leave the rebooted host with a nameserver-less stub:
+# correct address, correct route, no DNS, and no error anywhere.
+#
+# Seeding the head file means our servers come back with the file however and
+# whenever it is regenerated, without having to disturb a running DHCP client
+# - which is exactly what --no-restart promises not to do.
+ip_write_resolv_head() {
+    if ! ip_resolv_is_managed; then
+        return 0
+    fi
+    backup_once "$RESOLV_HEAD"
+    block_upsert "$RESOLV_HEAD" "" "$(ip_resolv_block)"
+    debug "seeded $RESOLV_HEAD"
+    return 0
+}
+
+ip_write_resolv() {
+    debug "rewriting $RESOLV_FILE"
+    ip_strip_resolv_lines
+    block_upsert "$RESOLV_FILE" "" "$(ip_resolv_block)"
+    ip_write_resolv_head
+    return 0
+}
+
+# Release and stop any DHCP client still holding this interface.
+#
+# This exists because of a genuinely silent failure. `systemctl restart
+# networking` tears the interface down using the NEW (static) stanza, so
+# ifupdown has no idea a DHCP client was started by the OLD (dhcp) one. The
+# client therefore SURVIVES the restart, keeps its lease, and rewrites
+# /etc/resolv.conf from its own state - destroying the DNS configuration this
+# command just wrote. After the next reboot the client correctly does not
+# start, but the resolv.conf it left behind has no nameservers at all, so the
+# host ends up with a correct address, a correct route, and no DNS, while the
+# command reports success.
+ip_stop_dhcp_client() {
+    local stopped=0
+    if command -v dhcpcd >/dev/null 2>&1 && pgrep -f "dhcpcd.*$IFACE" >/dev/null 2>&1; then
+        debug "releasing the dhcpcd lease on $IFACE"
+        dhcpcd -k "$IFACE" >/dev/null 2>&1 || true
+        stopped=1
+    fi
+    if command -v dhclient >/dev/null 2>&1 && pgrep -f "dhclient.*$IFACE" >/dev/null 2>&1; then
+        debug "releasing the dhclient lease on $IFACE"
+        dhclient -r "$IFACE" >/dev/null 2>&1 || true
+        stopped=1
+    fi
+    if [ "$stopped" -eq 1 ]; then
+        info "released the DHCP lease on $IFACE"
+    fi
+    return 0
+}
+
+ip_already_configured() {
+    [ "$(block_extract "$INTERFACES_FILE" "$IFACE")" = "$(ip_interfaces_block)" ] || return 1
+    if ip_conflicting_stanza; then return 1; fi
+    [ "$(block_extract "$HOSTS_FILE" "")" = "$(ip_hosts_block)" ] || return 1
+    [ "$(block_extract "$RESOLV_FILE" "")" = "$(ip_resolv_block)" ] || return 1
+    if ip_resolv_is_managed; then
+        [ "$(block_extract "$RESOLV_HEAD" "")" = "$(ip_resolv_block)" ] || return 1
+    fi
+    [ "$(static_hostname)" = "$IP_FQDN" ] || return 1
+    if [ "$IP_NO_IPV6" -eq 1 ]; then
+        [ -f "$SYSCTL_IPV6_FILE" ] || return 1
+        [ "$(cat "$SYSCTL_IPV6_FILE")" = "$(ip_sysctl_content)" ] || return 1
+    fi
+    return 0
+}
+
+# Sets: IP_ADDR IP_BITS IP_MASK IP_GW IP_FQDN IP_SHORT IP_DOMAIN IP_DNS[]
+#       IP_NO_IPV6 IP_NO_RESTART
+ip_resolve() {
+    local pos="" opt_mask="" opt_gw="" opt_host=""
+    local -a opt_dns=()
+    IP_NO_IPV6=0
+    IP_NO_RESTART=0
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_ip; exit "$E_OK" ;;
+            -n|--hostname)
+                [ $# -ge 2 ] || die "$E_ARGS" "--hostname requires a value"
+                opt_host="$2"; shift 2 ;;
+            --hostname=*) opt_host="${1#*=}"; shift ;;
+            -m|--mask)
+                [ $# -ge 2 ] || die "$E_ARGS" "--mask requires a value"
+                opt_mask="$2"; shift 2 ;;
+            --mask=*) opt_mask="${1#*=}"; shift ;;
+            -g|--gateway)
+                [ $# -ge 2 ] || die "$E_ARGS" "--gateway requires a value"
+                opt_gw="$2"; shift 2 ;;
+            --gateway=*) opt_gw="${1#*=}"; shift ;;
+            -d|--dns)
+                [ $# -ge 2 ] || die "$E_ARGS" "--dns requires a value"
+                opt_dns+=("$2"); shift 2 ;;
+            --dns=*) opt_dns+=("${1#*=}"); shift ;;
+            --no-ipv6) IP_NO_IPV6=1; shift ;;
+            --no-restart) IP_NO_RESTART=1; shift ;;
+            --) shift
+                while [ $# -gt 0 ]; do
+                    [ -z "$pos" ] || die "$E_ARGS" "unexpected argument: $1"
+                    pos="$1"; shift
+                done ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *)  [ -z "$pos" ] || die "$E_ARGS" "unexpected argument: $1"
+                pos="$1"; shift ;;
+        esac
+    done
+
+    [ -n "$pos" ] || { help_ip >&2; die "$E_ARGS" "an IP address is required"; }
+    [ -n "$opt_host" ] || { help_ip >&2; die "$E_ARGS" "--hostname is required"; }
+
+    # 1. positional address, optional /bits
+    local suffix_bits=""
+    case "$pos" in
+        */*) IP_ADDR="${pos%%/*}"; suffix_bits="${pos#*/}" ;;
+        *)   IP_ADDR="$pos" ;;
+    esac
+    ip_valid "$IP_ADDR" || die "$E_ARGS" "invalid IP address: '$IP_ADDR'"
+
+    # 2. mask: --mask wins over the /bits suffix, which wins over the default
+    local mask_src=""
+    if [ -n "$opt_mask" ]; then
+        mask_src="$opt_mask"
+    elif [ -n "$suffix_bits" ]; then
+        mask_src="$suffix_bits"
+    else
+        mask_src="$DEFAULT_MASK_BITS"
+    fi
+    IP_BITS="$(mask_to_bits "$mask_src")" \
+        || die "$E_ARGS" "invalid netmask: '$mask_src' (must be contiguous and within /$MASK_MIN_BITS-/$MASK_MAX_BITS)"
+    IP_MASK="$(bits_to_mask "$IP_BITS")"
+
+    # 3. host address must not be the network or broadcast address
+    local net bcast
+    net="$(net_addr "$IP_ADDR" "$IP_BITS")"
+    bcast="$(bcast_addr "$IP_ADDR" "$IP_BITS")"
+    [ "$IP_ADDR" != "$net" ] || die "$E_ARGS" "host IP '$IP_ADDR' is the network address of /$IP_BITS"
+    [ "$IP_ADDR" != "$bcast" ] || die "$E_ARGS" "host IP '$IP_ADDR' is the broadcast address of /$IP_BITS"
+
+    # 4. gateway
+    if [ -n "$opt_gw" ]; then
+        IP_GW="$opt_gw"
+        ip_valid "$IP_GW" || die "$E_ARGS" "invalid gateway: '$IP_GW'"
+    else
+        IP_GW="${IP_ADDR%.*}.$GATEWAY_LAST_OCTET"
+        if [ "$IP_GW" = "$IP_ADDR" ]; then
+            die "$E_ARGS" "default gateway '$IP_GW' collides with the host IP - pass --gateway explicitly"
+        fi
+    fi
+    same_net "$IP_GW" "$IP_ADDR" "$IP_BITS" \
+        || die "$E_ARGS" "gateway '$IP_GW' is not in the host network $net/$IP_BITS"
+    [ "$IP_GW" != "$IP_ADDR" ] || die "$E_ARGS" "gateway '$IP_GW' is the host IP"
+    [ "$IP_GW" != "$net" ] || die "$E_ARGS" "gateway '$IP_GW' is the network address"
+    [ "$IP_GW" != "$bcast" ] || die "$E_ARGS" "gateway '$IP_GW' is the broadcast address"
+
+    # 5. DNS servers - any network, order preserved, duplicates collapsed
+    IP_DNS=()
+    if [ "${#opt_dns[@]}" -eq 0 ]; then
+        IP_DNS=("$IP_GW")
+    else
+        local d seen=""
+        for d in "${opt_dns[@]}"; do
+            ip_valid "$d" || die "$E_ARGS" "invalid DNS server: '$d'"
+            case " $seen " in
+                *" $d "*) warn "duplicate DNS server '$d' ignored"; continue ;;
+            esac
+            seen="$seen $d"
+            IP_DNS+=("$d")
+        done
+    fi
+
+    # 6. hostname
+    fqdn_valid "$opt_host" \
+        || die "$E_ARGS" "invalid hostname: '$opt_host' (must be a fully qualified name including the domain)"
+    IP_FQDN="$opt_host"
+    IP_SHORT="${opt_host%%.*}"
+    IP_DOMAIN="${opt_host#*.}"
+
+    debug "resolved: addr=$IP_ADDR bits=$IP_BITS mask=$IP_MASK gw=$IP_GW"
+    debug "resolved: fqdn=$IP_FQDN short=$IP_SHORT domain=$IP_DOMAIN"
+    debug "resolved: dns=$(join_sp "${IP_DNS[@]}") no_ipv6=$IP_NO_IPV6 no_restart=$IP_NO_RESTART"
+    return 0
+}
+
+ip_print_plan() {
+    info "planned network configuration:"
+    info "  address:   $IP_ADDR/$IP_BITS ($IP_MASK)"
+    info "  gateway:   $IP_GW"
+    info "  dns:       $(join_sp "${IP_DNS[@]}")"
+    info "  domain:    $IP_DOMAIN"
+    info "  hostname:  $IP_FQDN"
+    return 0
+}
+
+cmd_ip() {
+    ip_resolve "$@"
+
+    precheck_net_env
+    require_sudo
+    # Printed AFTER elevation on purpose: the re-exec re-runs this function
+    # from the top, so anything echoed before it appears twice.
+    elevate "${ORIG_ARGS[@]}"
+
+    ip_print_plan
+
+    if ip_already_configured; then
+        info "network already configured"
+        exit "$E_OK"
+    fi
+
+    backup_once "$INTERFACES_FILE"
+    backup_once "$HOSTS_FILE"
+    backup_once "$RESOLV_FILE"
+
+    debug "rewriting $INTERFACES_FILE"
+    ip_strip_iface_stanzas
+    block_upsert "$INTERFACES_FILE" "$IFACE" "$(ip_interfaces_block)"
+
+    debug "rewriting $HOSTS_FILE"
+    ip_strip_hosts_lines
+    block_upsert "$HOSTS_FILE" "" "$(ip_hosts_block)"
+
+    debug "setting static hostname to $IP_FQDN"
+    hostnamectl set-hostname "$IP_FQDN" --static || die "$E_IO" "failed to set the static hostname"
+
+    if [ "$IP_NO_IPV6" -eq 1 ]; then
+        debug "writing $SYSCTL_IPV6_FILE"
+        # Persistent, unlike the old script's `sysctl -w`, which did not
+        # survive a reboot. There is no re-enable path: omitting --no-ipv6
+        # leaves an existing file alone rather than deleting it.
+        ip_sysctl_content | atomic_write "$SYSCTL_IPV6_FILE" 644
+        sysctl --system >/dev/null 2>&1 || warn "sysctl --system reported a problem applying $SYSCTL_IPV6_FILE"
+        info "IPv6 disabled persistently via $SYSCTL_IPV6_FILE"
+    fi
+
+    # /etc/resolv.conf is written LAST, and in the restart path only AFTER the
+    # restart, so that a DHCP client cannot get the last word on it. See
+    # ip_stop_dhcp_client for the failure this prevents.
+    if [ "$IP_NO_RESTART" -eq 1 ]; then
+        ip_write_resolv
+        info "network configuration written"
+        info ""
+        info "NOT restarting networking (--no-restart)."
+        info "Run 'systemctl restart networking' or reboot to apply."
+        info "Until then the interface keeps its current address, and a running"
+        info "DHCP client may still rewrite $RESOLV_FILE; the reboot settles it."
+        return 0
+    fi
+
+    info "network configuration written"
+    warn ""
+    warn "restarting networking NOW - any SSH session on the old address WILL DROP."
+    warn "the host should come back at $IP_ADDR/$IP_BITS"
+
+    ip_stop_dhcp_client
+    systemctl restart networking || die "$E_IO" "failed to restart networking"
+    ip_write_resolv
+
+    info "networking restarted; host is now $IP_FQDN at $IP_ADDR"
+}
+
+# --- hdd -------------------------------------------------------------------
+
+# part_name <device> <n> -- the path of partition <n> on <device>.
+# A device whose name ends in a digit takes a "p" separator (/dev/loop0p1,
+# /dev/nvme0n1p1, /dev/mmcblk0p1); classic sd*/vd* names take the number
+# directly (/dev/sdb1). The spec's flat "<device>1" only holds for the latter.
+part_name() {
+    case "$1" in
+        *[0-9]) printf '%sp%s' "$1" "$2" ;;
+        *)      printf '%s%s'  "$1" "$2" ;;
+    esac
+}
+
+# dev_partitions <device> -- one partition name per line (may be empty)
+dev_partitions() {
+    lsblk -nro NAME,TYPE "$1" 2>/dev/null | awk '$2 == "part" { print $1 }'
+}
+
+# dev_state <device> -- echoes blank | single | unsafe
+#
+# This classification is the guard between a --force typo and somebody's data,
+# so it errs towards "unsafe" whenever the disk is not obviously ours to take.
+dev_state() {
+    local dev="$1" parts n=0
+    parts="$(dev_partitions "$dev")"
+    [ -z "$parts" ] || n="$(printf '%s\n' "$parts" | wc -l)"
+
+    if [ "$n" -gt 1 ]; then printf 'unsafe'; return 0; fi
+
+    if [ "$n" -eq 0 ]; then
+        # A filesystem/RAID/crypto signature written straight to the device
+        # with no partition table: not ours, and not something to overwrite.
+        if blkid -p -u filesystem,raid,crypto "$dev" >/dev/null 2>&1; then
+            printf 'unsafe'; return 0
+        fi
+        printf 'blank'; return 0
+    fi
+
+    printf 'single'
+    return 0
+}
+
+hdd_describe() {
+    local dev="$1" p
+    lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT "$dev" 2>/dev/null || true
+    for p in $(dev_partitions "$dev"); do
+        local m
+        m="$(mount_point_of "/dev/$p")"
+        [ -z "$m" ] || info "  /dev/$p is mounted at $m"
+    done
+    return 0
+}
+
+hdd_partition() {
+    info "creating a single GPT partition spanning $HDD_DEVICE"
+    # Non-interactive by construction. The old script piped bare keystrokes
+    # into fdisk, which was silently sensitive to version and prompt wording.
+    printf 'start=2048, type=linux\n' \
+        | sfdisk --wipe always --label gpt "$HDD_DEVICE" >/dev/null 2>&1 \
+        || die "$E_IO" "sfdisk failed on $HDD_DEVICE"
+    udevadm settle >/dev/null 2>&1 || true
+    return 0
+}
+
+hdd_format() {
+    local part="$1"
+    local -a force_args=()
+    if [ -n "${MKFS_FORCE[$HDD_TYPE]}" ]; then
+        # Local IFS: the global one is $'\n\t' and would not split on spaces.
+        local IFS=' '
+        read -r -a force_args <<< "${MKFS_FORCE[$HDD_TYPE]}"
+    fi
+    info "formatting $part as $HDD_TYPE"
+    "${MKFS_CMD[$HDD_TYPE]}" ${force_args[@]+"${force_args[@]}"} "$part" >/dev/null 2>&1 \
+        || die "$E_IO" "${MKFS_CMD[$HDD_TYPE]} failed on $part"
+    return 0
+}
+
+# Rollback copy for the verification gate, kept SEPARATE from the pristine
+# .bak. backup_once writes .bak only the first time this script ever touches
+# fstab, so on a later run (adding a second disk) .bak predates the first
+# disk's entry - rolling back to it would discard a working configuration.
+HDD_FSTAB_ROLLBACK=""
+
+hdd_fstab_snapshot() {
+    HDD_FSTAB_ROLLBACK="$(mktemp "${FSTAB_FILE}.rollback.XXXXXX")"
+    CLEANUP_TMPFILES+=("$HDD_FSTAB_ROLLBACK")
+    cp -p "$FSTAB_FILE" "$HDD_FSTAB_ROLLBACK"
+    debug "fstab rollback copy: $HDD_FSTAB_ROLLBACK"
+    return 0
+}
+
+hdd_fstab_rollback() {
+    [ -n "$HDD_FSTAB_ROLLBACK" ] && [ -f "$HDD_FSTAB_ROLLBACK" ] || return 0
+    cp -p "$HDD_FSTAB_ROLLBACK" "$FSTAB_FILE"
+    warn "$FSTAB_FILE restored to its state from before this run"
+    return 0
+}
+
+hdd_fstab_write() {
+    local uuid="$1" content tmp
+
+    backup_once "$FSTAB_FILE"
+    hdd_fstab_snapshot
+
+    # Our own block first, so the legacy-line sweep below cannot eat it.
+    block_delete "$FSTAB_FILE" "$HDD_DEVICE"
+
+    # Reconcile: drop any line that refers to this device by PATH, or that
+    # claims our mount point. Device names are not stable across reboots -
+    # that instability is exactly why the replacement keys on UUID.
+    tmp="$(mktemp "${FSTAB_FILE}.XXXXXX")"
+    CLEANUP_TMPFILES+=("$tmp")
+    awk -v dev="$HDD_DEVICE" -v mnt="$HDD_MOUNT" '
+        /^[[:space:]]*#/  { print; next }
+        /^[[:space:]]*$/  { print; next }
+        (index($1, dev) == 1) || ($2 == mnt) { next }
+        { print }
+    ' "$FSTAB_FILE" > "$tmp"
+    cat "$tmp" > "$FSTAB_FILE"
+
+    content="$(block_marker_open "$HDD_DEVICE")
+UUID=$uuid  $HDD_MOUNT  ${FSTAB_TYPE[$HDD_TYPE]}  ${FSTAB_OPTS[$HDD_TYPE]}  0  ${FSTAB_PASS[$HDD_TYPE]}
+$(block_marker_close "$HDD_DEVICE")"
+    block_upsert "$FSTAB_FILE" "$HDD_DEVICE" "$content"
+    return 0
+}
+
+# The gate that makes this command safe to run unattended: never leave an
+# fstab behind that has not been proven mountable.
+hdd_fstab_verify() {
+    if ! findmnt --verify >/dev/null 2>&1; then
+        hdd_fstab_rollback
+        die "$E_IO" "$FSTAB_FILE failed 'findmnt --verify'; no changes kept"
+    fi
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if ! mount -a >/dev/null 2>&1; then
+        hdd_fstab_rollback
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        die "$E_IO" "'mount -a' failed; $FSTAB_FILE restored and no changes kept"
+    fi
+    return 0
+}
+
+hdd_already_configured() {
+    local part="$1" fstype mnt uuid
+    [ "$(dev_state "$HDD_DEVICE")" = "single" ] || return 1
+    fstype="$(part_fstype "$part")"
+    [ "$fstype" = "${FSTAB_TYPE[$HDD_TYPE]}" ] || [ "$fstype" = "$HDD_TYPE" ] || return 1
+    [ "$(mount_point_of "$part")" = "$HDD_MOUNT" ] || return 1
+    uuid="$(part_uuid "$part")"
+    [ -n "$uuid" ] || return 1
+    grep -qF "UUID=$uuid  $HDD_MOUNT  " "$FSTAB_FILE" 2>/dev/null || return 1
+    return 0
+}
+
+cmd_hdd() {
+    local opt_device="$DEFAULT_DEVICE" opt_mount="$DEFAULT_MOUNT" opt_type="$DEFAULT_FSTYPE"
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_hdd; exit "$E_OK" ;;
+            -d|--device)
+                [ $# -ge 2 ] || die "$E_ARGS" "--device requires a value"
+                opt_device="$2"; shift 2 ;;
+            --device=*) opt_device="${1#*=}"; shift ;;
+            -m|--mount)
+                [ $# -ge 2 ] || die "$E_ARGS" "--mount requires a value"
+                opt_mount="$2"; shift 2 ;;
+            --mount=*) opt_mount="${1#*=}"; shift ;;
+            -t|--type)
+                [ $# -ge 2 ] || die "$E_ARGS" "--type requires a value"
+                opt_type="$2"; shift 2 ;;
+            --type=*) opt_type="${1#*=}"; shift ;;
+            -f|--force) FORCE=1; shift ;;
+            --) shift; [ $# -eq 0 ] || die "$E_ARGS" "unexpected argument: $1" ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) die "$E_ARGS" "unexpected argument: $1" ;;
+        esac
+    done
+
+    [ -n "${MKFS_CMD[$opt_type]:-}" ] \
+        || die "$E_ARGS" "invalid --type: '$opt_type' (expected one of: ext4 xfs vfat ntfs)"
+
+    # Normalise the mount point to an absolute path: prepend /, collapse
+    # duplicate slashes, drop any trailing slash.
+    case "$opt_mount" in
+        /*) ;;
+        *) opt_mount="/$opt_mount" ;;
+    esac
+    while [[ "$opt_mount" == *//* ]]; do opt_mount="${opt_mount//\/\//\/}"; done
+    [ "$opt_mount" = "/" ] || opt_mount="${opt_mount%/}"
+    [ "$opt_mount" != "/" ] || die "$E_ARGS" "refusing to use / as the mount point"
+
+    HDD_DEVICE="$opt_device"
+    HDD_MOUNT="$opt_mount"
+    HDD_TYPE="$opt_type"
+    debug "resolved: device=$HDD_DEVICE mount=$HDD_MOUNT type=$HDD_TYPE force=$FORCE"
+
+    require_cmds sfdisk blkid "${MKFS_CMD[$HDD_TYPE]}"
+    require_sudo
+    elevate "${ORIG_ARGS[@]}"
+
+    dev_exists "$HDD_DEVICE" || die "$E_NOTFOUND" "block device '$HDD_DEVICE' not found"
+
+    local part state fstype mnt uuid
+    part="$(part_name "$HDD_DEVICE" 1)"
+    if hdd_already_configured "$part"; then
+        info "hdd already configured: $part ($HDD_TYPE) mounted at $HDD_MOUNT"
+        exit "$E_OK"
+    fi
+
+    state="$(dev_state "$HDD_DEVICE")"
+    debug "device state: $state"
+
+    case "$state" in
+        unsafe)
+            info "$HDD_DEVICE is not in a state this command will modify on its own:"
+            hdd_describe "$HDD_DEVICE"
+            if [ "$FORCE" != "1" ]; then
+                die "$E_EXISTS" "refusing to touch $HDD_DEVICE (re-run with --force to override)"
+            fi
+            confirm "DESTROY ALL DATA on $HDD_DEVICE and reformat it as $HDD_TYPE?" || exit "$E_OK"
+            local p
+            for p in $(dev_partitions "$HDD_DEVICE"); do
+                mnt="$(mount_point_of "/dev/$p")"
+                [ -z "$mnt" ] || umount "/dev/$p" || die "$E_IO" "failed to unmount /dev/$p"
+            done
+            hdd_partition
+            hdd_format "$part"
+            ;;
+        blank)
+            hdd_partition
+            hdd_format "$part"
+            ;;
+        single)
+            fstype="$(part_fstype "$part")"
+            mnt="$(mount_point_of "$part")"
+            debug "partition $part: fstype='${fstype:-none}' mount='${mnt:-none}'"
+
+            if [ "$fstype" = "${FSTAB_TYPE[$HDD_TYPE]}" ] || [ "$fstype" = "$HDD_TYPE" ]; then
+                # Right filesystem. Only the mount point can be wrong.
+                if [ -n "$mnt" ] && [ "$mnt" != "$HDD_MOUNT" ]; then
+                    if [ "$FORCE" != "1" ]; then
+                        die "$E_EXISTS" "$part is mounted at $mnt, not $HDD_MOUNT (re-run with --force to move it)"
+                    fi
+                    confirm "Unmount $part from $mnt and mount it at $HDD_MOUNT instead?" || exit "$E_OK"
+                    umount "$part" || die "$E_IO" "failed to unmount $part"
+                fi
+            else
+                if [ "$FORCE" != "1" ]; then
+                    die "$E_EXISTS" "$part is formatted as '${fstype:-unformatted}', not '$HDD_TYPE' (re-run with --force to reformat)"
+                fi
+                confirm "Reformat $part from '${fstype:-unformatted}' to '$HDD_TYPE'? ALL DATA on it will be destroyed." || exit "$E_OK"
+                if [ -n "$mnt" ]; then
+                    umount "$part" || die "$E_IO" "failed to unmount $part"
+                fi
+                hdd_format "$part"
+            fi
+            ;;
+    esac
+
+    uuid="$(part_uuid "$part")"
+    [ -n "$uuid" ] || die "$E_IO" "could not read a UUID from $part"
+
+    if [ ! -d "$HDD_MOUNT" ]; then
+        mkdir -p "$HDD_MOUNT" || die "$E_IO" "failed to create $HDD_MOUNT"
+    fi
+
+    hdd_fstab_write "$uuid"
+    hdd_fstab_verify
+
+    mnt="$(mount_point_of "$part")"
+    [ "$mnt" = "$HDD_MOUNT" ] || die "$E_IO" "$part did not end up mounted at $HDD_MOUNT"
+
+    info "hdd configured:"
+    info "  device: $part"
+    info "  uuid:   $uuid"
+    info "  type:   ${FSTAB_TYPE[$HDD_TYPE]}"
+    info "  mount:  $HDD_MOUNT"
+}
+
+# --- docker ----------------------------------------------------------------
+
+# After the sudo re-exec, $USER and $HOME both belong to root. Three steps
+# below act on the operator's account instead, so resolve them explicitly.
+docker_resolve_user() {
+    DOCKER_USER="${SUDO_USER:-$USER}"
+    DOCKER_USER_HOME="$(user_home "$DOCKER_USER")" \
+        || die "$E_PRECHECK" "cannot resolve the home directory of user '$DOCKER_USER'"
+    [ -d "$DOCKER_USER_HOME" ] \
+        || die "$E_PRECHECK" "home directory '$DOCKER_USER_HOME' of user '$DOCKER_USER' does not exist"
+    DOCKER_WORKSPACE="$DOCKER_USER_HOME/docker"
+    DOCKER_BASHRC="$DOCKER_USER_HOME/.bashrc"
+    debug "invoking user: $DOCKER_USER (home: $DOCKER_USER_HOME)"
+    return 0
+}
+
+docker_pool_want() { printf '[{"base":"%s","size":%s}]' "$DOCKER_NETWORK" "$DOCKER_SIZE"; }
+
+docker_pool_current() {
+    [ -f "$DOCKER_DAEMON_FILE" ] || return 0
+    jq -c '.["default-address-pools"] // empty' "$DOCKER_DAEMON_FILE" 2>/dev/null || true
+}
+
+docker_pool_matches() {
+    local want have
+    want="$(docker_pool_want | jq -c .)"
+    have="$(docker_pool_current)"
+    debug "address pool: have='$have' want='$want'"
+    [ "$want" = "$have" ]
+}
+
+docker_pool_write() {
+    if [ -e "$DOCKER_DAEMON_FILE" ]; then
+        jq empty "$DOCKER_DAEMON_FILE" >/dev/null 2>&1 \
+            || die "$E_IO" "$DOCKER_DAEMON_FILE exists but is not valid JSON"
+    else
+        mkdir -p "$(dirname "$DOCKER_DAEMON_FILE")"
+        printf '{}\n' > "$DOCKER_DAEMON_FILE"
+    fi
+    backup_once "$DOCKER_DAEMON_FILE"
+
+    # Merge, never overwrite: the operator may already have log-opts,
+    # registry-mirrors or data-root in this file.
+    jq --argjson pool "$(docker_pool_want)" '.["default-address-pools"] = $pool' \
+        "$DOCKER_DAEMON_FILE" | atomic_write "$DOCKER_DAEMON_FILE" 644
+
+    info "address pool set to $DOCKER_NETWORK (size /$DOCKER_SIZE)"
+    warn "restarting dockerd to apply the address pool - running containers will be stopped"
+    restart_unit docker
+    info "note: existing networks keep their subnets; the pool governs networks created from now on"
+}
+
+# The workspace folder is created only when absent. An existing folder is left
+# ENTIRELY alone - no chown, no chmod, no recursion. It holds Compose projects
+# and bind-mounted data, so a recursive chown on a re-run could rewrite the
+# ownership of live container data.
+docker_workspace() {
+    if [ -d "$DOCKER_WORKSPACE" ]; then
+        debug "workspace exists; leaving ownership and mode untouched"
+        info "workspace folder already present: $DOCKER_WORKSPACE"
+        return 0
+    fi
+    mkdir -p "$DOCKER_WORKSPACE" || die "$E_IO" "failed to create $DOCKER_WORKSPACE"
+    chown "$DOCKER_USER:" "$DOCKER_WORKSPACE" || die "$E_IO" "failed to set ownership on $DOCKER_WORKSPACE"
+    chmod 755 "$DOCKER_WORKSPACE"
+    info "created workspace folder $DOCKER_WORKSPACE (owner $DOCKER_USER)"
+    return 0
+}
+
+docker_shortcuts_path() {
+    local src
+    src="$(dirname "$SELF")/$SHORTCUTS_NAME"
+    [ -f "$src" ] || return 1
+    realpath "$src"
+}
+
+docker_shortcuts_install() {
+    local src content
+    if ! src="$(docker_shortcuts_path)"; then
+        warn "$SHORTCUTS_NAME not found beside the script at $(dirname "$SELF")/$SHORTCUTS_NAME; skipping the shell shortcuts"
+        return 0
+    fi
+
+    # A CRLF-terminated file breaks every login shell that sources it
+    # ("$'\r': command not found", then a syntax error). This repo is authored
+    # on Windows and deployed to Linux, so it is a live hazard, and a broken
+    # ~/.bashrc is a nasty thing to hand someone. Refuse rather than install it.
+    if LC_ALL=C grep -q "$(printf '\r')" "$src"; then
+        warn "$src has CRLF line endings and would break every login shell that sources it"
+        warn "convert it to LF (dos2unix $src) and re-run; shell shortcuts not installed"
+        return 0
+    fi
+
+    if [ ! -e "$DOCKER_BASHRC" ]; then
+        : > "$DOCKER_BASHRC"
+        chmod 644 "$DOCKER_BASHRC"
+    fi
+
+    # Sentinel id "docker" is deliberately DISTINCT from the id-less block
+    # cmd_setup maintains in the same file; sharing an id would make each
+    # command silently delete the other's block.
+    # The [ -f ] guard is mandatory: a repository that is later moved or
+    # deleted must not break the operator's login shell.
+    content="$(block_marker_open docker)
+[ -f \"$src\" ] && . \"$src\"
+$(block_marker_close docker)"
+
+    block_upsert "$DOCKER_BASHRC" "docker" "$content"
+    # block_upsert writes through a root-owned temp file; hand it back.
+    chown "$DOCKER_USER:" "$DOCKER_BASHRC"
+    info "shell shortcuts sourced from $src in $DOCKER_BASHRC"
+    return 0
+}
+
+docker_shortcuts_present() {
+    local src
+    src="$(docker_shortcuts_path)" || return 1
+    # A file that has since become CRLF is NOT "present and fine" - the user's
+    # login shell is broken by it, and reporting "already configured" would
+    # hide that. Returning false here makes the next run surface the warning.
+    if LC_ALL=C grep -q "$(printf '\r')" "$src" 2>/dev/null; then return 1; fi
+    [ -f "$DOCKER_BASHRC" ] || return 1
+    grep -qF "$(block_marker_open docker)" "$DOCKER_BASHRC" || return 1
+    grep -qF "[ -f \"$src\" ] && . \"$src\"" "$DOCKER_BASHRC"
+}
+
+docker_do_install() {
+    local pkg arch codename
+    info "installing Docker from the official Debian repository"
+    export DEBIAN_FRONTEND=noninteractive
+
+    # Conflicting distro packages; an absent package is not an error.
+    for pkg in "${DOCKER_CONFLICTS[@]}"; do
+        apt-get remove -y "$pkg" >/dev/null 2>&1 || true
+    done
+
+    apt-get update -y >/dev/null 2>&1 || die "$E_IO" "apt-get update failed"
+    apt-get install -y ca-certificates curl >/dev/null 2>&1 \
+        || die "$E_IO" "failed to install ca-certificates and curl"
+
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL "$DOCKER_GPG_URL" -o "$DOCKER_KEYRING" \
+        || die "$E_IO" "failed to fetch the Docker GPG key from $DOCKER_GPG_URL"
+    chmod a+r "$DOCKER_KEYRING"
+
+    arch="$(dpkg --print-architecture)"
+    # shellcheck disable=SC1091  # /etc/os-release is a runtime file, not a source dependency
+    codename="$(. /etc/os-release && printf '%s' "$VERSION_CODENAME")"
+    debug "docker repo: arch=$arch codename=$codename"
+    printf 'deb [arch=%s signed-by=%s] %s %s stable\n' \
+        "$arch" "$DOCKER_KEYRING" "$DOCKER_REPO_URL" "$codename" > "$DOCKER_SOURCES"
+
+    apt-get update -y >/dev/null 2>&1 \
+        || die "$E_IO" "apt-get update failed after adding the Docker repository (is $codename published at $DOCKER_REPO_URL?)"
+    apt-get install -y "${DOCKER_PKGS[@]}" >/dev/null 2>&1 \
+        || die "$E_IO" "failed to install the Docker packages"
+
+    groupadd -f docker
+    usermod -aG docker "$DOCKER_USER" || die "$E_IO" "failed to add '$DOCKER_USER' to the docker group"
+    info "user '$DOCKER_USER' added to the docker group; log out and back in for it to take effect"
+
+    systemctl enable --now docker.service containerd.service >/dev/null 2>&1 \
+        || die "$E_IO" "failed to enable and start the Docker services"
+    info "Docker installed"
+    return 0
+}
+
+docker_verify() {
+    if docker run --rm hello-world >/dev/null 2>&1; then
+        info "verified: 'docker run hello-world' succeeded"
+    else
+        warn "'docker run hello-world' failed - the install itself succeeded, but the registry may be unreachable"
+    fi
+    return 0
+}
+
+docker_do_uninstall() {
+    local pkg
+    info "removing Docker"
+    export DEBIAN_FRONTEND=noninteractive
+
+    systemctl disable --now docker.service docker.socket containerd.service >/dev/null 2>&1 || true
+
+    # apt's exit code is unreliable here (absent packages are not failures),
+    # so purge permissively and then assert on what actually matters.
+    apt-get purge -y "${DOCKER_PKGS[@]}" >/dev/null 2>&1 || true
+    apt-get autoremove -y >/dev/null 2>&1 || true
+    for pkg in "${DOCKER_PKGS[@]}"; do
+        if pkg_installed "$pkg"; then die "$E_IO" "failed to remove package '$pkg'"; fi
+    done
+
+    rm -f "$DOCKER_SOURCES" "$DOCKER_KEYRING"
+
+    if [ -f "$DOCKER_DAEMON_FILE.bak" ]; then
+        cp -p "$DOCKER_DAEMON_FILE.bak" "$DOCKER_DAEMON_FILE" \
+            || die "$E_IO" "failed to restore $DOCKER_DAEMON_FILE"
+        info "restored $DOCKER_DAEMON_FILE from its backup"
+    fi
+
+    block_delete "$DOCKER_BASHRC" "docker"
+    [ ! -f "$DOCKER_BASHRC" ] || chown "$DOCKER_USER:" "$DOCKER_BASHRC"
+    info "shell shortcuts removed from $DOCKER_BASHRC"
+
+    # This command never deletes data. Image and volume storage is left
+    # exactly as it was, and removing it is a deliberate operator decision
+    # made outside this script.
+    info "Docker removed"
+    info ""
+    info "The following were NOT removed and are left for you to handle:"
+    if [ -d /var/lib/docker ] || [ -d /var/lib/containerd ]; then
+        du -sh /var/lib/docker /var/lib/containerd 2>/dev/null || true
+        info "  ^ image, volume and container data - delete it yourself if you want the space back"
+    fi
+    info "  $DOCKER_WORKSPACE - your Compose projects and bind mounts"
+    return 0
+}
+
+cmd_docker() {
+    local opt_network="" opt_size="" opt_uninstall=0
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_docker; exit "$E_OK" ;;
+            -n|--network)
+                [ $# -ge 2 ] || die "$E_ARGS" "--network requires a value"
+                opt_network="$2"; shift 2 ;;
+            --network=*) opt_network="${1#*=}"; shift ;;
+            -s|--size)
+                [ $# -ge 2 ] || die "$E_ARGS" "--size requires a value"
+                opt_size="$2"; shift 2 ;;
+            --size=*) opt_size="${1#*=}"; shift ;;
+            -u|--uninstall) opt_uninstall=1; shift ;;
+            --) shift; [ $# -eq 0 ] || die "$E_ARGS" "unexpected argument: $1" ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) die "$E_ARGS" "unexpected argument: $1" ;;
+        esac
+    done
+
+    [ -n "$opt_network" ] || [ -z "$opt_size" ] \
+        || die "$E_ARGS" "--size requires --network"
+    [ "$opt_uninstall" -eq 0 ] || [ -z "$opt_network" ] \
+        || die "$E_ARGS" "--uninstall cannot be combined with --network"
+
+    if [ -n "$opt_network" ]; then
+        cidr_valid "$opt_network" \
+            || die "$E_ARGS" "invalid --network: '$opt_network' (expected a CIDR such as 10.100.0.0/16)"
+        local base_bits="${opt_network#*/}"
+        [ -n "$opt_size" ] || opt_size="$DEFAULT_POOL_SIZE"
+        pool_size_valid "$opt_size" "$base_bits" \
+            || die "$E_ARGS" "invalid --size: '$opt_size' (must be between the pool prefix /$base_bits and /30)"
+    fi
+
+    DOCKER_NETWORK="$opt_network"
+    DOCKER_SIZE="$opt_size"
+    DOCKER_UNINSTALL="$opt_uninstall"
+    debug "resolved: network=${DOCKER_NETWORK:-none} size=${DOCKER_SIZE:-n/a} uninstall=$DOCKER_UNINSTALL"
+
+    require_cmds jq realpath
+    require_sudo
+    elevate "${ORIG_ARGS[@]}"
+    docker_resolve_user
+
+    if [ "$DOCKER_UNINSTALL" -eq 1 ]; then
+        docker_do_uninstall
+        return 0
+    fi
+
+    # Install mode. The workspace folder and the shell shortcuts are part of
+    # the desired state of "Docker is set up on this host", so they are
+    # converged on every run - not just the first install.
+    local installed=0 pool_ok=0 ws_ok=0 sc_ok=0
+    if docker_installed; then installed=1; fi
+    if [ -z "$DOCKER_NETWORK" ]; then pool_ok=1; elif docker_pool_matches; then pool_ok=1; fi
+    if [ -d "$DOCKER_WORKSPACE" ]; then ws_ok=1; fi
+    if docker_shortcuts_present; then sc_ok=1; fi
+    debug "state: installed=$installed pool_ok=$pool_ok workspace=$ws_ok shortcuts=$sc_ok"
+
+    if [ "$installed" -eq 1 ] && [ "$pool_ok" -eq 1 ] && [ "$ws_ok" -eq 1 ] && [ "$sc_ok" -eq 1 ]; then
+        info "docker already configured"
+        exit "$E_OK"
+    fi
+
+    if [ "$installed" -eq 0 ]; then
+        docker_do_install
+    else
+        info "Docker is already installed"
+    fi
+
+    docker_workspace
+    docker_shortcuts_install
+
+    if [ -n "$DOCKER_NETWORK" ] && [ "$pool_ok" -eq 0 ]; then
+        docker_pool_write
+    fi
+
+    [ "$installed" -eq 1 ] || docker_verify
+}
+
+# --- ntp -------------------------------------------------------------------
+
+# Current NTP= value from timesyncd.conf, whitespace-normalised. Empty when
+# unset or commented out (the stock file ships it as "#NTP=").
+timesyncd_servers() {
+    [ -f "$TIMESYNCD_FILE" ] || return 0
+    sed -n 's/^[[:space:]]*NTP[[:space:]]*=[[:space:]]*//p' "$TIMESYNCD_FILE" \
+        | head -1 | tr -s ' ' | sed 's/[[:space:]]*$//'
+}
+
+# systemd-timesyncd is a separate package on Debian; a host that has never
+# had it (or had it removed in favour of another daemon) needs it installed.
+ensure_timesyncd() {
+    if systemctl cat systemd-timesyncd.service >/dev/null 2>&1; then
+        return 0
+    fi
+    info "systemd-timesyncd is not present; installing it"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y systemd-timesyncd >/dev/null 2>&1 \
+        || die "$E_IO" "failed to install the systemd-timesyncd package"
+    return 0
+}
+
+ntp_configure() {
+    local want current enabled synced
+    want="$(join_sp "${NTP_SERVERS[@]}")"
+
+    ensure_timesyncd
+    backup_once "$TIMESYNCD_FILE"
+
+    current="$(timesyncd_servers)"
+    enabled="$(timedatectl show -p NTP --value 2>/dev/null || true)"
+    debug "timesyncd: current='$current' enabled='$enabled' want='$want'"
+
+    # Order is significant: it is the order timesyncd tries the servers.
+    if [ "$current" = "$want" ] && [ "$enabled" = "yes" ]; then
+        info "ntp already configured: $want"
+        exit "$E_OK"
+    fi
+
+    debug "writing $TIMESYNCD_FILE"
+    printf '%s\n' "[Time]" "NTP=$want" | atomic_write "$TIMESYNCD_FILE" 644
+
+    timedatectl set-ntp true || die "$E_IO" "failed to enable network time synchronization"
+    restart_unit systemd-timesyncd
+
+    info "ntp configured: $want"
+    synced="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
+    if [ "$synced" != "yes" ]; then
+        warn "not synchronised yet - synchronisation is asynchronous, and name-form servers also wait on DNS"
+    fi
+}
+
+# "Uninstall" restores the stock configuration; systemd-timesyncd is part of
+# the base system and is deliberately not removed as a package.
+ntp_restore() {
+    ensure_timesyncd
+    if [ -f "$TIMESYNCD_BAK" ]; then
+        debug "restoring $TIMESYNCD_FILE from $TIMESYNCD_BAK"
+        cp -p "$TIMESYNCD_BAK" "$TIMESYNCD_FILE" \
+            || die "$E_IO" "failed to restore $TIMESYNCD_FILE from $TIMESYNCD_BAK"
+    else
+        warn "$TIMESYNCD_BAK not found; writing a bare [Time] section instead"
+        printf '%s\n' "[Time]" | atomic_write "$TIMESYNCD_FILE" 644
+    fi
+    restart_unit systemd-timesyncd
+    info "time synchronization returned to the distribution default"
+}
+
+cmd_ntp() {
+    local opt_uninstall=0
+    local -a opt_servers=()
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_ntp; exit "$E_OK" ;;
+            -s|--server)
+                [ $# -ge 2 ] || die "$E_ARGS" "--server requires a value"
+                opt_servers+=("$2"); shift 2 ;;
+            --server=*) opt_servers+=("${1#*=}"); shift ;;
+            -u|--uninstall) opt_uninstall=1; shift ;;
+            --) shift; [ $# -eq 0 ] || die "$E_ARGS" "unexpected argument: $1" ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) die "$E_ARGS" "unexpected argument: '$1' (ntp takes no positional arguments; use --server)" ;;
+        esac
+    done
+
+    [ "$opt_uninstall" -eq 0 ] || [ "${#opt_servers[@]}" -eq 0 ] \
+        || die "$E_ARGS" "--uninstall cannot be combined with --server"
+
+    NTP_UNINSTALL="$opt_uninstall"
+    NTP_SERVERS=()
+
+    if [ "$opt_uninstall" -eq 0 ]; then
+        if [ "${#opt_servers[@]}" -eq 0 ]; then
+            local gw
+            gw="$(default_gw)"
+            [ -n "$gw" ] || die "$E_ARGS" "no default route to derive an NTP server from - pass --server explicitly"
+            NTP_SERVERS=("$gw")
+        else
+            local s seen=""
+            for s in "${opt_servers[@]}"; do
+                if ! ip_valid "$s" && ! dns_name_valid "$s"; then
+                    die "$E_ARGS" "invalid NTP server: '$s' (expected an IPv4 address or a DNS name)"
+                fi
+                case " $seen " in
+                    *" $s "*) warn "duplicate NTP server '$s' ignored"; continue ;;
+                esac
+                seen="$seen $s"
+                NTP_SERVERS+=("$s")
+            done
+        fi
+
+        # A host cannot usefully sync time from itself. IP-form servers only:
+        # checking a name would require resolving it, which we never do.
+        local addr srv
+        for srv in "${NTP_SERVERS[@]}"; do
+            if ip_valid "$srv"; then
+                for addr in $(host_addrs); do
+                    [ "$srv" != "$addr" ] || die "$E_ARGS" "NTP server '$srv' is an address of this host"
+                done
+            fi
+        done
+    fi
+
+    debug "resolved: uninstall=$NTP_UNINSTALL servers=$(join_sp ${NTP_SERVERS[@]+"${NTP_SERVERS[@]}"})"
+
+    precheck_timesync
+    require_sudo
+    elevate "${ORIG_ARGS[@]}"
+
+    if [ "$NTP_UNINSTALL" -eq 1 ]; then
+        ntp_restore
+    else
+        ntp_configure
+    fi
+}
+
+# --- tz --------------------------------------------------------------------
+
+cmd_tz() {
+    local -a args=()
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_tz; exit "$E_OK" ;;
+            --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+
+    [ "${#args[@]}" -ne 0 ] || { help_tz >&2; die "$E_ARGS" "a timezone is required"; }
+    [ "${#args[@]}" -eq 1 ] || die "$E_ARGS" "unexpected argument: ${args[1]}"
+
+    local tz="${args[0]}"
+    tz_valid "$tz" || die "$E_ARGS" "invalid timezone: '$tz'"
+    debug "resolved: timezone=$tz"
+
+    require_sudo
+    elevate "${ORIG_ARGS[@]}"
+
+    local current
+    current="$(timedatectl show -p Timezone --value 2>/dev/null || true)"
+    debug "current timezone: ${current:-unknown}"
+    if [ "$current" = "$tz" ]; then
+        info "timezone already configured: $tz"
+        exit "$E_OK"
+    fi
+
+    timedatectl set-timezone "$tz" || die "$E_IO" "failed to set timezone to '$tz'"
+    info "timezone set to $tz (local time is now $(date '+%Y-%m-%d %H:%M:%S %Z'))"
+}
+
+# --- file ------------------------------------------------------------------
+
+# Execution order is fixed and independent of key order in the document.
+# network is last because reconfiguring the address disconnects the session
+# this is running over; docker is before it because installing Docker needs
+# outbound connectivity, which the host still has on its original address.
+# An ARRAY, not a space-separated string: the global IFS contains no space,
+# so `for node in $FILE_ORDER` would not split it and the whole string would
+# be treated as a single node name.
+readonly -a FILE_ORDER=(tz hdd docker ntp network)
+
+declare -a FILE_ERRORS=()
+file_err() { FILE_ERRORS+=("$*"); }
+
+# jf <filter> [jq args...] -- raw value from the document, empty when absent
+jf() { jq -r "$@" "$FILE_PATH" 2>/dev/null; }
+
+# json_type_of <node> <key> -- jq type name, or "absent"
+# shellcheck disable=SC2016  # $n/$k are jq variables bound by --arg, not shell expansions
+json_type_of() {
+    jf --arg n "$1" --arg k "$2" 'if (.[$n]|type) == "object" and (.[$n]|has($k)) then (.[$n][$k]|type) else "absent" end'
+}
+
+# json_expect <node> <key> <type> -- record an error when present with the wrong type
+json_expect() {
+    local t
+    t="$(json_type_of "$1" "$2")"
+    [ "$t" = "absent" ] && return 0
+    [ "$t" = "$3" ] && return 0
+    file_err "$1.$2 must be $3, got $t"
+    return 1
+}
+
+# json_fields <node> <allowed...> -- reject unknown keys
+# shellcheck disable=SC2016  # $n/$k are jq variables bound by --arg, not shell expansions
+json_fields() {
+    local node="$1"; shift
+    # join_sp, not "$*": the global IFS has no space in it, so "$*" would
+    # build the allowlist separated by NEWLINES and the space-delimited
+    # match below would never hit - rejecting every legitimate field.
+    local allowed key
+    allowed=" $(join_sp "$@") "
+    local -a keys=()
+    mapfile -t keys < <(jf --arg n "$node" '.[$n] | keys[]?')
+    for key in ${keys[@]+"${keys[@]}"}; do
+        case "$allowed" in
+            *" $key "*) ;;
+            *) file_err "unknown field: $node.$key" ;;
+        esac
+    done
+    return 0
+}
+
+# json_alias <node> <canonical> <alias> -- value of whichever is set; both is an error
+# json_alias is called inside a command substitution, so it runs in a SUBSHELL
+# and CANNOT record errors - an append to FILE_ERRORS there is discarded when
+# the subshell exits. Conflict detection therefore lives in its own function,
+# called directly from json_validate.
+# shellcheck disable=SC2016  # $n/$k are jq variables bound by --arg, not shell expansions
+json_alias() {
+    local node="$1" a="$2" b="$3" va vb
+    va="$(jf --arg n "$node" --arg k "$a" '.[$n][$k] // empty')"
+    vb="$(jf --arg n "$node" --arg k "$b" '.[$n][$k] // empty')"
+    printf '%s' "${va:-$vb}"
+    return 0
+}
+
+# shellcheck disable=SC2016  # $n/$k are jq variables bound by --arg
+json_alias_check() {
+    local node="$1" a="$2" b="$3" va vb
+    va="$(jf --arg n "$node" --arg k "$a" '.[$n][$k] // empty')"
+    vb="$(jf --arg n "$node" --arg k "$b" '.[$n][$k] // empty')"
+    if [ -n "$va" ] && [ -n "$vb" ]; then
+        file_err "$node.$a and $node.$b are aliases for the same field; set only one"
+    fi
+    return 0
+}
+
+json_has_node() { jq -e --arg n "$1" 'has($n)' "$FILE_PATH" >/dev/null 2>&1; }
+
+# Validation for EVERY node runs before ANY node executes, and every problem
+# is collected rather than reported one per run.
+json_validate() {
+    local -a roots=()
+    FILE_ERRORS=()
+
+    if [ "$(jf 'type')" != "object" ]; then
+        file_err "the document must be a JSON object"
+        return 1
+    fi
+
+    mapfile -t roots < <(jf 'keys[]?')
+    if [ "${#roots[@]}" -eq 0 ]; then
+        file_err "no configuration nodes found"
+        return 1
+    fi
+
+    local node
+    for node in "${roots[@]}"; do
+        case "$node" in
+            network|docker|ntp|hdd|tz) ;;
+            *) file_err "unknown root node: '$node'" ;;
+        esac
+    done
+
+    if json_has_node tz; then
+        [ "$(jf '.tz | type')" = "string" ] || file_err "tz must be a string"
+        local tz; tz="$(jf '.tz // empty')"
+        [ -z "$tz" ] || tz_valid "$tz" || file_err "invalid tz: '$tz'"
+    fi
+
+    if json_has_node hdd; then
+        json_fields hdd device mount type
+        json_expect hdd device string
+        json_expect hdd mount string
+        json_expect hdd type string
+        local ht; ht="$(jf '.hdd.type // empty')"
+        if [ -n "$ht" ] && [ -z "${MKFS_CMD[$ht]:-}" ]; then
+            file_err "invalid hdd.type: '$ht' (expected one of: ext4 xfs vfat ntfs)"
+        fi
+    fi
+
+    if json_has_node docker; then
+        json_fields docker enabled network size
+        json_expect docker enabled boolean
+        json_expect docker network string
+        json_expect docker size number
+        local dn ds
+        dn="$(jf '.docker.network // empty')"
+        ds="$(jf '.docker.size // empty')"
+        if [ -n "$dn" ]; then
+            if cidr_valid "$dn"; then
+                [ -z "$ds" ] || pool_size_valid "$ds" "${dn#*/}" \
+                    || file_err "invalid docker.size: '$ds' (must be between /${dn#*/} and /30)"
+            else
+                file_err "invalid docker.network: '$dn'"
+            fi
+        elif [ -n "$ds" ]; then
+            file_err "docker.size requires docker.network"
+        fi
+        if [ "$(jf '.docker.enabled')" = "false" ] && [ -n "$dn" ]; then
+            file_err "docker.network cannot be combined with docker.enabled: false"
+        fi
+    fi
+
+    if json_has_node ntp; then
+        json_fields ntp enabled server
+        json_expect ntp enabled boolean
+        local st; st="$(json_type_of ntp server)"
+        if [ "$st" != "absent" ] && [ "$st" != "array" ]; then
+            # Deliberately array-only, even for one server: one shape to
+            # validate, and adding a second is an edit inside the brackets.
+            file_err "ntp.server must be an array of strings, got $st"
+        elif [ "$st" = "array" ]; then
+            local -a servers=()
+            mapfile -t servers < <(jf '.ntp.server[]?')
+            [ "${#servers[@]}" -ne 0 ] || file_err "ntp.server must not be empty"
+            local sv
+            for sv in ${servers[@]+"${servers[@]}"}; do
+                if ! ip_valid "$sv" && ! dns_name_valid "$sv"; then
+                    file_err "invalid ntp.server entry: '$sv'"
+                fi
+            done
+            if [ "$(jf '.ntp.enabled')" = "false" ] && [ "${#servers[@]}" -ne 0 ]; then
+                file_err "ntp.server cannot be combined with ntp.enabled: false"
+            fi
+        fi
+    fi
+
+    if json_has_node network; then
+        json_fields network name hostname ip address netmask mask gateway dns ipv6 restart
+        json_expect network gateway string
+        json_expect network dns array
+        json_expect network ipv6 boolean
+        json_expect network restart boolean
+
+        json_alias_check network name hostname
+        json_alias_check network ip address
+        json_alias_check network netmask mask
+
+        local nm ip mask gw
+        nm="$(json_alias network name hostname)"
+        ip="$(json_alias network ip address)"
+        mask="$(json_alias network netmask mask)"
+        gw="$(jf '.network.gateway // empty')"
+
+        [ -n "$nm" ] || file_err "network.name is required"
+        [ -z "$nm" ] || fqdn_valid "$nm" || file_err "invalid network.name: '$nm' (must include the domain)"
+        [ -n "$ip" ] || file_err "network.ip is required"
+
+        local addr="${ip%%/*}" bits=""
+        [ -z "$ip" ] || ip_valid "$addr" || file_err "invalid network.ip: '$addr'"
+        case "$ip" in */*) bits="${ip#*/}" ;; esac
+
+        local resolved="${mask:-${bits:-$DEFAULT_MASK_BITS}}"
+        if [ -n "$ip" ] && ! mask_to_bits "$resolved" >/dev/null; then
+            file_err "invalid network netmask: '$resolved'"
+        fi
+        [ -z "$gw" ] || ip_valid "$gw" || file_err "invalid network.gateway: '$gw'"
+
+        local -a dns=()
+        mapfile -t dns < <(jf '.network.dns[]?')
+        local d
+        for d in ${dns[@]+"${dns[@]}"}; do
+            ip_valid "$d" || file_err "invalid network.dns entry: '$d'"
+        done
+    fi
+
+    [ "${#FILE_ERRORS[@]}" -eq 0 ]
+}
+
+# Each of these fills FILE_ARGS with the argv the corresponding command would
+# have been given on the command line. Execution then calls the very same
+# cmd_* function the CLI does - there is no second implementation of anything.
+declare -a FILE_ARGS=()
+
+file_args_tz() { FILE_ARGS=("$(jf '.tz')"); }
+
+file_args_hdd() {
+    local dev mnt typ
+    dev="$(jf '.hdd.device // empty')"
+    mnt="$(jf '.hdd.mount // empty')"
+    typ="$(jf '.hdd.type // empty')"
+    FILE_ARGS=()
+    [ -z "$dev" ] || FILE_ARGS+=(--device "$dev")
+    [ -z "$mnt" ] || FILE_ARGS+=(--mount "$mnt")
+    [ -z "$typ" ] || FILE_ARGS+=(--type "$typ")
+}
+
+file_args_docker() {
+    local net size
+    FILE_ARGS=()
+    if [ "$(jf '.docker.enabled')" = "false" ]; then
+        FILE_ARGS=(--uninstall)
+        return 0
+    fi
+    net="$(jf '.docker.network // empty')"
+    size="$(jf '.docker.size // empty')"
+    [ -z "$net" ] || FILE_ARGS+=(--network "$net")
+    [ -z "$size" ] || FILE_ARGS+=(--size "$size")
+}
+
+file_args_ntp() {
+    local -a servers=()
+    FILE_ARGS=()
+    if [ "$(jf '.ntp.enabled')" = "false" ]; then
+        FILE_ARGS=(--uninstall)
+        return 0
+    fi
+    mapfile -t servers < <(jf '.ntp.server[]?')
+    local s
+    for s in ${servers[@]+"${servers[@]}"}; do
+        FILE_ARGS+=(--server "$s")
+    done
+}
+
+file_args_network() {
+    local nm ip mask gw
+    local -a dns=()
+    nm="$(json_alias network name hostname)"
+    ip="$(json_alias network ip address)"
+    mask="$(json_alias network netmask mask)"
+    gw="$(jf '.network.gateway // empty')"
+    FILE_ARGS=("$ip" --hostname "$nm")
+    [ -z "$mask" ] || FILE_ARGS+=(--mask "$mask")
+    [ -z "$gw" ] || FILE_ARGS+=(--gateway "$gw")
+    mapfile -t dns < <(jf '.network.dns[]?')
+    local d
+    for d in ${dns[@]+"${dns[@]}"}; do
+        FILE_ARGS+=(--dns "$d")
+    done
+    # false means "turn this off"; true means "leave it alone", not "turn on".
+    [ "$(jf '.network.ipv6')" = "false" ] && FILE_ARGS+=(--no-ipv6)
+    [ "$(jf '.network.restart')" = "false" ] && FILE_ARGS+=(--no-restart)
+    return 0
+}
+
+cmd_file() {
+    local opt_dryrun=0
+    local -a args=()
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_file; exit "$E_OK" ;;
+            --dry-run) opt_dryrun=1; shift ;;
+            --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+
+    [ "${#args[@]}" -ne 0 ] || { help_file >&2; die "$E_ARGS" "a JSON file path is required"; }
+    [ "${#args[@]}" -eq 1 ] || die "$E_ARGS" "unexpected argument: ${args[1]}"
+
+    local path="${args[0]}"
+    [ -f "$path" ] || die "$E_NOTFOUND" "file not found: '$path'"
+
+    require_cmds jq realpath
+    jq empty "$path" >/dev/null 2>&1 || die "$E_IO" "'$path' is not valid JSON"
+
+    FILE_PATH="$path"
+    FILE_DRYRUN="$opt_dryrun"
+    debug "resolved: path=$FILE_PATH dry_run=$FILE_DRYRUN"
+
+    if ! json_validate; then
+        local e
+        for e in "${FILE_ERRORS[@]}"; do
+            printf 'error: %s\n' "$e" >&2
+        done
+        printf 'error: %s problem(s) found in %s; nothing was executed\n' \
+            "${#FILE_ERRORS[@]}" "$FILE_PATH" >&2
+        exit "$E_ARGS"
+    fi
+
+    local -a present=()
+    local node
+    for node in "${FILE_ORDER[@]}"; do
+        if json_has_node "$node"; then present+=("$node"); fi
+    done
+    info "plan for $FILE_PATH: $(join_sp "${present[@]}")"
+
+    # Elevate ONCE, here. Each cmd_* calls elevate itself, and that re-execs
+    # the whole script - inside a file run that would restart the entire
+    # sequence and re-run nodes that had already completed. Doing it up front
+    # means every node below sees EUID 0 and its own elevate is a no-op.
+    if [ "$FILE_DRYRUN" -eq 0 ]; then
+        require_sudo
+        elevate "${ORIG_ARGS[@]}"
+    fi
+
+    local -a results=()
+    local first_rc=0 cmd rc out label
+
+    for node in "${present[@]}"; do
+        case "$node" in
+            network) cmd=cmd_ip; file_args_network ;;
+            tz)      cmd=cmd_tz; file_args_tz ;;
+            hdd)     cmd=cmd_hdd; file_args_hdd ;;
+            docker)  cmd=cmd_docker; file_args_docker ;;
+            ntp)     cmd=cmd_ntp; file_args_ntp ;;
+        esac
+
+        if [ "$FILE_DRYRUN" -eq 1 ]; then
+            info ""
+            info "[$node] would run: system-setup ${node/network/ip} $(join_sp ${FILE_ARGS[@]+"${FILE_ARGS[@]}"})"
+            results+=("$node|0|dry-run")
+            continue
+        fi
+
+        info ""
+        info "=== $node ==="
+        # Each node runs in a SUBSHELL: every cmd_* ends its failures with
+        # die(), which exits. Without the subshell the first failing node
+        # would take the whole sequence down instead of being recorded.
+        # `out=$(...)` propagates the substitution's status, and under set -e a
+        # failing node would abort the whole loop - exactly what continue-on-
+        # error exists to prevent. The if/else keeps the status without it
+        # being fatal.
+        if out="$( ( "$cmd" ${FILE_ARGS[@]+"${FILE_ARGS[@]}"} ) 2>&1 )"; then
+            rc=0
+        else
+            rc=$?
+        fi
+        printf '%s\n' "$out"
+
+        if [ "$rc" -eq 0 ]; then
+            case "$out" in
+                *"already configured"*) label="ok (already configured)" ;;
+                *) label="ok" ;;
+            esac
+        else
+            label="failed ($rc)"
+            [ "$first_rc" -ne 0 ] || first_rc="$rc"
+        fi
+        results+=("$node|$rc|$label")
+    done
+
+    info ""
+    info "summary:"
+    local r
+    for r in "${results[@]}"; do
+        printf '  %-8s %s\n' "${r%%|*}" "${r##*|}"
+    done
+
+    if [ "$FILE_DRYRUN" -eq 1 ]; then
+        info ""
+        info "dry run: validation passed, nothing was changed"
+        return 0
+    fi
+
+    if [ "$first_rc" -ne 0 ]; then
+        exit "$first_rc"
+    fi
+    return 0
+}
+
+# --- setup -----------------------------------------------------------------
+
+cmd_setup() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_setup; exit "$E_OK" ;;
+            --) shift; [ $# -eq 0 ] || die "$E_ARGS" "unexpected argument: $1" ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) die "$E_ARGS" "unexpected argument: $1" ;;
+        esac
+    done
+
+    require_cmds realpath
+
+    local sbin=""
+    if [ -d /usr/local/sbin ]; then
+        sbin=/usr/local/sbin
+    elif [ -d /usr/sbin ]; then
+        sbin=/usr/sbin
+    else
+        die "$E_PRECHECK" "neither /usr/local/sbin nor /usr/sbin exists"
+    fi
+    debug "target sbin: $sbin"
+
+    # This command deliberately does NOT call elevate. It writes ~/.bashrc,
+    # which must land in the INVOKING user's home - after a sudo re-exec that
+    # would be root's. Only the symlink operations are elevated, via $SUDO.
+    local SUDO=""
+    if [ ! -w "$sbin" ]; then
+        command -v sudo >/dev/null 2>&1 \
+            || die "$E_PRECHECK" "$sbin is not writable and sudo is not available"
+        SUDO="sudo"
+    fi
+
+    local link="$sbin/system-setup"
+    if [ -e "$link" ] || [ -L "$link" ]; then
+        warn "$link already exists, skipping symlink"
+    else
+        # shellcheck disable=SC2086  # $SUDO is deliberately unquoted: empty means "no prefix"
+        $SUDO ln -s "$SELF" "$link" || die "$E_IO" "failed to create the symlink $link"
+        # shellcheck disable=SC2086
+        $SUDO chmod +x "$SELF" || die "$E_IO" "failed to mark $SELF executable"
+        info "installed $link -> $SELF"
+    fi
+
+    local bashrc="$HOME/.bashrc" path_needed=1
+    case ":$PATH:" in
+        *":$sbin:"*) path_needed=0 ;;
+    esac
+
+    if [ "$path_needed" -eq 0 ]; then
+        info "$sbin is already in PATH"
+    else
+        local content
+        # Sentinel id is empty - deliberately DISTINCT from the "docker" block
+        # that cmd_docker maintains in this same file.
+        content="$(block_marker_open)
+export PATH=\"\$PATH:$sbin\"
+$(block_marker_close)"
+        block_upsert "$bashrc" "" "$content"
+        export PATH="$PATH:$sbin"
+        info "added $sbin to PATH in $bashrc"
+    fi
+
+    info "setup complete"
+    info "note: already-open shells need 'source $bashrc' to pick up the change"
+}
+
+# ---------------------------------------------------------------------------
+# 11. Help screens
+# ---------------------------------------------------------------------------
+
+help_main() {
+    cat << 'EOF'
+system-setup - basic configuration for freshly deployed Debian 12 VMs
+
+Usage:
+  system-setup ip <ip[/mask]> -n <fqdn> [-m <mask>] [-g <gw>] [-d <dns>]... [--no-ipv6] [--no-restart]
+  system-setup hdd [-d <device>] [-m <mount>] [-t <ext4|xfs|vfat|ntfs>] [-f]
+  system-setup docker [-n <cidr> [-s <bits>]] | -u
+  system-setup ntp [-s <server>]... | -u
+  system-setup tz <zone>
+  system-setup file <path.json> [--dry-run]
+  system-setup setup
+
+Aliases:
+  system-setup network ...   same as 'system-setup ip ...'
+  system-setup <path.json>   same as 'system-setup file <path.json>'
+
+Global:
+  --verbose                  detailed per-action logging
+
+Run 'system-setup <command> -h' for command-specific help.
+EOF
+}
+
+help_ip() {
+    cat << 'EOF'
+system-setup ip <ip[/mask]> -n <fqdn> [-m <mask>] [-g <gw>] [-d <dns>]... [--no-ipv6] [--no-restart]
+
+Alias: system-setup network
+
+Configures the static address, gateway, DNS and hostname of ens192.
+
+  <ip[/mask]>            host address, required; may carry a /bits suffix
+  -n, --hostname <fqdn>  host name including the domain, required
+  -m, --mask <mask>      24 or 255.255.255.0; overrides the /bits suffix; default 24
+  -g, --gateway <ip>     default: host IP with the last octet set to 254
+  -d, --dns <ip>         repeatable; default: the gateway
+      --no-ipv6          disable IPv6 persistently via /etc/sysctl.d
+      --no-restart       write the configuration but do not restart networking
+
+Restarting networking drops any SSH session on the old address. Use
+--no-restart to stage the change and apply it on the next reboot.
+EOF
+}
+
+help_hdd() {
+    cat << 'EOF'
+system-setup hdd [-d <device>] [-m <mount>] [-t <ext4|xfs|vfat|ntfs>] [-f]
+
+Partitions, formats and mounts a second disk, recording it in /etc/fstab by UUID.
+
+  -d, --device <dev>     default /dev/sdb
+  -m, --mount <path>     default /data; a bare name is taken as /<name>
+  -t, --type <fs>        ext4 | xfs | vfat | ntfs; default ext4
+  -f, --force            permit destructive changes (reformat, unmount), and
+                         skip the confirmation prompt
+
+Without --force, a disk that is already formatted differently or mounted
+elsewhere is reported and left untouched.
+EOF
+}
+
+help_docker() {
+    cat << 'EOF'
+system-setup docker [-n <cidr> [-s <bits>]] | -u
+
+Installs Docker by the official Debian procedure, creates the workspace
+folder, and installs the shell shortcuts.
+
+  -n, --network <cidr>   address pool that user-defined networks are carved
+                         from (default-address-pools), e.g. 10.100.0.0/16
+  -s, --size <bits>      prefix length of each network from that pool; default 24
+  -u, --uninstall        remove Docker and the shell shortcuts
+
+Applying a pool change restarts dockerd, which stops running containers.
+This command never deletes data. --uninstall leaves /var/lib/docker,
+/var/lib/containerd and $HOME/docker in place; removing them is yours to do.
+EOF
+}
+
+help_ntp() {
+    cat << 'EOF'
+system-setup ntp [-s <server>]... | -u
+
+Points systemd-timesyncd at one or more NTP servers.
+
+  -s, --server <host>    IPv4 address or DNS name; repeatable; order is the
+                         order timesyncd tries them; default: the current
+                         default gateway
+  -u, --uninstall        restore the stock timesyncd configuration
+
+This command takes no positional arguments.
+EOF
+}
+
+help_tz() {
+    cat << 'EOF'
+system-setup tz <zone>
+
+Sets the host timezone, e.g. 'system-setup tz America/Denver'.
+The zone must exist under /usr/share/zoneinfo.
+EOF
+}
+
+help_file() {
+    cat << 'EOF'
+system-setup file <path.json> [--dry-run]
+
+Runs a sequence of configuration tasks from a JSON file, in the fixed order
+tz -> hdd -> docker -> ntp -> network. A failing task does not stop the
+sequence; the exit code is that of the first failure.
+
+      --dry-run          validate everything and print the plan, change nothing
+EOF
+}
+
+help_setup() {
+    cat << 'EOF'
+system-setup setup
+
+Installs system-setup as a symlink in /usr/local/sbin (or /usr/sbin) and adds
+that folder to PATH in ~/.bashrc.
+
+Already-open shells must run 'source ~/.bashrc' to see the change.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# 12. Argument router
+# ---------------------------------------------------------------------------
+
+main() {
+    ORIG_ARGS=("$@")
+
+    # --verbose is global and may appear anywhere; strip it before dispatch.
+    local a
+    local -a argv=()
+    for a in ${1+"$@"}; do
+        if [ "$a" = "--verbose" ]; then
+            VERBOSE=1
+        else
+            argv+=("$a")
+        fi
+    done
+    set -- ${argv[@]+"${argv[@]}"}
+
+    if [ $# -eq 0 ]; then
+        help_main
+        exit "$E_ARGS"
+    fi
+
+    case "$1" in
+        -h|--help) help_main; exit "$E_OK" ;;
+        ip|network) shift; cmd_ip ${1+"$@"} ;;
+        hdd)        shift; cmd_hdd ${1+"$@"} ;;
+        docker)     shift; cmd_docker ${1+"$@"} ;;
+        ntp)        shift; cmd_ntp ${1+"$@"} ;;
+        tz)         shift; cmd_tz ${1+"$@"} ;;
+        file)       shift; cmd_file ${1+"$@"} ;;
+        setup)      shift; cmd_setup ${1+"$@"} ;;
+        *)
+            # A single argument that is an existing file means file mode.
+            # Known command names are matched above, so they always win.
+            if [ $# -eq 1 ] && [ -f "$1" ]; then
+                cmd_file "$1"
+            else
+                printf 'error: unknown command: %s\n' "$1" >&2
+                help_main >&2
+                exit "$E_ARGS"
+            fi
+            ;;
+    esac
+}
+
+# Only run when executed, not when sourced. Sourcing lets the test suite call
+# the validation and resolution functions directly, which is why this script
+# ships with no debug subcommands of its own.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main ${1+"$@"}
+fi

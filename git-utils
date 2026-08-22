@@ -1,0 +1,1160 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+# ---------------------------------------------------------------------------
+# 2. Constants
+# ---------------------------------------------------------------------------
+
+# shellcheck disable=SC2034  # E_OK documents the full exit-code space; success needs no explicit exit
+readonly E_OK=0 E_PRECHECK=1 E_ARGS=2 E_IO=3 E_EXISTS=4 E_NOTFOUND=5
+readonly REPOS_FILE="$HOME/.repositories.json"
+readonly LOCK_FILE="$HOME/.repositories.json.lock"
+readonly SSH_DIR="$HOME/.ssh"
+readonly SSH_CONFIG="$SSH_DIR/config"
+readonly BASHRC="$HOME/.bashrc"
+readonly DEFAULT_BRANCH_FALLBACK="main"
+readonly CHARSET='A-Za-z0-9._-'
+readonly LOCK_WAIT=10
+readonly IMAGES_FILE_NAME=".images"
+readonly COMPOSE_PROFILE_WILDCARD='*'
+
+declare -A DEP_PACKAGE=(
+    [git]="git"
+    [realpath]="coreutils"
+    [jq]="jq"
+    [ssh-keygen]="openssh-client"
+)
+
+declare -a CLEANUP_TMPFILES=()
+cleanup_tmpfiles() {
+    local f
+    for f in "${CLEANUP_TMPFILES[@]}"; do
+        rm -f "$f"
+    done
+    return 0
+}
+trap cleanup_tmpfiles EXIT
+
+# ---------------------------------------------------------------------------
+# 3. Output helpers
+# ---------------------------------------------------------------------------
+
+info() { printf '%s\n' "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+
+die() {
+    local code="$1"; shift
+    printf 'error: %s\n' "$*" >&2
+    exit "$code"
+}
+
+confirm() {
+    local prompt="$1" reply
+    if [ "${FORCE:-0}" = "1" ]; then
+        return 0
+    fi
+    if [ ! -t 0 ]; then
+        die "$E_ARGS" "confirmation required but stdin is not a TTY (use --force)"
+    fi
+    read -r -p "$prompt [Y/n] " reply || reply=""
+    case "$reply" in
+        [nN]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# 4. File helpers
+# ---------------------------------------------------------------------------
+
+ensure_trailing_newline() {
+    local file="$1"
+    if [ -s "$file" ] && [ "$(tail -c1 "$file" | wc -l)" -eq 0 ]; then
+        printf '\n' >> "$file"
+    fi
+}
+
+atomic_write() {
+    local file="$1" mode="$2" tmp
+    tmp="$(mktemp "${file}.XXXXXX")"
+    CLEANUP_TMPFILES+=("$tmp")
+    cat > "$tmp"
+    chmod "$mode" "$tmp"
+    mv "$tmp" "$file"
+}
+
+block_marker_open() {
+    local id="${1:-}"
+    if [ -n "$id" ]; then
+        printf '# >>> git-utils %s >>>' "$id"
+    else
+        printf '# >>> git-utils >>>'
+    fi
+}
+
+block_marker_close() {
+    local id="${1:-}"
+    if [ -n "$id" ]; then
+        printf '# <<< git-utils %s <<<' "$id"
+    else
+        printf '# <<< git-utils <<<'
+    fi
+}
+
+# block_upsert <file> <sentinel_id> <content>
+# <content> is the full block text, sentinel lines included.
+block_upsert() {
+    local file="$1" sentinel_id="$2" content="$3"
+    local open close_marker tmp mode
+
+    open="$(block_marker_open "$sentinel_id")"
+    close_marker="$(block_marker_close "$sentinel_id")"
+
+    if [ -e "$file" ]; then
+        mode="$(stat -c '%a' "$file")"
+    else
+        : > "$file"
+        mode="644"
+    fi
+    ensure_trailing_newline "$file"
+
+    tmp="$(mktemp "${file}.XXXXXX")"
+    CLEANUP_TMPFILES+=("$tmp")
+
+    if grep -qF "$open" "$file"; then
+        awk -v open="$open" -v close_marker="$close_marker" -v content="$content" '
+            $0 == open { print content; skip=1; next }
+            $0 == close_marker { skip=0; next }
+            skip { next }
+            { print }
+        ' "$file" > "$tmp"
+    else
+        cat "$file" > "$tmp"
+        printf '%s\n' "$content" >> "$tmp"
+    fi
+
+    chmod "$mode" "$tmp"
+    mv "$tmp" "$file"
+}
+
+# block_delete <file> <sentinel_id>  -- silent no-op if the block is absent
+block_delete() {
+    local file="$1" sentinel_id="$2"
+    local open close esc_open esc_close tmp mode
+
+    [ -f "$file" ] || return 0
+
+    open="$(block_marker_open "$sentinel_id")"
+    close="$(block_marker_close "$sentinel_id")"
+    esc_open="$(printf '%s' "$open" | sed 's/[.[\*^$/]/\\&/g')"
+    esc_close="$(printf '%s' "$close" | sed 's/[.[\*^$/]/\\&/g')"
+
+    mode="$(stat -c '%a' "$file")"
+    tmp="$(mktemp "${file}.XXXXXX")"
+    CLEANUP_TMPFILES+=("$tmp")
+
+    sed "/^${esc_open}\$/,/^${esc_close}\$/d" "$file" > "$tmp" \
+        || die "$E_IO" "failed to update $file"
+
+    chmod "$mode" "$tmp"
+    mv "$tmp" "$file"
+}
+
+# ---------------------------------------------------------------------------
+# 5. Lock helpers
+# ---------------------------------------------------------------------------
+
+# store_lock_writable <fd> -- shared writability pre-check: `exec N>file`
+# is a bash special builtin, and a failed bare-redirect exec TERMINATES THE
+# WHOLE SHELL outright (this bypasses `||` entirely -- it's not a normal
+# command failure). Checking writability first avoids ever attempting the
+# risky exec when it would fail; a permission change in the narrow window
+# between this check and the exec is an accepted, extremely unlikely race.
+#
+# NOTE: never attach `2>/dev/null` (or any redirect) to a *bare* `exec`
+# statement below. Bash applies a bare exec's redirects to the current
+# shell PERMANENTLY, not just to that one statement -- `exec 9>f 2>/dev/null`
+# would silently discard this process's stderr (including every later
+# warn()) for the rest of its run. This is exactly the bug that motivated
+# this comment: it shipped once and silently ate every warning after the
+# first store_lock call.
+store_lock_writable() {
+    if [ -e "$LOCK_FILE" ]; then
+        [ -w "$LOCK_FILE" ]
+    else
+        [ -w "$(dirname "$LOCK_FILE")" ]
+    fi
+}
+
+store_lock() {
+    store_lock_writable || die "$E_IO" "cannot open lock file $LOCK_FILE"
+    exec 9>"$LOCK_FILE" || die "$E_IO" "cannot open lock file $LOCK_FILE"
+    flock -w "$LOCK_WAIT" 9 || die "$E_IO" "could not acquire lock on $LOCK_FILE (busy)"
+}
+
+store_unlock() {
+    exec 9>&-
+}
+
+# store_lock_soft / store_unlock_soft -- like store_lock/store_unlock but
+# return 1 instead of dying on failure to open or acquire the lock.
+# Used only by images_write, whose failures must never affect exit code.
+store_lock_soft() {
+    store_lock_writable || return 1
+    exec 9>"$LOCK_FILE" || return 1
+    flock -w "$LOCK_WAIT" 9 2>/dev/null || { exec 9>&-; return 1; }
+}
+
+store_unlock_soft() {
+    exec 9>&-
+}
+
+# ---------------------------------------------------------------------------
+# 6. Pre-check helpers
+# ---------------------------------------------------------------------------
+
+require_cmds() {
+    local missing=() cmd
+    for cmd in "$@"; do
+        command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+    done
+    [ "${#missing[@]}" -eq 0 ] && return 0
+
+    local missing_str="" pkgs=() seen="" pkg
+    for cmd in "${missing[@]}"; do
+        if [ -z "$missing_str" ]; then missing_str="$cmd"; else missing_str="$missing_str, $cmd"; fi
+        pkg="${DEP_PACKAGE[$cmd]:-$cmd}"
+        case " $seen " in
+            *" $pkg "*) ;;
+            *) pkgs+=("$pkg"); seen="$seen $pkg" ;;
+        esac
+    done
+    local pkgs_str="" p
+    for p in "${pkgs[@]}"; do
+        if [ -z "$pkgs_str" ]; then pkgs_str="$p"; else pkgs_str="$pkgs_str $p"; fi
+    done
+
+    printf 'error: those commands not available: %s\n' "$missing_str" >&2
+    printf 'please run "sudo apt install %s -y" to install\n' "$pkgs_str" >&2
+    exit "$E_PRECHECK"
+}
+
+precheck_common() { require_cmds git realpath jq; }
+
+precheck_store() {
+    [ -f "$REPOS_FILE" ] || die "$E_PRECHECK" "$REPOS_FILE not found; run 'git-utils repo add' first"
+    jq empty "$REPOS_FILE" >/dev/null 2>&1 || die "$E_IO" "$REPOS_FILE is not valid JSON"
+}
+
+# ---------------------------------------------------------------------------
+# 7. Parsing layer
+# ---------------------------------------------------------------------------
+
+validate_part() {
+    local value="$1" minlen="$2" label="$3"
+    if [[ ! "$value" =~ ^[$CHARSET]+$ ]]; then
+        die "$E_ARGS" "invalid $label: '$value'"
+    fi
+    if [ "${#value}" -lt "$minlen" ]; then
+        die "$E_ARGS" "invalid $label: '$value' (minimum length $minlen)"
+    fi
+}
+
+# parse_repo_name <value>  -- sets REPO_ORG, REPO_NAME, REPO_BRANCH
+parse_repo_name() {
+    local input="$1"
+    local -a parts
+    IFS='/' read -r -a parts <<< "$input"
+    local n="${#parts[@]}"
+
+    case "$n" in
+        3)
+            REPO_ORG="${parts[0]}"
+            REPO_NAME="${parts[1]}"
+            REPO_BRANCH="${parts[2]}"
+            ;;
+        2)
+            REPO_ORG="${parts[0]}"
+            REPO_NAME="${parts[1]}"
+            REPO_BRANCH="${GH_DEFAULT_BRANCH:-$DEFAULT_BRANCH_FALLBACK}"
+            ;;
+        1)
+            REPO_NAME="${parts[0]}"
+            [ -n "${GH_DEFAULT_ORG:-}" ] || die "$E_ARGS" "no org given and GH_DEFAULT_ORG is not set"
+            REPO_ORG="$GH_DEFAULT_ORG"
+            REPO_BRANCH="${GH_DEFAULT_BRANCH:-$DEFAULT_BRANCH_FALLBACK}"
+            ;;
+        *)
+            die "$E_ARGS" "invalid repo name: '$input'"
+            ;;
+    esac
+
+    validate_part "$REPO_ORG" 3 "org"
+    validate_part "$REPO_NAME" 3 "name"
+    validate_part "$REPO_BRANCH" 1 "branch"
+}
+
+# resolve_target [<value>]  -- sets TARGET_KIND (path|fullname|key), TARGET_VALUE
+resolve_target() {
+    local value="${1:-}" raw="${1:-}"
+    [ -n "$raw" ] || raw="."
+
+    case "$raw" in
+        .|..|/*|./*|../*|~*)
+            TARGET_KIND="path"
+            TARGET_VALUE="$(realpath -m -- "$raw")"
+            return
+            ;;
+    esac
+
+    if [[ "$value" == */* ]]; then
+        TARGET_KIND="fullname"
+        parse_repo_name "$value"
+        TARGET_VALUE="$value"
+    else
+        TARGET_KIND="key"
+        validate_part "$value" 3 "key"
+        TARGET_VALUE="$value"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 8. Store layer -- repos_*
+# ---------------------------------------------------------------------------
+
+repos_init() {
+    [ -f "$REPOS_FILE" ] || printf '{}' | atomic_write "$REPOS_FILE" 600
+}
+
+repos_check() {
+    local key="$1"
+    jq -e --arg k "$key" 'has($k)' "$REPOS_FILE" >/dev/null 2>&1
+}
+
+repos_check_by_name() {
+    local org="$1" name="$2" branch="$3"
+    jq -r --arg org "$org" --arg name "$name" --arg branch "$branch" \
+        'to_entries[] | select(.value.org==$org and .value.name==$name and .value.branch==$branch) | .key' \
+        "$REPOS_FILE" | head -n1
+}
+
+repos_find_by_location() {
+    local path="$1"
+    jq -r --arg p "$path" \
+        'to_entries[] | select(.value.locations[]?.path==$p) | .key' \
+        "$REPOS_FILE" | head -n1
+}
+
+# repos_load_record <key> -- sets REC_KEY, REC_NAME, REC_ORG, REC_BRANCH, REC_LOCATIONS (array)
+repos_load_record() {
+    local key="$1" json
+    json="$(jq -c --arg k "$key" '.[$k]' "$REPOS_FILE")"
+    REC_KEY="$key"
+    REC_NAME="$(jq -r '.name' <<< "$json")"
+    REC_ORG="$(jq -r '.org' <<< "$json")"
+    REC_BRANCH="$(jq -r '.branch' <<< "$json")"
+    mapfile -t REC_LOCATIONS < <(jq -r '.locations[]?.path' <<< "$json")
+}
+
+# repos_resolve -- dispatches on TARGET_KIND set by resolve_target; exits 5 if not found
+repos_resolve() {
+    local key=""
+    case "$TARGET_KIND" in
+        key)
+            repos_check "$TARGET_VALUE" || die "$E_NOTFOUND" "no repo registered for key '$TARGET_VALUE'"
+            key="$TARGET_VALUE"
+            ;;
+        fullname)
+            key="$(repos_check_by_name "$REPO_ORG" "$REPO_NAME" "$REPO_BRANCH")"
+            [ -n "$key" ] || die "$E_NOTFOUND" "no repo registered for $REPO_ORG/$REPO_NAME/$REPO_BRANCH"
+            ;;
+        path)
+            key="$(repos_find_by_location "$TARGET_VALUE")"
+            [ -n "$key" ] || die "$E_NOTFOUND" "no repo registered at location '$TARGET_VALUE'"
+            ;;
+    esac
+    repos_load_record "$key"
+}
+
+repos_add() {
+    local key="$1" org="$2" name="$3" branch="$4" priv="$5" pub="$6" tmp
+    tmp="$(jq --arg k "$key" --arg name "$name" --arg org "$org" --arg branch "$branch" \
+        --arg priv "$priv" --arg pub "$pub" \
+        '. + {($k): {name:$name, org:$org, branch:$branch, private_key:$priv, public_key:$pub, locations: [], images: []}}' \
+        "$REPOS_FILE")" || return 1
+    printf '%s' "$tmp" | atomic_write "$REPOS_FILE" 600
+}
+
+repos_delete() {
+    local key="$1" tmp
+    tmp="$(jq --arg k "$key" 'del(.[$k])' "$REPOS_FILE")" || return 1
+    printf '%s' "$tmp" | atomic_write "$REPOS_FILE" 600
+}
+
+repos_locations_list() {
+    local key="$1"
+    jq -r --arg k "$key" '.[$k].locations[]?.path' "$REPOS_FILE"
+}
+
+repos_locations_add() {
+    local key="$1" path="$2" tmp
+    if ! repos_check "$key"; then
+        warn "repo record '$key' no longer exists; location not recorded"
+        return 0
+    fi
+    tmp="$(jq --arg k "$key" --arg p "$path" \
+        '.[$k].locations = ((.[$k].locations // []) + [{path:$p}] | unique_by(.path))' \
+        "$REPOS_FILE")" || return 1
+    printf '%s' "$tmp" | atomic_write "$REPOS_FILE" 600
+}
+
+repos_locations_remove() {
+    local key="$1" path="$2" tmp
+    tmp="$(jq --arg k "$key" --arg p "$path" \
+        '.[$k].locations = ((.[$k].locations // []) | map(select(.path != $p)))' \
+        "$REPOS_FILE")" || return 1
+    printf '%s' "$tmp" | atomic_write "$REPOS_FILE" 600
+}
+
+# repos_get_images <key>
+# Prints the stored `images` value: the compact JSON array if the field is
+# present, or the literal string "null" if absent. The null/array
+# distinction lets images_write force exactly one write when migrating a
+# legacy record, even if the freshly computed result is [].
+repos_get_images() {
+    local key="$1"
+    jq -c --arg k "$key" 'if (.[$k] | has("images")) then .[$k].images else null end' "$REPOS_FILE"
+}
+
+repos_set_images() {
+    local key="$1" images_json="$2" tmp
+    tmp="$(jq --arg k "$key" --argjson imgs "$images_json" \
+        '.[$k].images = $imgs' "$REPOS_FILE")" || return 1
+    printf '%s' "$tmp" | atomic_write "$REPOS_FILE" 600
+}
+
+repos_list() {
+    jq -r 'to_entries[] | [.key, .value.org, .value.name, .value.branch] | @tsv' "$REPOS_FILE"
+}
+
+repos_keys() {
+    jq -r 'to_entries[] | [.key, .value.private_key, .value.org, .value.name, .value.branch] | @tsv' "$REPOS_FILE"
+}
+
+display_url() {
+    local org="$1" name="$2" branch="$3"
+    printf 'https://github.com/%s/%s/%s' "$org" "$name" "$branch"
+}
+
+clone_url() {
+    local key="$1" org="$2" name="$3"
+    printf 'git@%s.repo:%s/%s.git' "$key" "$org" "$name"
+}
+
+# ---------------------------------------------------------------------------
+# 9. Images layer -- images_*
+# ---------------------------------------------------------------------------
+
+# images_read_file <loc> -- source A; prints one image ref per line
+images_read_file() {
+    local loc="$1"
+    local f="$loc/$IMAGES_FILE_NAME"
+    [ -e "$f" ] || return 0
+    if [ -d "$f" ]; then
+        warn "$f is a directory, ignoring"
+        return 0
+    fi
+    if [ ! -r "$f" ]; then
+        warn "$f is not readable, ignoring"
+        return 0
+    fi
+    sed -e 's/\r//g' -e 's/#.*$//' \
+        -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+        -e '/^$/d' "$f"
+}
+
+# images_is_compose_project <loc> -- true/false via exit status
+images_is_compose_project() {
+    local loc="$1" f
+    for f in "$loc/compose.yml" "$loc/compose.yaml" "$loc/docker-compose.yml" "$loc/docker-compose.yaml"; do
+        [ -e "$f" ] && return 0
+    done
+    return 1
+}
+
+# images_compose_available -- v2 plugin probe; never touches the daemon
+images_compose_available() {
+    command -v docker >/dev/null 2>&1 || return 1
+    docker compose version >/dev/null 2>&1
+}
+
+# images_compose_config_json <loc>
+# Prints `docker compose config --format json`, preferring --profile '*'.
+# Verifies the wildcard actually pulled in every declared profile's
+# services by comparing against an explicit --profile <name>... run; falls
+# back to the explicit list if they differ. Costs one extra `config` call
+# only when the compose file declares at least one profile.
+images_compose_config_json() {
+    local loc="$1"
+    local -a declared=()
+    mapfile -t declared < <(cd "$loc" && docker compose config --profiles 2>/dev/null)
+
+    local -a profile_args=(--profile "$COMPOSE_PROFILE_WILDCARD")
+    if [ "${#declared[@]}" -gt 0 ]; then
+        local -a explicit_args=()
+        local p
+        for p in "${declared[@]}"; do explicit_args+=(--profile "$p"); done
+
+        local wildcard_keys explicit_keys
+        wildcard_keys="$(cd "$loc" && docker compose --profile "$COMPOSE_PROFILE_WILDCARD" config --format json 2>/dev/null | jq -rS '.services // {} | keys')"
+        explicit_keys="$(cd "$loc" && docker compose "${explicit_args[@]}" config --format json 2>/dev/null | jq -rS '.services // {} | keys')"
+
+        [ "$wildcard_keys" = "$explicit_keys" ] || profile_args=("${explicit_args[@]}")
+    fi
+
+    ( cd "$loc" && docker compose "${profile_args[@]}" config --format json )
+}
+
+# images_compose_extract <loc> -- source B; prints one image ref per line.
+# Returns 2 (and warns) specifically when `config` itself failed, so the
+# caller's mapfile naturally yields B=∅ without extra plumbing.
+images_compose_extract() {
+    local loc="$1" json
+    json="$(images_compose_config_json "$loc")" || { warn "docker compose config failed for $loc"; return 2; }
+    jq -r '[.services // {} | to_entries[]
+            | select(.value.build == null)
+            | .value.image // empty
+            | select(. != "")] | .[]' <<< "$json"
+}
+
+# images_collect <loc>
+# Prints a compact, sorted, deduplicated JSON array on stdout and returns 0.
+# Returns 1 and prints nothing when the compose contribution is
+# indeterminate (compose project, docker compose unavailable) -- caller
+# must leave the stored `images` value untouched in that case.
+images_collect() {
+    local loc="$1"
+    local -a a_lines=() b_lines=()
+    mapfile -t a_lines < <(images_read_file "$loc")
+
+    if images_is_compose_project "$loc"; then
+        if ! images_compose_available; then
+            warn "docker compose not available; leaving images unchanged for $loc"
+            return 1
+        fi
+        mapfile -t b_lines < <(images_compose_extract "$loc")
+    fi
+
+    printf '%s\n' "${a_lines[@]}" "${b_lines[@]}" \
+        | sed '/^$/d' | sort -u | jq -R . | jq -sc .
+}
+
+# images_write <key> <new_json>
+# Best-effort: skips the write if unchanged, turns every failure (vanished
+# record, lock timeout, unwritable store) into a warning. Never call while
+# already holding the store lock -- store_lock_soft reuses fd 9, and the
+# two lock kinds are never held concurrently in this script.
+images_write() {
+    local key="$1" new_json="$2" current_json
+
+    repos_check "$key" || { warn "repo record '$key' no longer exists; images not recorded"; return 0; }
+
+    current_json="$(repos_get_images "$key")"
+    [ "$new_json" != "$current_json" ] || return 0
+
+    store_lock_soft || { warn "could not acquire lock to update images for '$key'"; return 0; }
+
+    if ! repos_check "$key"; then
+        store_unlock_soft
+        warn "repo record '$key' no longer exists; images not recorded"
+        return 0
+    fi
+    if ! repos_set_images "$key" "$new_json"; then
+        store_unlock_soft
+        warn "failed to write images for '$key'"
+        return 0
+    fi
+    store_unlock_soft
+}
+
+# images_update_record <key> <loc>
+# Orchestrates collect + write for one location. Silent on the
+# indeterminate case beyond images_collect's own warning.
+images_update_record() {
+    local key="$1" loc="$2" new_json
+    new_json="$(images_collect "$loc")" || return 0
+    images_write "$key" "$new_json"
+}
+
+# ---------------------------------------------------------------------------
+# 10. Key layer -- keys_*
+# ---------------------------------------------------------------------------
+
+keys_check() {
+    local key="$1"
+    [ -e "$SSH_DIR/${key}.key" ]
+}
+
+keys_preflight() {
+    [ -w "$SSH_DIR" ] || die "$E_IO" "$SSH_DIR is not writable"
+    if [ -e "$SSH_CONFIG" ]; then
+        [ -w "$SSH_CONFIG" ] || die "$E_IO" "$SSH_CONFIG is not writable"
+    fi
+}
+
+keys_add() {
+    local key="$1" host content
+
+    mkdir -p "$SSH_DIR"
+    chmod 700 "$SSH_DIR"
+    [ -e "$SSH_CONFIG" ] || { : > "$SSH_CONFIG"; chmod 600 "$SSH_CONFIG"; }
+
+    host="$(hostname)"
+    ssh-keygen -t ed25519 \
+        -C "deploy@${host}.${key}" \
+        -f "$SSH_DIR/${key}.key" \
+        -N '' >/dev/null 2>&1 \
+        || die "$E_IO" "failed to generate deploy key for '$key'"
+    chmod 600 "$SSH_DIR/${key}.key"
+
+    content="$(block_marker_open "$key")
+Host ${key}.repo
+    HostName github.com
+    AddKeysToAgent yes
+    StrictHostKeyChecking no
+    PreferredAuthentications publickey
+    IdentityFile ${SSH_DIR}/${key}.key
+
+$(block_marker_close "$key")"
+
+    block_upsert "$SSH_CONFIG" "$key" "$content"
+    chmod 600 "$SSH_CONFIG"
+}
+
+keys_delete() {
+    local key="$1"
+    rm -f "$SSH_DIR/${key}.key" "$SSH_DIR/${key}.key.pub"
+    block_delete "$SSH_CONFIG" "$key"
+    [ -f "$SSH_CONFIG" ] && chmod 600 "$SSH_CONFIG"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# 11. Command implementations
+# ---------------------------------------------------------------------------
+
+cmd_setup() {
+    local opt_org="" opt_branch=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_setup; exit 0 ;;
+            -o|--default-org)
+                [ $# -ge 2 ] || die "$E_ARGS" "--default-org requires a value"
+                opt_org="$2"; shift 2 ;;
+            --default-org=*) opt_org="${1#*=}"; shift ;;
+            -b|--default-branch)
+                [ $# -ge 2 ] || die "$E_ARGS" "--default-branch requires a value"
+                opt_branch="$2"; shift 2 ;;
+            --default-branch=*) opt_branch="${1#*=}"; shift ;;
+            --) shift ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) die "$E_ARGS" "unexpected argument: $1" ;;
+        esac
+    done
+
+    [ -z "$opt_org" ] || validate_part "$opt_org" 3 "org"
+    [ -z "$opt_branch" ] || validate_part "$opt_branch" 1 "branch"
+
+    local sbin=""
+    if [ -d /usr/local/sbin ]; then
+        sbin=/usr/local/sbin
+    elif [ -d /usr/sbin ]; then
+        sbin=/usr/sbin
+    else
+        die "$E_PRECHECK" "neither /usr/local/sbin nor /usr/sbin exists"
+    fi
+
+    local SUDO=""
+    if [ ! -w "$sbin" ]; then
+        command -v sudo >/dev/null 2>&1 || die "$E_PRECHECK" "$sbin is not writable and sudo is not available"
+        SUDO="sudo"
+    fi
+
+    local self
+    self="$(realpath "${BASH_SOURCE[0]}")"
+
+    if [ -e "$sbin/git-utils" ] || [ -L "$sbin/git-utils" ]; then
+        warn "$sbin/git-utils already exists, skipping symlink"
+    else
+        $SUDO ln -s "$self" "$sbin/git-utils"
+        $SUDO chmod +x "$self"
+    fi
+
+    local existing_org="" existing_branch=""
+    if [ -f "$BASHRC" ]; then
+        local block
+        block="$(awk -v open="$(block_marker_open "")" -v close_marker="$(block_marker_close "")" \
+            '$0==open{f=1;next} $0==close_marker{f=0} f' "$BASHRC")"
+        existing_org="$(printf '%s\n' "$block" | sed -n 's/^export GH_DEFAULT_ORG="\(.*\)"$/\1/p')"
+        existing_branch="$(printf '%s\n' "$block" | sed -n 's/^export GH_DEFAULT_BRANCH="\(.*\)"$/\1/p')"
+    fi
+
+    local final_org="${opt_org:-$existing_org}"
+    local final_branch="${opt_branch:-$existing_branch}"
+
+    local path_needed=1
+    case ":$PATH:" in
+        *":$sbin:"*) path_needed=0 ;;
+    esac
+
+    local body=""
+    [ "$path_needed" -eq 1 ] && body+="export PATH=\"\$PATH:$sbin\""$'\n'
+    [ -n "$final_org" ] && body+="export GH_DEFAULT_ORG=\"$final_org\""$'\n'
+    [ -n "$final_branch" ] && body+="export GH_DEFAULT_BRANCH=\"$final_branch\""$'\n'
+
+    local content
+    content="$(block_marker_open "")"$'\n'"${body}$(block_marker_close "")"
+
+    block_upsert "$BASHRC" "" "$content"
+
+    [ -n "$final_org" ] && export GH_DEFAULT_ORG="$final_org"
+    [ -n "$final_branch" ] && export GH_DEFAULT_BRANCH="$final_branch"
+
+    info "setup complete."
+    info "note: already-open shells need 'source ~/.bashrc' to pick up the changes."
+}
+
+cmd_repo_add() {
+    local name_flag=""
+    local args=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_repo_add; exit 0 ;;
+            -n|--name)
+                [ $# -ge 2 ] || die "$E_ARGS" "--name requires a value"
+                name_flag="$2"; shift 2 ;;
+            --name=*) name_flag="${1#*=}"; shift ;;
+            --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    [ "${#args[@]}" -ge 1 ] || { help_repo_add; exit "$E_ARGS"; }
+    [ "${#args[@]}" -le 1 ] || die "$E_ARGS" "unexpected argument: ${args[1]}"
+    local repo_arg="${args[0]}"
+
+    require_cmds git realpath jq ssh-keygen
+
+    parse_repo_name "$repo_arg"
+    local key="${name_flag:-$REPO_NAME}"
+    validate_part "$key" 3 "key"
+
+    if [ -e "$SSH_DIR" ]; then
+        [ -w "$SSH_DIR" ] || die "$E_IO" "$SSH_DIR is not writable"
+    else
+        mkdir -p "$SSH_DIR" || die "$E_IO" "cannot create $SSH_DIR"
+        chmod 700 "$SSH_DIR" || die "$E_IO" "cannot set permissions on $SSH_DIR"
+    fi
+    if [ -e "$SSH_CONFIG" ]; then
+        [ -w "$SSH_CONFIG" ] || die "$E_IO" "$SSH_CONFIG is not writable"
+    else
+        { : > "$SSH_CONFIG"; } 2>/dev/null || die "$E_IO" "cannot create $SSH_CONFIG"
+        chmod 600 "$SSH_CONFIG" || die "$E_IO" "cannot set permissions on $SSH_CONFIG"
+    fi
+    if [ -e "$REPOS_FILE" ]; then
+        [ -w "$REPOS_FILE" ] || die "$E_IO" "$REPOS_FILE is not writable"
+    else
+        [ -w "$HOME" ] || die "$E_IO" "$HOME is not writable"
+    fi
+
+    store_lock
+    repos_init
+    if repos_check "$key"; then
+        store_unlock
+        die "$E_EXISTS" "repo key '$key' is already registered"
+    fi
+    if keys_check "$key"; then
+        store_unlock
+        die "$E_EXISTS" "deploy key '$key' already exists"
+    fi
+
+    keys_add "$key"
+
+    if ! repos_add "$key" "$REPO_ORG" "$REPO_NAME" "$REPO_BRANCH" \
+            "$SSH_DIR/${key}.key" "$SSH_DIR/${key}.key.pub"; then
+        keys_delete "$key"
+        store_unlock
+        die "$E_IO" "failed to write $REPOS_FILE; rolled back deploy key"
+    fi
+    store_unlock
+
+    local host; host="$(hostname)"
+    cat << EOF
+
+Add following key to Github deployment keys:
+
+   Key name: ${host}.${key}
+   Key value:
+   $(cat "$SSH_DIR/${key}.key.pub")
+
+Then use following command to clone github repository:
+
+   git-utils repo clone ${key}
+
+EOF
+}
+
+cmd_repo_delete() {
+    local force=0
+    local args=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_repo_delete; exit 0 ;;
+            -f|--force) force=1; shift ;;
+            --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    [ "${#args[@]}" -le 1 ] || die "$E_ARGS" "unexpected argument: ${args[1]}"
+    local target="${args[0]:-}"
+    FORCE="$force"
+
+    precheck_common
+    precheck_store
+
+    resolve_target "$target"
+    repos_resolve
+
+    keys_preflight
+
+    local loc
+    for loc in "${REC_LOCATIONS[@]}"; do
+        [ "$TARGET_KIND" = "path" ] && [ "$loc" = "$TARGET_VALUE" ] && continue
+        [ -e "$loc" ] || warn "recorded location no longer exists: $loc"
+    done
+
+    if [ "$TARGET_KIND" = "path" ] && [ -d "$TARGET_VALUE/.git" ]; then
+        local dirty
+        dirty="$(cd "$TARGET_VALUE" && git status --porcelain --ignored)"
+        if [ -n "$dirty" ]; then
+            confirm "'$TARGET_VALUE' has untracked/ignored files. Delete anyway?" || exit 0
+        fi
+    fi
+
+    local del_key="$REC_KEY"
+    local -a del_locations=("${REC_LOCATIONS[@]}")
+
+    store_lock
+    keys_delete "$del_key"
+    repos_delete "$del_key"
+    store_unlock
+
+    if [ "$TARGET_KIND" = "path" ]; then
+        case "$TARGET_VALUE" in
+            "/"|"$HOME") die "$E_IO" "refusing to delete $TARGET_VALUE" ;;
+        esac
+        local recorded_match=0 rl
+        for rl in "${del_locations[@]}"; do
+            [ "$rl" = "$TARGET_VALUE" ] && recorded_match=1
+        done
+        [ "$recorded_match" -eq 1 ] || die "$E_IO" "refusing to delete '$TARGET_VALUE': not a recorded location"
+
+        if ! rm -rf "$TARGET_VALUE"; then
+            warn "failed to remove folder; orphaned path: $TARGET_VALUE"
+            exit "$E_IO"
+        fi
+    fi
+
+    info "deleted repo '$del_key'"
+}
+
+cmd_repo_clone() {
+    local args=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_repo_clone; exit 0 ;;
+            --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    [ "${#args[@]}" -ge 1 ] || { help_repo_clone; exit "$E_ARGS"; }
+    [ "${#args[@]}" -le 2 ] || die "$E_ARGS" "unexpected argument: ${args[2]}"
+    local target="${args[0]}" dest="${args[1]:-}"
+
+    precheck_common
+    precheck_store
+
+    resolve_target "$target"
+    [ "$TARGET_KIND" != "path" ] || die "$E_ARGS" "repo clone requires a repo key or full repo name, not a path"
+
+    repos_resolve
+
+    local out="${dest:-$REC_NAME}"
+    [ ! -e "$out" ] || die "$E_EXISTS" "destination '$out' already exists"
+
+    git clone -b "$REC_BRANCH" "$(clone_url "$REC_KEY" "$REC_ORG" "$REC_NAME")" "$out" \
+        || die "$E_IO" "git clone failed"
+
+    local abs; abs="$(realpath -m -- "$out")"
+    store_lock
+    repos_locations_add "$REC_KEY" "$abs"
+    store_unlock
+
+    images_update_record "$REC_KEY" "$abs"
+
+    info "cloned into $out"
+}
+
+cmd_repo_update() {
+    local all=0
+    local args=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_repo_update; exit 0 ;;
+            -a|--all) all=1; shift ;;
+            --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    [ "${#args[@]}" -le 1 ] || die "$E_ARGS" "unexpected argument: ${args[1]}"
+    local target="${args[0]:-}"
+
+    precheck_common
+    precheck_store
+
+    resolve_target "$target"
+    repos_resolve
+
+    local -a targets=()
+    if [ "$TARGET_KIND" = "path" ] && [ "$all" -ne 1 ]; then
+        targets=("$TARGET_VALUE")
+        local loc
+        for loc in "${REC_LOCATIONS[@]}"; do
+            [ "$loc" = "$TARGET_VALUE" ] || warn "not updating other tracked location: $loc"
+        done
+    else
+        targets=("${REC_LOCATIONS[@]}")
+    fi
+
+    local -a failed=() succeeded=()
+    local loc
+    for loc in "${targets[@]}"; do
+        if [ ! -d "$loc" ] || [ ! -d "$loc/.git" ]; then
+            warn "skipping missing or non-git location: $loc"
+            continue
+        fi
+        if ( cd "$loc" && git fetch origin && git reset --hard "origin/$REC_BRANCH" && git clean -fd ); then
+            succeeded+=("$loc")
+        else
+            failed+=("$loc")
+        fi
+    done
+
+    # Image collection happens once per invocation, regardless of --all:
+    #   TARGET_KIND=path         -> only that exact path, and only if it succeeded
+    #   TARGET_KIND=key|fullname -> first location in REC_LOCATIONS order that succeeded
+    local collect_loc="" l
+    if [ "$TARGET_KIND" = "path" ]; then
+        for l in "${succeeded[@]}"; do
+            [ "$l" = "$TARGET_VALUE" ] && collect_loc="$TARGET_VALUE"
+        done
+    else
+        for loc in "${REC_LOCATIONS[@]}"; do
+            for l in "${succeeded[@]}"; do
+                [ "$l" = "$loc" ] && collect_loc="$loc"
+            done
+            [ -n "$collect_loc" ] && break
+        done
+    fi
+    [ -z "$collect_loc" ] || images_update_record "$REC_KEY" "$collect_loc"
+
+    if [ "${#failed[@]}" -gt 0 ]; then
+        warn "update failed for:"
+        for loc in "${failed[@]}"; do
+            warn "  $loc"
+        done
+        exit "$E_IO"
+    fi
+}
+
+cmd_repo_list() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_repo_list; exit 0 ;;
+            *) die "$E_ARGS" "unexpected argument: $1" ;;
+        esac
+    done
+    precheck_common
+    precheck_store
+    while IFS=$'\t' read -r key org name branch; do
+        [ -n "$key" ] || continue
+        printf '%s %s\n' "$key" "$(display_url "$org" "$name" "$branch")"
+    done < <(repos_list)
+}
+
+cmd_repo_keys() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_repo_keys; exit 0 ;;
+            *) die "$E_ARGS" "unexpected argument: $1" ;;
+        esac
+    done
+    precheck_common
+    precheck_store
+    while IFS=$'\t' read -r key priv org name branch; do
+        [ -n "$key" ] || continue
+        printf '%s %s\n' "$priv" "$(display_url "$org" "$name" "$branch")"
+    done < <(repos_keys)
+}
+
+# ---------------------------------------------------------------------------
+# 12. Help screens
+# ---------------------------------------------------------------------------
+
+help_main() {
+    cat << 'EOF'
+git-utils - manage tracked git/GitHub repos and their deploy keys
+
+Usage:
+  git-utils setup [-o <org>] [-b <branch>]
+  git-utils repo add <org/name[/branch]> [-n <key>]
+  git-utils repo delete [<repo_or_path>] [-f]
+  git-utils repo clone <repo> [<folder_name>]
+  git-utils repo update [<repo_or_path>] [-a]
+  git-utils repo list
+  git-utils repo keys
+
+Aliases:
+  git-utils repos ...   same as 'git-utils repo ...'
+  git-utils update ...  same as 'git-utils repo update ...'
+
+Run 'git-utils <command> -h' for command-specific help.
+EOF
+}
+
+help_setup() {
+    cat << 'EOF'
+git-utils setup [-o|--default-org <org>] [-b|--default-branch <branch>]
+
+Installs git-utils as a symlink in /usr/local/sbin (or /usr/sbin) and
+configures GH_DEFAULT_ORG / GH_DEFAULT_BRANCH in ~/.bashrc.
+
+Already-open shells must run 'source ~/.bashrc' to see the changes.
+EOF
+}
+
+help_repo_add() {
+    cat << 'EOF'
+git-utils repo add <org/name/branch | org/name | name> [-n|--name <key>]
+
+Registers a repo and generates a GitHub deploy key for it.
+If <org> is omitted, GH_DEFAULT_ORG must be set.
+If <branch> is omitted, GH_DEFAULT_BRANCH (or 'main') is used.
+The registered key defaults to the repo name; override with --name.
+EOF
+}
+
+help_repo_delete() {
+    cat << 'EOF'
+git-utils repo delete [<repo_key_or_full_name_or_path>] [-f|--force]
+
+Removes a tracked repo, its deploy key, and (if a path/current folder
+was given) the cloned folder itself. With no argument, the current
+folder is used.
+EOF
+}
+
+help_repo_clone() {
+    cat << 'EOF'
+git-utils repo clone <repo_key_or_full_name> [<folder_name>]
+
+Clones a tracked repo using its deploy key. Defaults the destination
+folder to the repo name.
+EOF
+}
+
+help_repo_update() {
+    cat << 'EOF'
+git-utils repo update [<repo_key_or_full_name_or_path>] [-a|--all]
+
+Fetches and hard-resets a tracked repo to its remote branch. With no
+argument, the current folder is used. With a path and without --all,
+only that location is updated; --all updates every tracked location.
+EOF
+}
+
+help_repo_list() {
+    cat << 'EOF'
+git-utils repo list
+
+Lists each registered repo key with its display URL.
+EOF
+}
+
+help_repo_keys() {
+    cat << 'EOF'
+git-utils repo keys
+
+Lists each registered repo's deploy key file path with its display URL.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# 13. Argument router
+# ---------------------------------------------------------------------------
+
+main() {
+    local cmd="${1:-}"
+    case "$cmd" in
+        "")
+            help_main
+            exit "$E_ARGS"
+            ;;
+        -h|--help)
+            help_main
+            exit 0
+            ;;
+        setup)
+            shift
+            cmd_setup "$@"
+            ;;
+        repo|repos)
+            shift
+            local sub="${1:-}"
+            case "$sub" in
+                "")
+                    help_main
+                    exit "$E_ARGS"
+                    ;;
+                -h|--help)
+                    help_main
+                    exit 0
+                    ;;
+                add) shift; cmd_repo_add "$@" ;;
+                delete) shift; cmd_repo_delete "$@" ;;
+                clone) shift; cmd_repo_clone "$@" ;;
+                update) shift; cmd_repo_update "$@" ;;
+                list) shift; cmd_repo_list "$@" ;;
+                keys) shift; cmd_repo_keys "$@" ;;
+                *)
+                    help_main
+                    exit "$E_ARGS"
+                    ;;
+            esac
+            ;;
+        update)
+            shift
+            cmd_repo_update "$@"
+            ;;
+        *)
+            help_main
+            exit "$E_ARGS"
+            ;;
+    esac
+}
+
+main "$@"
