@@ -187,7 +187,13 @@ r t2 2 'unexpected argument'                   hdd extra
 r t3 2 'unknown flag'                          hdd --nope
 
 echo "== 76-80: router =="
-r 78 2 'Usage:'                    # bare invocation
+# Bare invocation now depends on whether stdin is a TTY, so the mode must be
+# pinned explicitly or this test passes or fails according to how the suite
+# was launched. Non-TTY with nothing on stdin is the documented error; the
+# TTY path (which still prints help) is covered by E8 in test-file.sh.
+OUT78="$(bash "$SCRIPT" < /dev/null 2>&1)"; RC78=$?
+if [ "$RC78" = 2 ]; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); FAILURES+=("78: rc=$RC78 want 2"); fi
+if grep -q "no configuration received on stdin" <<< "$OUT78"; then PASS=$((PASS+1)); else FAIL=$((FAIL+1)); FAILURES+=("78b: unexpected output :: $OUT78"); fi
 r 79a 0 'Usage:'         --help
 r 79b 0 'system-setup ip'          ip --help
 r 79c 0 'system-setup hdd'         hdd -h

@@ -31,7 +31,9 @@ readonly TIMESYNCD_FILE="/etc/systemd/timesyncd.conf"
 readonly TIMESYNCD_BAK="/etc/systemd/timesyncd.conf.bak"
 readonly DOCKER_DAEMON_FILE="/etc/docker/daemon.json"
 readonly SYSCTL_IPV6_FILE="/etc/sysctl.d/99-system-setup-ipv6.conf"
-readonly SHORTCUTS_NAME="docker-shortcuts"
+readonly SHORTCUTS_NAME="command-shortcuts"
+readonly BASHRC_ID_SHORTCUTS="shortcuts"
+readonly BASHRC_ID_DOCKER="docker"
 readonly ZONEINFO_DIR="/usr/share/zoneinfo"
 
 readonly DEFAULT_DEVICE="/dev/sdb"
@@ -55,6 +57,7 @@ readonly DOCKER_SOURCES="/etc/apt/sources.list.d/docker.list"
 
 declare -A DEP_PACKAGE=(
     [jq]="jq"
+    [yq]="yq"
     [realpath]="coreutils"
     [sfdisk]="util-linux"
     [blkid]="util-linux"
@@ -85,7 +88,7 @@ declare -a CLEANUP_TMPFILES=()
 
 # Resolved real path of this script, taken before any directory change.
 # realpath is preferred (it resolves the sbin symlink, which is how the
-# docker command finds its sibling docker-shortcuts); the cd/pwd form is a
+# setup command finds its sibling command-shortcuts); the cd/pwd form is a
 # fallback for the rare host without coreutils, and does not follow symlinks.
 if command -v realpath >/dev/null 2>&1; then
     SELF="$(realpath "${BASH_SOURCE[0]}")"
@@ -127,6 +130,17 @@ join_sp() {
     printf '%s' "$*"
 }
 
+# Currently UNREACHABLE, and kept deliberately.
+#
+# Every former call site sat behind `if [ "$FORCE" != "1" ]; then die; fi`,
+# and this function returns 0 on its first line when FORCE=1 - so no prompt
+# could execute in either branch. Those calls were removed rather than left to
+# imply an interaction that never happened.
+#
+# The function stays because it is part of the helper set shared with
+# git-utils, and because the escape hatch it implements is what any future
+# prompt would need. Note the consequence while there are none: the script is
+# now entirely non-interactive, and safe to drive from CI, Ansible or cron.
 confirm() {
     local prompt="$1" reply
     if [ "$FORCE" = "1" ]; then
@@ -1201,7 +1215,6 @@ cmd_hdd() {
             if [ "$FORCE" != "1" ]; then
                 die "$E_EXISTS" "refusing to touch $HDD_DEVICE (re-run with --force to override)"
             fi
-            confirm "DESTROY ALL DATA on $HDD_DEVICE and reformat it as $HDD_TYPE?" || exit "$E_OK"
             local p
             for p in $(dev_partitions "$HDD_DEVICE"); do
                 mnt="$(mount_point_of "/dev/$p")"
@@ -1225,14 +1238,12 @@ cmd_hdd() {
                     if [ "$FORCE" != "1" ]; then
                         die "$E_EXISTS" "$part is mounted at $mnt, not $HDD_MOUNT (re-run with --force to move it)"
                     fi
-                    confirm "Unmount $part from $mnt and mount it at $HDD_MOUNT instead?" || exit "$E_OK"
                     umount "$part" || die "$E_IO" "failed to unmount $part"
                 fi
             else
                 if [ "$FORCE" != "1" ]; then
                     die "$E_EXISTS" "$part is formatted as '${fstype:-unformatted}', not '$HDD_TYPE' (re-run with --force to reformat)"
                 fi
-                confirm "Reformat $part from '${fstype:-unformatted}' to '$HDD_TYPE'? ALL DATA on it will be destroyed." || exit "$E_OK"
                 if [ -n "$mnt" ]; then
                     umount "$part" || die "$E_IO" "failed to unmount $part"
                 fi
@@ -1330,61 +1341,117 @@ docker_workspace() {
     return 0
 }
 
-docker_shortcuts_path() {
+# --- shell shortcuts -------------------------------------------------------
+#
+# Installed by cmd_setup, not cmd_docker. The file is named command-shortcuts
+# because its contents are no longer docker-specific; setup is the command
+# that already exists to make these tools usable in a shell.
+
+shortcuts_path() {
     local src
     src="$(dirname "$SELF")/$SHORTCUTS_NAME"
     [ -f "$src" ] || return 1
     realpath "$src"
 }
 
-docker_shortcuts_install() {
-    local src content
-    if ! src="$(docker_shortcuts_path)"; then
+# A CRLF-terminated file breaks every login shell that sources it
+# ("$'\r': command not found", then a syntax error). This repo is authored
+# on Windows and deployed to Linux, so it is a live hazard, and a broken
+# ~/.bashrc is a nasty thing to hand someone.
+shortcuts_is_crlf() {
+    LC_ALL=C grep -q "$(printf '\r')" "$1" 2>/dev/null
+}
+
+# The [ -f ] guard is mandatory: a repository that is later moved or deleted
+# must not break the operator's login shell.
+shortcuts_line() { printf '[ -f "%s" ] && . "%s"' "$1" "$1"; }
+
+# Remove a LEGACY docker-id shortcuts block.
+#
+# The "docker" sentinel id is REUSED by this change: it used to hold the
+# source line, and now holds the DOCKER_HOME export written by cmd_docker.
+# The two are therefore told apart by CONTENT, not by id - a legacy block
+# sources a file, the new one only exports a variable.
+#
+# Only cmd_setup migrates. If cmd_docker did it too, a docker run could delete
+# a legacy block that setup has not yet replaced, losing the shortcuts until
+# the next setup.
+shortcuts_migrate() {
+    local bashrc="$1" block
+    [ -f "$bashrc" ] || return 0
+    block="$(block_extract "$bashrc" "$BASHRC_ID_DOCKER")" || return 0
+    [ -n "$block" ] || return 0
+    case "$block" in
+        *". \""*|*"source "*)
+            block_delete "$bashrc" "$BASHRC_ID_DOCKER"
+            info "removed the legacy docker-shortcuts block from $bashrc"
+            ;;
+    esac
+    return 0
+}
+
+shortcuts_install() {
+    local bashrc="$1" src content
+    if ! src="$(shortcuts_path)"; then
         warn "$SHORTCUTS_NAME not found beside the script at $(dirname "$SELF")/$SHORTCUTS_NAME; skipping the shell shortcuts"
         return 0
     fi
-
-    # A CRLF-terminated file breaks every login shell that sources it
-    # ("$'\r': command not found", then a syntax error). This repo is authored
-    # on Windows and deployed to Linux, so it is a live hazard, and a broken
-    # ~/.bashrc is a nasty thing to hand someone. Refuse rather than install it.
-    if LC_ALL=C grep -q "$(printf '\r')" "$src"; then
+    if shortcuts_is_crlf "$src"; then
         warn "$src has CRLF line endings and would break every login shell that sources it"
         warn "convert it to LF (dos2unix $src) and re-run; shell shortcuts not installed"
         return 0
     fi
+    if [ ! -e "$bashrc" ]; then
+        : > "$bashrc"
+        chmod 644 "$bashrc"
+    fi
+    content="$(block_marker_open "$BASHRC_ID_SHORTCUTS")
+$(shortcuts_line "$src")
+$(block_marker_close "$BASHRC_ID_SHORTCUTS")"
+    block_upsert "$bashrc" "$BASHRC_ID_SHORTCUTS" "$content"
+    info "shell shortcuts sourced from $src in $bashrc"
+    return 0
+}
+
+shortcuts_present() {
+    local bashrc="$1" src
+    src="$(shortcuts_path)" || return 1
+    # A file that has since become CRLF is NOT "present and fine" - the login
+    # shell is broken by it, and reporting success would hide that.
+    if shortcuts_is_crlf "$src"; then return 1; fi
+    [ -f "$bashrc" ] || return 1
+    grep -qF "$(block_marker_open "$BASHRC_ID_SHORTCUTS")" "$bashrc" || return 1
+    grep -qF "$(shortcuts_line "$src")" "$bashrc"
+}
+
+# DOCKER_HOME lives in ~/.bashrc, in this command's own sentinel block.
+#
+# It is set here rather than in command-shortcuts because the shortcuts are
+# installed by cmd_setup, which may run on a host that never gets docker at
+# all. Exporting the variable from the command that creates the workspace is
+# what lets the shortcuts guard on it: they appear exactly when the workspace
+# does, and not before.
+docker_home_install() {
+    local content
+    content="$(block_marker_open "$BASHRC_ID_DOCKER")
+export DOCKER_HOME=\"$DOCKER_WORKSPACE\"
+$(block_marker_close "$BASHRC_ID_DOCKER")"
 
     if [ ! -e "$DOCKER_BASHRC" ]; then
         : > "$DOCKER_BASHRC"
         chmod 644 "$DOCKER_BASHRC"
     fi
-
-    # Sentinel id "docker" is deliberately DISTINCT from the id-less block
-    # cmd_setup maintains in the same file; sharing an id would make each
-    # command silently delete the other's block.
-    # The [ -f ] guard is mandatory: a repository that is later moved or
-    # deleted must not break the operator's login shell.
-    content="$(block_marker_open docker)
-[ -f \"$src\" ] && . \"$src\"
-$(block_marker_close docker)"
-
-    block_upsert "$DOCKER_BASHRC" "docker" "$content"
+    block_upsert "$DOCKER_BASHRC" "$BASHRC_ID_DOCKER" "$content"
     # block_upsert writes through a root-owned temp file; hand it back.
     chown "$DOCKER_USER:" "$DOCKER_BASHRC"
-    info "shell shortcuts sourced from $src in $DOCKER_BASHRC"
+    info "DOCKER_HOME=$DOCKER_WORKSPACE exported in $DOCKER_BASHRC"
     return 0
 }
 
-docker_shortcuts_present() {
-    local src
-    src="$(docker_shortcuts_path)" || return 1
-    # A file that has since become CRLF is NOT "present and fine" - the user's
-    # login shell is broken by it, and reporting "already configured" would
-    # hide that. Returning false here makes the next run surface the warning.
-    if LC_ALL=C grep -q "$(printf '\r')" "$src" 2>/dev/null; then return 1; fi
+docker_home_present() {
     [ -f "$DOCKER_BASHRC" ] || return 1
-    grep -qF "$(block_marker_open docker)" "$DOCKER_BASHRC" || return 1
-    grep -qF "[ -f \"$src\" ] && . \"$src\"" "$DOCKER_BASHRC"
+    grep -qF "$(block_marker_open "$BASHRC_ID_DOCKER")" "$DOCKER_BASHRC" || return 1
+    grep -qF "export DOCKER_HOME=\"$DOCKER_WORKSPACE\"" "$DOCKER_BASHRC"
 }
 
 docker_do_install() {
@@ -1460,9 +1527,11 @@ docker_do_uninstall() {
         info "restored $DOCKER_DAEMON_FILE from its backup"
     fi
 
-    block_delete "$DOCKER_BASHRC" "docker"
+    # Removes the DOCKER_HOME block this command owns. The shell shortcuts are
+    # owned by cmd_setup and are deliberately left alone.
+    block_delete "$DOCKER_BASHRC" "$BASHRC_ID_DOCKER"
     [ ! -f "$DOCKER_BASHRC" ] || chown "$DOCKER_USER:" "$DOCKER_BASHRC"
-    info "shell shortcuts removed from $DOCKER_BASHRC"
+    info "DOCKER_HOME removed from $DOCKER_BASHRC"
 
     # This command never deletes data. Image and volume storage is left
     # exactly as it was, and removing it is a deliberate operator decision
@@ -1518,7 +1587,7 @@ cmd_docker() {
     DOCKER_UNINSTALL="$opt_uninstall"
     debug "resolved: network=${DOCKER_NETWORK:-none} size=${DOCKER_SIZE:-n/a} uninstall=$DOCKER_UNINSTALL"
 
-    require_cmds jq realpath
+    require_cmds jq
     require_sudo
     elevate "${ORIG_ARGS[@]}"
     docker_resolve_user
@@ -1531,14 +1600,14 @@ cmd_docker() {
     # Install mode. The workspace folder and the shell shortcuts are part of
     # the desired state of "Docker is set up on this host", so they are
     # converged on every run - not just the first install.
-    local installed=0 pool_ok=0 ws_ok=0 sc_ok=0
+    local installed=0 pool_ok=0 ws_ok=0 home_ok=0
     if docker_installed; then installed=1; fi
     if [ -z "$DOCKER_NETWORK" ]; then pool_ok=1; elif docker_pool_matches; then pool_ok=1; fi
     if [ -d "$DOCKER_WORKSPACE" ]; then ws_ok=1; fi
-    if docker_shortcuts_present; then sc_ok=1; fi
-    debug "state: installed=$installed pool_ok=$pool_ok workspace=$ws_ok shortcuts=$sc_ok"
+    if docker_home_present; then home_ok=1; fi
+    debug "state: installed=$installed pool_ok=$pool_ok workspace=$ws_ok docker_home=$home_ok"
 
-    if [ "$installed" -eq 1 ] && [ "$pool_ok" -eq 1 ] && [ "$ws_ok" -eq 1 ] && [ "$sc_ok" -eq 1 ]; then
+    if [ "$installed" -eq 1 ] && [ "$pool_ok" -eq 1 ] && [ "$ws_ok" -eq 1 ] && [ "$home_ok" -eq 1 ]; then
         info "docker already configured"
         exit "$E_OK"
     fi
@@ -1550,7 +1619,7 @@ cmd_docker() {
     fi
 
     docker_workspace
-    docker_shortcuts_install
+    docker_home_install
 
     if [ -n "$DOCKER_NETWORK" ] && [ "$pool_ok" -eq 0 ]; then
         docker_pool_write
@@ -1747,6 +1816,108 @@ declare -a FILE_ERRORS=()
 file_err() { FILE_ERRORS+=("$*"); }
 
 # jf <filter> [jq args...] -- raw value from the document, empty when absent
+# --- input format ----------------------------------------------------------
+#
+# JSON is tried FIRST, and yq is consulted only when that fails.
+#
+# yq would handle both - JSON is a subset of YAML - so routing everything
+# through it would work. But that would make yq a hard dependency for
+# operators who only ever use JSON, which is a regression on the behaviour
+# this command shipped with. Trying jq first keeps yq needed only by those who
+# actually want YAML, and yields a precise error per format instead of one
+# generic one.
+
+# yq_flavour -- "kislyuk" | "mikefarah" | "unknown"
+#
+# The two implementations are NOT interchangeable for this task. Debian ships
+# kislyuk's (a python wrapper around jq, Depends: jq), whose `yq .` emits
+# JSON. mikefarah's Go yq is far more commonly installed by hand, and with the
+# identical command emits YAML - which would then be handed to jq and fail
+# with a confusing parse error three steps later rather than a useful one.
+yq_flavour() {
+    local v
+    v="$(yq --version 2>&1)" || true
+    case "$v" in
+        *mikefarah*)   printf 'mikefarah' ;;
+        yq\ [0-9]*)    printf 'kislyuk' ;;
+        *)             printf 'unknown' ;;
+    esac
+}
+
+# yq_to_json <infile> <outfile>
+yq_to_json() {
+    case "$(yq_flavour)" in
+        kislyuk)   yq . "$1" > "$2" 2>/dev/null ;;
+        mikefarah) yq -o=json . "$1" > "$2" 2>/dev/null ;;
+        *) die "$E_PRECHECK" "unrecognised yq implementation; install the packaged one with 'sudo apt install yq -y'" ;;
+    esac
+}
+
+# file_spool_stdin -- read the document from stdin into a temp file.
+#
+# Spooling happens BEFORE anything else, and certainly before elevation: the
+# document can only be read once, and the elevated child would find an empty
+# stdin. See file_elevate.
+# Sets FILE_SPOOL rather than echoing the path. A command substitution runs
+# the function in a SUBSHELL, so `CLEANUP_TMPFILES+=(...)` there registers in a
+# copy that is discarded on return and the spool is never cleaned up. Assigning
+# to a global keeps the registration in the caller's shell.
+file_spool_stdin() {
+    FILE_SPOOL="$(mktemp /tmp/ss-stdin.XXXXXX)"
+    CLEANUP_TMPFILES+=("$FILE_SPOOL")
+    cat > "$FILE_SPOOL"
+    [ -s "$FILE_SPOOL" ] || die "$E_ARGS" "no configuration received on stdin"
+    return 0
+}
+
+# file_elevate -- re-run this command as root, then exit with its status.
+#
+# Two departures from the shared elevate(), both required here:
+#
+# 1. It RUNS sudo as a child instead of exec'ing into it. `exec` replaces the
+#    process without running the EXIT trap, which would leak every temp file
+#    created above - the stdin spool and any YAML conversion. Keeping the
+#    parent alive costs one process and makes cleanup automatic.
+# 2. It passes a REWRITTEN argv - `file <resolved-path>` - not ORIG_ARGS. The
+#    original may say `-`, or name a YAML file; either way the child must be
+#    handed the JSON that already exists, not asked to read a drained stdin or
+#    repeat the conversion.
+file_elevate() {
+    local rc=0
+    local -a argv=(file "$FILE_PATH")
+    if [ "$VERBOSE" = "1" ]; then argv+=(--verbose); fi
+    if [ "$FORCE" = "1" ]; then argv+=(--force); fi
+    debug "elevating: sudo -- $SELF $(join_sp "${argv[@]}")"
+    sudo -- "$SELF" "${argv[@]}" || rc=$?
+    exit "$rc"
+}
+
+# file_load <path> -- set FILE_SOURCE (for messages) and FILE_PATH (for jq).
+#
+# They differ for YAML: FILE_PATH becomes a temporary JSON conversion, and
+# quoting that path back at the operator would be actively unhelpful.
+file_load() {
+    FILE_SOURCE="$1"
+
+    if jq empty "$1" >/dev/null 2>&1; then
+        FILE_PATH="$1"
+        debug "input is JSON: $FILE_SOURCE"
+        return 0
+    fi
+
+    require_cmds yq
+    FILE_PATH="$(mktemp /tmp/ss-file.XXXXXX.json)"
+    CLEANUP_TMPFILES+=("$FILE_PATH")
+    yq_to_json "$1" "$FILE_PATH" \
+        || die "$E_IO" "'$FILE_SOURCE' is neither valid JSON nor valid YAML"
+    # yq can exit 0 having produced nothing useful for some inputs; make sure
+    # what came out is actually parseable before the pipeline trusts it.
+    jq empty "$FILE_PATH" >/dev/null 2>&1 \
+        || die "$E_IO" "'$FILE_SOURCE' is neither valid JSON nor valid YAML"
+    debug "input is YAML: $FILE_SOURCE -> $FILE_PATH"
+    return 0
+}
+
 jf() { jq -r "$@" "$FILE_PATH" 2>/dev/null; }
 
 # json_type_of <node> <key> -- jq type name, or "absent"
@@ -1959,6 +2130,9 @@ file_args_hdd() {
     [ -z "$dev" ] || FILE_ARGS+=(--device "$dev")
     [ -z "$mnt" ] || FILE_ARGS+=(--mount "$mnt")
     [ -z "$typ" ] || FILE_ARGS+=(--type "$typ")
+    # Passed explicitly rather than relying on the global, so the --dry-run
+    # plan line shows exactly what a real run would do.
+    if [ "$FORCE" = "1" ]; then FILE_ARGS+=(--force); fi
 }
 
 file_args_docker() {
@@ -2017,24 +2191,37 @@ cmd_file() {
         case "$1" in
             -h|--help) help_file; exit "$E_OK" ;;
             --dry-run) opt_dryrun=1; shift ;;
+            # Sets the same global the CLI sets. hdd is its only consumer.
+            # Deliberately a command-line flag and NOT a document field: a
+            # configuration file alone must never be able to destroy data.
+            -f|--force) FORCE=1; shift ;;
             --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
+            # A bare - is the conventional "read from stdin" argument, not a
+            # flag; it must be matched before the -* case swallows it.
+            -) args+=("$1"); shift ;;
             -*) die "$E_ARGS" "unknown flag: $1" ;;
             *) args+=("$1"); shift ;;
         esac
     done
 
-    [ "${#args[@]}" -ne 0 ] || { help_file >&2; die "$E_ARGS" "a JSON file path is required"; }
+    [ "${#args[@]}" -ne 0 ] || { help_file >&2; die "$E_ARGS" "a JSON or YAML file path is required"; }
     [ "${#args[@]}" -eq 1 ] || die "$E_ARGS" "unexpected argument: ${args[1]}"
 
     local path="${args[0]}"
-    [ -f "$path" ] || die "$E_NOTFOUND" "file not found: '$path'"
+    if [ "$path" = "-" ]; then
+        require_cmds jq realpath
+        file_spool_stdin
+        path="$FILE_SPOOL"
+        file_load "$path"
+        FILE_SOURCE="(stdin)"
+    else
+        [ -f "$path" ] || die "$E_NOTFOUND" "file not found: '$path'"
+        require_cmds jq realpath
+        file_load "$path"
+    fi
 
-    require_cmds jq realpath
-    jq empty "$path" >/dev/null 2>&1 || die "$E_IO" "'$path' is not valid JSON"
-
-    FILE_PATH="$path"
     FILE_DRYRUN="$opt_dryrun"
-    debug "resolved: path=$FILE_PATH dry_run=$FILE_DRYRUN"
+    debug "resolved: source=$FILE_SOURCE path=$FILE_PATH dry_run=$FILE_DRYRUN"
 
     if ! json_validate; then
         local e
@@ -2042,7 +2229,7 @@ cmd_file() {
             printf 'error: %s\n' "$e" >&2
         done
         printf 'error: %s problem(s) found in %s; nothing was executed\n' \
-            "${#FILE_ERRORS[@]}" "$FILE_PATH" >&2
+            "${#FILE_ERRORS[@]}" "$FILE_SOURCE" >&2
         exit "$E_ARGS"
     fi
 
@@ -2051,15 +2238,15 @@ cmd_file() {
     for node in "${FILE_ORDER[@]}"; do
         if json_has_node "$node"; then present+=("$node"); fi
     done
-    info "plan for $FILE_PATH: $(join_sp "${present[@]}")"
+    info "plan for $FILE_SOURCE: $(join_sp "${present[@]}")"
 
     # Elevate ONCE, here. Each cmd_* calls elevate itself, and that re-execs
     # the whole script - inside a file run that would restart the entire
     # sequence and re-run nodes that had already completed. Doing it up front
     # means every node below sees EUID 0 and its own elevate is a no-op.
-    if [ "$FILE_DRYRUN" -eq 0 ]; then
+    if [ "$FILE_DRYRUN" -eq 0 ] && [ "$EUID" -ne 0 ]; then
         require_sudo
-        elevate "${ORIG_ARGS[@]}"
+        file_elevate
     fi
 
     local -a results=()
@@ -2192,8 +2379,13 @@ $(block_marker_close)"
         info "added $sbin to PATH in $bashrc"
     fi
 
+    # Legacy hosts have the shortcuts in a docker-id block written by an older
+    # cmd_docker. Remove it before installing the new one.
+    shortcuts_migrate "$bashrc"
+    shortcuts_install "$bashrc"
+
     info "setup complete"
-    info "note: already-open shells need 'source $bashrc' to pick up the change"
+    info "note: already-open shells need 'source $bashrc' to pick up the changes"
 }
 
 # ---------------------------------------------------------------------------
@@ -2210,12 +2402,13 @@ Usage:
   system-setup docker [-n <cidr> [-s <bits>]] | -u
   system-setup ntp [-s <server>]... | -u
   system-setup tz <zone>
-  system-setup file <path.json> [--dry-run]
+  system-setup file <path|-> [--dry-run] [-f]
   system-setup setup
 
 Aliases:
   system-setup network ...   same as 'system-setup ip ...'
-  system-setup <path.json>   same as 'system-setup file <path.json>'
+  system-setup <path>        same as 'system-setup file <path>'
+  <document> | system-setup  reads a JSON or YAML document from stdin
 
 Global:
   --verbose                  detailed per-action logging
@@ -2267,12 +2460,13 @@ help_docker() {
 system-setup docker [-n <cidr> [-s <bits>]] | -u
 
 Installs Docker by the official Debian procedure, creates the workspace
-folder, and installs the shell shortcuts.
+folder, and exports DOCKER_HOME in ~/.bashrc. The shell shortcuts themselves
+are installed by 'system-setup setup' and activate once DOCKER_HOME is set.
 
   -n, --network <cidr>   address pool that user-defined networks are carved
                          from (default-address-pools), e.g. 10.100.0.0/16
   -s, --size <bits>      prefix length of each network from that pool; default 24
-  -u, --uninstall        remove Docker and the shell shortcuts
+  -u, --uninstall        remove Docker and the DOCKER_HOME export
 
 Applying a pool change restarts dockerd, which stops running containers.
 This command never deletes data. --uninstall leaves /var/lib/docker,
@@ -2306,13 +2500,17 @@ EOF
 
 help_file() {
     cat << 'EOF'
-system-setup file <path.json> [--dry-run]
+system-setup file <path|-> [--dry-run]
 
-Runs a sequence of configuration tasks from a JSON file, in the fixed order
+Reads a JSON or YAML document from <path>, or from stdin when <path> is '-'.
+Runs a sequence of configuration tasks from it, in the fixed order
 tz -> hdd -> docker -> ntp -> network. A failing task does not stop the
 sequence; the exit code is that of the first failure.
 
       --dry-run          validate everything and print the plan, change nothing
+  -f, --force            permit destructive hdd operations (reformat, unmount).
+                         Deliberately a flag, not a document field: a config
+                         file on its own can never destroy data.
 EOF
 }
 
@@ -2320,8 +2518,8 @@ help_setup() {
     cat << 'EOF'
 system-setup setup
 
-Installs system-setup as a symlink in /usr/local/sbin (or /usr/sbin) and adds
-that folder to PATH in ~/.bashrc.
+Installs system-setup as a symlink in /usr/local/sbin (or /usr/sbin), adds
+that folder to PATH in ~/.bashrc, and sources command-shortcuts from there.
 
 Already-open shells must run 'source ~/.bashrc' to see the change.
 EOF
@@ -2346,13 +2544,34 @@ main() {
     done
     set -- ${argv[@]+"${argv[@]}"}
 
+    # -h/--help wins over everything, including a piped document.
+    case "${1:-}" in
+        -h|--help) help_main; exit "$E_OK" ;;
+    esac
+
+    # A document piped in with no COMMAND is file mode. Any leading flags are
+    # handed to cmd_file, so `cat doc | system-setup --force` works - only
+    # --verbose is stripped globally above, and gating solely on `$# -eq 0`
+    # would send every other flag down the unknown-command path.
+    local piped=0
+    if [ ! -t 0 ]; then
+        if [ $# -eq 0 ]; then
+            piped=1
+        else
+            case "$1" in -*) piped=1 ;; esac
+        fi
+    fi
+    if [ "$piped" -eq 1 ]; then
+        cmd_file - ${1+"$@"}
+        return 0
+    fi
+
     if [ $# -eq 0 ]; then
         help_main
         exit "$E_ARGS"
     fi
 
     case "$1" in
-        -h|--help) help_main; exit "$E_OK" ;;
         ip|network) shift; cmd_ip ${1+"$@"} ;;
         hdd)        shift; cmd_hdd ${1+"$@"} ;;
         docker)     shift; cmd_docker ${1+"$@"} ;;

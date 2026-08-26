@@ -49,7 +49,8 @@ bash "$SCRIPT" docker >/dev/null 2>&1 || { echo "FATAL: install failed"; exit 1;
 echo
 echo "=== 32: second run is idempotent ==="
 run 32 0 "already configured" docker
-assert 32b "[ \"\$(block_count '>>> system-setup docker >>>')\" = 1 ]"
+if [ "$(block_count '>>> system-setup docker >>>')" = 1 ]; then ok; else bad "C1: no DOCKER_HOME block"; fi
+if grep -qF "export DOCKER_HOME=\"$WS\"" "$BASHRC"; then ok; else bad "C1b: DOCKER_HOME not exported as $WS"; fi
 
 echo
 echo "=== 33: pre-existing workspace keeps its ownership and mode ==="
@@ -67,45 +68,13 @@ assert 34b "[ \"\$(dirname '$WS')\" = \"\$HOME\" ]"
 assert 34c "id -nG $USER | grep -qw docker"
 
 echo
-echo "=== 31: the docker and setup .bashrc blocks must not eat each other ==="
+echo "=== 31: the setup-owned .bashrc block survives a docker run ==="
 # cmd_setup is phase 12; simulate its id-less block to prove block isolation.
 # shellcheck disable=SC2016  # the literal $PATH is the point: this mimics what cmd_setup writes
 printf '%s\n%s\n%s\n' '# >>> system-setup >>>' 'export PATH="$PATH:/usr/local/sbin"' '# <<< system-setup <<<' >> "$BASHRC"
 run 31 0 "" docker
 assert 31b "[ \"\$(block_count '>>> system-setup >>>')\" = 1 ]"
-assert 31c "[ \"\$(block_count '>>> system-setup docker >>>')\" = 1 ]"
 assert 31d "grep -q 'export PATH=' '$BASHRC'"
-
-echo
-echo "=== the resulting ~/.bashrc must source without errors ==="
-# The block being present is not enough: a CRLF-terminated shortcuts file
-# parses fine as a filename and breaks every login shell that sources it.
-# -i, not -l: Debian's ~/.bashrc returns immediately when not interactive,
-# so a login shell would source nothing and the check would pass vacuously.
-# bash -i without a tty always emits job-control notices; those are the
-# harness's own noise, not anything ~/.bashrc did. Filter only those.
-SHELL_ERR="$(bash -ic true 2>&1 | grep -vE '^$|cannot set terminal process group|no job control in this shell')"
-if [ -z "$SHELL_ERR" ]; then ok; else bad "sh1: login shell emits errors :: $SHELL_ERR"; fi
-if bash -n "$REPO/docker-shortcuts" 2>/dev/null; then ok; else bad "sh2: docker-shortcuts is not valid bash"; fi
-if LC_ALL=C grep -q "$(printf '\r')" "$REPO/docker-shortcuts"; then bad "sh3: docker-shortcuts has CRLF line endings"; else ok; fi
-
-echo
-echo "=== 36: a moved repository is reconciled to the new path ==="
-cp -a "$REPO" /tmp/ss-moved
-run_alt /tmp/ss-moved/system-setup 36 0 "shell shortcuts" docker
-assert 36b "grep -q '/tmp/ss-moved/docker-shortcuts' '$BASHRC'"
-assert 36c "[ \"\$(block_count '>>> system-setup docker >>>')\" = 1 ]"
-# put it back
-run 36d 0 "" docker
-assert 36e "grep -q '$REPO/docker-shortcuts' '$BASHRC'"
-rm -rf /tmp/ss-moved
-
-echo
-echo "=== 35: missing docker-shortcuts warns but does not fail ==="
-mv "$REPO/docker-shortcuts" /tmp/docker-shortcuts.hidden
-run 35 0 "not found beside the script" docker
-mv /tmp/docker-shortcuts.hidden "$REPO/docker-shortcuts"
-run 35b 0 "" docker
 
 echo
 echo "=== 37: daemon.json merge preserves unrelated keys ==="
@@ -142,7 +111,6 @@ run 40 0 "Docker removed" docker -u
 assert 40b "! dpkg-query -W -f='\${Status}' docker-ce 2>/dev/null | grep -q '^install ok installed$'"
 assert 40c "test -d /var/lib/docker"
 assert 40d "test -d '$WS'"
-assert 40e "[ \"\$(block_count '>>> system-setup docker >>>')\" = 0 ]"
 assert 40f "[ \"\$(block_count '>>> system-setup >>>')\" = 1 ]"
 assert 40h "! test -f /etc/apt/sources.list.d/docker.list"
 
@@ -156,6 +124,50 @@ assert u3 "test -d '$WS'"
 assert u4 "test -f '$WS/keep-me.txt'"
 assert u5 "! command -v docker >/dev/null"
 rm -f "$WS/keep-me.txt"
+
+
+echo
+echo "=== C2-C6: DOCKER_HOME and the guarded shortcuts ==="
+# The preceding section leaves docker UNINSTALLED, so converge first;
+# C2 is about the SECOND run being idempotent, not the first.
+run C2pre 0 "Docker installed" docker
+run C2 0 "already configured" docker
+assert C2b "[ \"$(block_count '>>> system-setup docker >>>')\" = 1 ]"
+
+echo "--- C6: command-shortcuts must NOT set DOCKER_HOME itself ---"
+if grep -qE '^[[:space:]]*(export[[:space:]]+)?DOCKER_HOME=' "$REPO/command-shortcuts"; then
+    bad "C6: command-shortcuts still assigns DOCKER_HOME"
+else
+    ok
+fi
+if grep -q 'DOCKER_HOME:-' "$REPO/command-shortcuts"; then ok; else bad "C6b: docker shortcuts are not guarded on DOCKER_HOME"; fi
+
+echo "--- C4: with DOCKER_HOME set, the shortcuts activate ---"
+bash "$SCRIPT" setup >/dev/null 2>&1
+C4OUT="$(bash -ic 'echo "DH=$DOCKER_HOME"; type dcu 2>/dev/null | head -1' 2>/dev/null)"
+if grep -q "DH=$WS" <<< "$C4OUT"; then ok; else bad "C4: DOCKER_HOME not exported :: $C4OUT"; fi
+if grep -q 'dcu is aliased' <<< "$C4OUT"; then ok; else bad "C4b: dcu alias missing :: $C4OUT"; fi
+
+echo "--- C5: WITHOUT DOCKER_HOME, shortcuts load but docker aliases stay absent ---"
+# This is the state after `setup` but before `docker` has ever run. The
+# shortcuts file is sourced; its docker section must simply not activate.
+sed -i '/# >>> system-setup docker/,/# <<< system-setup docker/d' "$BASHRC"
+C5OUT="$(bash -ic 'echo "DH=[$DOCKER_HOME]"; type dcu 2>/dev/null | head -1' 2>/dev/null)"
+if grep -q 'DH=\[\]' <<< "$C5OUT"; then ok; else bad "C5: DOCKER_HOME unexpectedly set :: $C5OUT"; fi
+if grep -q 'dcu is aliased' <<< "$C5OUT"; then bad "C5b: docker aliases active without DOCKER_HOME"; else ok; fi
+C5ERR="$(bash -ic true 2>&1 | grep -vE '^$|cannot set terminal process group|no job control in this shell')"
+if [ -z "$C5ERR" ]; then ok; else bad "C5c: shell errors without DOCKER_HOME :: $C5ERR"; fi
+# put it back
+run C5d 0 "" docker
+
+echo "--- C3: uninstall removes DOCKER_HOME but keeps the shortcuts ---"
+run C3 0 "DOCKER_HOME removed" docker -u
+assert C3b "[ \"$(block_count '>>> system-setup docker >>>')\" = 0 ]"
+assert C3c "[ \"$(block_count '>>> system-setup shortcuts >>>')\" = 1 ]"
+assert C3d "test -d '$WS'"
+C3OUT="$(bash -ic 'type dcu 2>/dev/null | head -1' 2>/dev/null)"
+if grep -q 'dcu is aliased' <<< "$C3OUT"; then bad "C3e: docker aliases survived uninstall"; else ok; fi
+run C3f 0 "Docker installed" docker
 
 echo
 echo "passed: $PASS   failed: $FAIL"
