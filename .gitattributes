@@ -1,0 +1,5 @@
+# Everything here is a Linux shell script. It must keep LF endings in the
+# working tree: with core.autocrlf=true (set on this repo) a checkout would
+# otherwise write CRLF, the shebang would end in a carriage return, and the
+# interpreter lookup would fail with "bad interpreter: /usr/bin/env bash^M".
+* text=auto eol=lf
