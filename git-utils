@@ -322,6 +322,10 @@ precheck_store_format() {
             die "$E_DBFORMAT" \
                 "$REPOS_FILE was written by a newer git-utils (schema $(db_schema_version)); this script understands $SCHEMA_VERSION"
             ;;
+        badschema)
+            die "$E_DBFORMAT" \
+                "$REPOS_FILE has an invalid schema version; run 'git-utils validate' to inspect it"
+            ;;
         old)
             die "$E_DBFORMAT" \
                 "$REPOS_FILE is in an old format; run 'git-utils validate --fix' to convert it"
@@ -434,7 +438,7 @@ db_schema_version() {
         "$file" 2>/dev/null || printf ''
 }
 
-# db_format_state [<file>] -- prints exactly one of: ok | old | invalid | newer
+# db_format_state [<file>] -- prints one of: ok | old | badschema | invalid | newer
 #
 # Single source of truth for store-format classification. Two consumers with
 # different reactions: precheck_store dies on the result, `validate` renders it
@@ -455,9 +459,13 @@ db_format_state() {
         return 0
     fi
 
+    # Has the new shape but an unusable version marker. NOT 'old': converting
+    # would wrap the document a second time, giving
+    # {schema, repositories: {schema, repositories}}. Report it instead --
+    # guessing a version for data of unknown vintage is worse than saying so.
     ver="$(db_schema_version "$file")"
     if [ -z "$ver" ] || [[ ! "$ver" =~ $SCHEMA_REGEX ]]; then
-        printf 'old\n'
+        printf 'badschema\n'
         return 0
     fi
 
@@ -470,6 +478,58 @@ db_format_state() {
 
     printf 'ok\n'
 }
+
+# backup_path -- a timestamped name that never collides.
+#
+# Backups are tied to conversions, not to runs, and a conversion happens at
+# most once per store, so these do not accumulate. The collision loop covers
+# two conversions inside the same second; overwriting a backup is never
+# acceptable, since it could be the only clean copy left.
+backup_path() {
+    local ts p n=1
+    ts="$(date -u +%Y%m%dT%H%M%SZ)"
+    p="${REPOS_FILE}.${ts}.bak"
+    while [ -e "$p" ]; do
+        p="${REPOS_FILE}.${ts}-${n}.bak"
+        n=$((n + 1))
+    done
+    printf '%s' "$p"
+}
+
+# db_convert_with_backup -- old flat layout -> schema 1.1. Prints the backup
+# path on success.
+#
+# Order matters: build, VERIFY, back up, then move. A conversion that fails
+# verification leaves the original byte-for-byte intact, writes no backup, and
+# leaves no temp file behind -- so there is no damaged-store state for a later
+# run to find, and no residue from a failed attempt.
+db_convert_with_backup() {
+    local tmp bak
+    tmp="$(mktemp "${REPOS_FILE}.XXXXXX")"
+    CLEANUP_TMPFILES+=("$tmp")
+
+    # A store that already carries a `repositories` object only lost its
+    # version marker -- stamp it. Anything else is the flat pre-1.1 layout and
+    # gets wrapped. Wrapping the former would nest it inside itself.
+    jq --arg v "$SCHEMA_VERSION" \
+        'if (type == "object" and has("repositories") and (.repositories | type == "object"))
+         then .schema = $v
+         else {schema: $v, repositories: .} end' \
+        "$REPOS_FILE" > "$tmp" || return 1
+
+    jq empty "$tmp" >/dev/null 2>&1 || return 1
+    [ "$(db_format_state "$tmp")" = "ok" ] || return 1
+
+    bak="$(backup_path)"
+    cp "$REPOS_FILE" "$bak" || return 1
+    chmod 600 "$bak" || return 1
+
+    chmod 600 "$tmp"
+    mv "$tmp" "$REPOS_FILE" || return 1
+    printf '%s' "$bak"
+}
+
+repos_all_ids() { jq -r '.repositories | keys[]' "$REPOS_FILE"; }
 
 repos_init() {
     [ -f "$REPOS_FILE" ] || jq -nc --arg v "$SCHEMA_VERSION" \
@@ -1301,6 +1361,77 @@ rv_run() {
     return "$rc"
 }
 
+# db_validate [<fix>] -- prints the whole-store validation JSON; returns 1 if
+# anything failed.
+#
+# Each step stops the run when it fails, because the next one cannot be
+# evaluated: there is no schema to check in an unparseable file, and no records
+# to walk in a layout that has not been converted.
+db_validate() {
+    local fix="${1:-0}"
+    local s_db s_schema state rc=0
+
+    if [ ! -f "$REPOS_FILE" ]; then
+        s_db="$(status_obj "$E_NOTFOUND" "Failed" "Database file not found: $REPOS_FILE")"
+        jq -nc --argjson d "$s_db" '{database: $d}'
+        return 1
+    fi
+
+    state="$(db_format_state)"
+
+    if [ "$state" = "invalid" ]; then
+        # no repair path: nothing can be recovered from a file that does not parse
+        s_db="$(status_obj "$E_IO" "Failed" "Unable to parse database file")"
+        jq -nc --argjson d "$s_db" '{database: $d}'
+        return 1
+    fi
+
+    if [ "$state" = "old" ]; then
+        if [ "$fix" != "1" ]; then
+            s_db="$(status_obj "$E_DBFORMAT" "Failed" "Database is in old format")"
+            jq -nc --argjson d "$s_db" '{database: $d}'
+            return 1
+        fi
+        local bak
+        store_lock
+        if ! bak="$(db_convert_with_backup)"; then
+            store_unlock
+            s_db="$(status_obj "$E_IO" "Failed" "Conversion failed; database left unchanged")"
+            jq -nc --argjson d "$s_db" '{database: $d}'
+            return 1
+        fi
+        store_unlock
+        s_db="$(status_obj 0 "Fixed" "Converted to schema $SCHEMA_VERSION; backup written to $bak")"
+        state="$(db_format_state)"
+    else
+        s_db="$(status_obj 0 "Ok")"
+    fi
+
+    if [ "$state" != "ok" ]; then
+        s_schema="$(status_obj 1 "Failed" "Database schema is in invalid format or missing")"
+        jq -nc --argjson d "$s_db" --argjson s "$s_schema" '{database: $d, schema: $s}'
+        return 1
+    fi
+    s_schema="$(status_obj 0 "Ok")"
+
+    # Per record. --fix propagates: without it a --fix run would convert the
+    # layout and then leave every record missing its new fields.
+    #
+    # The store lock is NOT held here -- rv_fix takes it per repo, and holding
+    # it across this loop would deadlock against itself.
+    local -a ids=()
+    mapfile -t ids < <(repos_all_ids)
+    local reps="[]" id out
+    for id in "${ids[@]}"; do
+        if out="$(rv_run "$id" "$fix")"; then :; else rc=1; fi
+        reps="$(jq -c --argjson r "$out" '. + [$r]' <<< "$reps")"
+    done
+
+    jq -nc --argjson d "$s_db" --argjson s "$s_schema" --argjson r "$reps" \
+        '{database: $d, schema: $s, repositories: $r}'
+    return "$rc"
+}
+
 # ---------------------------------------------------------------------------
 # 14. Command implementations
 # ---------------------------------------------------------------------------
@@ -1724,6 +1855,34 @@ cmd_folder_status() {
     exit "$code"
 }
 
+cmd_validate() {
+    local args=()
+    local fix=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_validate; exit 0 ;;
+            --fix) fix=1; shift ;;
+            --output-format)
+                [ $# -ge 2 ] || die "$E_ARGS" "--output-format requires a value"
+                output_format_set "$2"; shift 2 ;;
+            --output-format=*) output_format_set "${1#*=}"; shift ;;
+            --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    [ "${#args[@]}" -eq 0 ] || die "$E_ARGS" "unexpected argument: ${args[0]}"
+
+    require_cmds git realpath jq yq
+    # deliberately NOT precheck_store: inspecting and repairing a store this
+    # script cannot otherwise use is the entire point of this command
+
+    local out rc=0
+    out="$(db_validate "$fix")" || rc=$?
+    render_output "$out"
+    exit "$rc"
+}
+
 cmd_repo_validate() {
     local args=()
     local fix=0
@@ -1959,6 +2118,7 @@ Usage:
   git-utils folder status [<path>]
   git-utils folder adopt [<path>] [-n <id>]
   git-utils folder validate [<path>]
+  git-utils validate [--fix]
 
 Aliases:
   git-utils repos ...   same as 'git-utils repo ...'
@@ -1981,6 +2141,30 @@ the current folder is used.
 The argument may be a repo key, a full repo name (org/name/branch), or a
 path to a cloned folder — the same three forms 'repo update' and
 'repo delete' accept. Exits 5 if nothing matches.
+EOF
+}
+
+help_validate() {
+    cat << 'EOF'
+git-utils validate [--fix] [--output-format json|text|yaml]
+
+Checks the whole store: that it parses, that it is in a layout this
+script understands, that its schema version is one it knows, and then
+every record in turn.
+
+With --fix it also repairs. An old-format store is converted to the
+current schema, and --fix carries down into each record, so locations
+that no longer exist are pruned and missing fields are backfilled.
+
+The conversion is the one operation that rewrites the whole file, so it
+is built and verified before anything irreversible happens, and the
+original is copied to a timestamped ~/.repositories.json.<UTC>.bak first.
+Backups are never overwritten. A conversion that fails verification
+leaves the store untouched and writes no backup at all.
+
+An unparseable store cannot be repaired and is only reported.
+
+Exits 0 when everything checks out, 1 otherwise.
 EOF
 }
 
@@ -2209,6 +2393,10 @@ main() {
                     exit "$E_ARGS"
                     ;;
             esac
+            ;;
+        validate)
+            shift
+            cmd_validate "$@"
             ;;
         update)
             shift
