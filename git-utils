@@ -3,7 +3,7 @@ set -euo pipefail
 IFS=$'\n\t'
 
 # ---------------------------------------------------------------------------
-# 3. Constants
+# 2. Constants
 # ---------------------------------------------------------------------------
 
 # shellcheck disable=SC2034  # E_OK documents the full exit-code space; success needs no explicit exit
