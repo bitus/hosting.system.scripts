@@ -563,6 +563,11 @@ repos_load_record() {
     REC_NAME="$(jq -r '.name' <<< "$json")"
     REC_ORG="$(jq -r '.org' <<< "$json")"
     REC_BRANCH="$(jq -r '.branch' <<< "$json")"
+    # empty when absent, so callers can apply their own default rather than
+    # seeing the string "null"
+    REC_ORIGIN="$(jq -r 'if has("origin") then .origin else "" end' <<< "$json")"
+    REC_VISIBILITY="$(jq -r 'if has("visibility") then .visibility else "" end' <<< "$json")"
+    REC_FOREIGN="$(jq -r 'if has("foreign") then (.foreign | tostring) else "" end' <<< "$json")"
     mapfile -t REC_LOCATIONS < <(jq -r '.locations[]?.path' <<< "$json")
 }
 
@@ -586,11 +591,23 @@ repos_resolve() {
     repos_load_record "$key"
 }
 
+# repos_add -- insert a record for a repo git-utils is creating.
+#
+# Always private and never foreign: `repo add` generates the key pair and
+# writes the sentinel block itself. The origin is composed here, at creation,
+# and stored -- everything downstream reads the stored value rather than
+# recomposing it, which is what lets adopted and public repos work at all.
 repos_add() {
-    local key="$1" org="$2" name="$3" branch="$4" priv="$5" pub="$6" tmp
+    local key="$1" org="$2" name="$3" branch="$4" priv="$5" pub="$6" tmp now origin
+    now="$(now_iso8601)"
+    origin="$(clone_url "$key" "$org" "$name")"
     tmp="$(jq --arg k "$key" --arg name "$name" --arg org "$org" --arg branch "$branch" \
-        --arg priv "$priv" --arg pub "$pub" \
-        '.repositories[$k] = {name:$name, org:$org, branch:$branch, private_key:$priv, public_key:$pub, locations: [], images: []}' \
+        --arg priv "$priv" --arg pub "$pub" --arg origin "$origin" --arg now "$now" \
+        '.repositories[$k] = {name:$name, org:$org, branch:$branch,
+                              visibility:"private", foreign:false, origin:$origin,
+                              private_key:$priv, public_key:$pub,
+                              locations: [], images: [],
+                              date_created:$now, date_updated:$now}' \
         "$REPOS_FILE")" || return 1
     printf '%s' "$tmp" | atomic_write "$REPOS_FILE" 600
 }
@@ -694,8 +711,12 @@ repos_list() {
     jq -r '.repositories | to_entries[] | [.key, .value.org, .value.name, .value.branch] | @tsv' "$REPOS_FILE"
 }
 
+# repos_keys -- records with no private_key (public repos) are skipped rather
+# than emitted with a blank first column
 repos_keys() {
-    jq -r '.repositories | to_entries[] | [.key, .value.private_key, .value.org, .value.name, .value.branch] | @tsv' "$REPOS_FILE"
+    jq -r '.repositories | to_entries[]
+           | select(.value.private_key != null)
+           | [.key, .value.private_key, .value.org, .value.name, .value.branch] | @tsv' "$REPOS_FILE"
 }
 
 now_iso8601() { date -u +%Y-%m-%dT%H:%M:%SZ; }
@@ -1620,7 +1641,19 @@ cmd_repo_delete() {
     resolve_target "$target"
     repos_resolve
 
-    keys_preflight
+    # git-utils only removes key material it created. A foreign repo's keys and
+    # Host block were written by someone else -- possibly shared with other
+    # repos -- and a public repo has none. Absent fields default to the
+    # pre-adoption world, where every record was private and git-utils-made.
+    local owns_keys=0
+    if [ "${REC_VISIBILITY:-private}" = "private" ] && [ "${REC_FOREIGN:-false}" != "true" ]; then
+        owns_keys=1
+    fi
+
+    # only meaningful when we are actually going to touch ~/.ssh
+    if [ "$owns_keys" -eq 1 ]; then
+        keys_preflight
+    fi
 
     local loc
     for loc in "${REC_LOCATIONS[@]}"; do
@@ -1640,7 +1673,9 @@ cmd_repo_delete() {
     local -a del_locations=("${REC_LOCATIONS[@]}")
 
     store_lock
-    keys_delete "$del_key"
+    if [ "$owns_keys" -eq 1 ]; then
+        keys_delete "$del_key"
+    fi
     repos_delete "$del_key"
     store_unlock
 
@@ -1688,7 +1723,16 @@ cmd_repo_clone() {
     local out="${dest:-$REC_NAME}"
     [ ! -e "$out" ] || die "$E_EXISTS" "destination '$out' already exists"
 
-    git clone -b "$REC_BRANCH" "$(clone_url "$REC_KEY" "$REC_ORG" "$REC_NAME")" "$out" \
+    # The record's own origin, not a recomposed one: a foreign repo clones
+    # through its real Host alias and a public one over https, and neither is
+    # expressible as git@<id>.repo:<org>/<name>.git.
+    local url="$REC_ORIGIN"
+    if [ -z "$url" ]; then
+        url="$(clone_url "$REC_KEY" "$REC_ORG" "$REC_NAME")"
+        warn "record '$REC_KEY' has no origin; falling back to '$url' (run 'git-utils repo validate $REC_KEY --fix')"
+    fi
+
+    git clone -b "$REC_BRANCH" "$url" "$out" \
         || die "$E_IO" "git clone failed"
 
     local abs; abs="$(realpath -m -- "$out")"

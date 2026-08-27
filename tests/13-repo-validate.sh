@@ -127,9 +127,10 @@ run 0 "keys restored -> 0" repo validate priv.repo
 
 echo "=== 51: private NON-foreign repo missing its sentinel block ==="
 run 0 "repo add managed.repo -> 0" repo add manorg/managed.repo/main
-# repo add does not write visibility/foreign yet (phase 11), so set them here
-store_patch '.repositories["managed.repo"].visibility = "private" | .repositories["managed.repo"].foreign = false'
-run 1 "managed repo, block present but fields incomplete -> 1" repo validate managed.repo --output-format json
+run 0 "a repo-add record is complete out of the box -> 0" repo validate managed.repo --output-format json
+check "repo add wrote visibility private" "$( [ "$(rec_field managed.repo visibility)" = "private" ] && echo 1 || echo 0 )"
+check "repo add wrote foreign false" "$( [ "$(rec_field managed.repo foreign)" = "false" ] && echo 1 || echo 0 )"
+check "fields Ok" "$( [ "$(chk fields)" = "Ok" ] && echo 1 || echo 0 )"
 check "ssh Ok while the sentinel block exists" "$( [ "$(chk ssh)" = "Ok" ] && echo 1 || echo 0 )"
 block_delete_manual() { grep -v 'managed.repo' "$HOME/.ssh/config" > "$WORK/cfg.tmp"; mv "$WORK/cfg.tmp" "$HOME/.ssh/config"; }
 block_delete_manual
