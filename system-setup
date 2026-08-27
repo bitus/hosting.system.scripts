@@ -2351,13 +2351,37 @@ cmd_setup() {
 
     local link="$sbin/system-setup"
     if [ -e "$link" ] || [ -L "$link" ]; then
-        warn "$link already exists, skipping symlink"
+        local target
+        target="$(readlink -f "$link" 2>/dev/null || true)"
+        if [ -n "$target" ] && [ "$target" != "$SELF" ]; then
+            # Naming the real target matters: a symlink left over from another
+            # checkout is the other way this failure looks like "setup does
+            # not help".
+            warn "$link already exists and points at $target, not $SELF; skipping symlink"
+        else
+            warn "$link already exists, skipping symlink"
+        fi
     else
         # shellcheck disable=SC2086  # $SUDO is deliberately unquoted: empty means "no prefix"
         $SUDO ln -s "$SELF" "$link" || die "$E_IO" "failed to create the symlink $link"
-        # shellcheck disable=SC2086
-        $SUDO chmod +x "$SELF" || die "$E_IO" "failed to mark $SELF executable"
         info "installed $link -> $SELF"
+    fi
+
+    # OUTSIDE the branch above, deliberately.
+    #
+    # `git reset --hard` restores the mode git recorded, not the mode the file
+    # happened to have. A checkout committed 100644 therefore loses the
+    # executable bit on every update, and the symlink then points at a
+    # non-executable file: "Permission denied" on every invocation.
+    #
+    # While this chmod lived inside the create-the-symlink branch, re-running
+    # setup on an affected host did nothing at all - the only cure was to
+    # delete the symlink first, an ordering no operator would guess from the
+    # error message. Out here, `setup` repairs it on its own.
+    if [ ! -x "$SELF" ]; then
+        # shellcheck disable=SC2086
+        $SUDO chmod +x "$SELF" || die "$E_IO" "cannot make $SELF executable"
+        info "restored the executable bit on $SELF"
     fi
 
     local bashrc="$HOME/.bashrc" path_needed=1
