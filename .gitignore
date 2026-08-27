@@ -1,5 +1,3 @@
-/tests/
-
 # Secrets
 .env
 .env.test
