@@ -1,0 +1,2478 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# shellcheck disable=SC2034  # E_OK documents the full exit-code space; success needs no explicit exit
+readonly E_OK=0 E_PRECHECK=1 E_ARGS=2 E_IO=3 E_EXISTS=4 E_NOTFOUND=5
+# shellcheck disable=SC2034  # E_GITFOLDER/E_MISMATCH/E_GITOUTPUT land with the commands that raise them
+readonly E_GITFOLDER=6 E_MISMATCH=8 E_GITOUTPUT=10 E_DBFORMAT=90
+readonly SCHEMA_VERSION="1.1"
+readonly SCHEMA_REGEX='^[0-9]+(\.[0-9]+)?$'
+readonly REPOS_FILE="$HOME/.repositories.json"
+readonly LOCK_FILE="$HOME/.repositories.json.lock"
+readonly SSH_DIR="$HOME/.ssh"
+readonly SSH_CONFIG="$SSH_DIR/config"
+readonly BASHRC="$HOME/.bashrc"
+readonly DEFAULT_BRANCH_FALLBACK="main"
+readonly CHARSET='A-Za-z0-9._-'
+readonly LOCK_WAIT=10
+readonly IMAGES_FILE_NAME=".images"
+readonly COMPOSE_PROFILE_WILDCARD='*'
+
+declare -A DEP_PACKAGE=(
+    [git]="git"
+    [realpath]="coreutils"
+    [jq]="jq"
+    [ssh-keygen]="openssh-client"
+    [yq]="yq"
+)
+
+declare -a CLEANUP_TMPFILES=()
+cleanup_tmpfiles() {
+    local f
+    for f in "${CLEANUP_TMPFILES[@]}"; do
+        rm -f "$f"
+    done
+    return 0
+}
+trap cleanup_tmpfiles EXIT
+
+# ---------------------------------------------------------------------------
+# 3. Output helpers
+# ---------------------------------------------------------------------------
+
+info() { printf '%s\n' "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+
+die() {
+    local code="$1"; shift
+    printf 'error: %s\n' "$*" >&2
+    exit "$code"
+}
+
+confirm() {
+    local prompt="$1" reply
+    if [ "${FORCE:-0}" = "1" ]; then
+        return 0
+    fi
+    if [ ! -t 0 ]; then
+        die "$E_ARGS" "confirmation required but stdin is not a TTY (use --force)"
+    fi
+    read -r -p "$prompt [Y/n] " reply || reply=""
+    case "$reply" in
+        [nN]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# 4. Status & render helpers
+# ---------------------------------------------------------------------------
+
+# status_obj <code> <status> [description] -- one check result, compact JSON.
+#
+# Statuses: Ok, Fixed, Warning, Skipped (all passing) and Failed.
+status_obj() {
+    jq -nc --argjson c "$1" --arg s "$2" --arg d "${3:-}" \
+        '{code:$c, status:$s, description:$d}'
+}
+
+# status_failed <status_json> -- true when this check counts as a failure.
+#
+# Failure is decided by .status == "Failed", NOT by .code != 0: the `fields`
+# check fails with code 90 while `Warning` passes with code 0, so the code is
+# not a reliable predicate.
+status_failed() {
+    [ "$(jq -r '.status' <<< "$1")" = "Failed" ]
+}
+
+# Folds every status object anywhere in the structure into a plain string.
+# The type guard comes first because has() errors on non-objects; recursion
+# through map_values/map reaches status objects nested inside checks.locations
+# and inside the repositories array without any special-casing.
+#
+# Empty description -> bare status, so a passing check reads "Ok".
+# Non-empty         -> "<status> — <description>", so the default output never
+#                      hides the reason a check failed.
+readonly FOLD_FILTER='
+def fold:
+  if type == "object" then
+    if (has("code") and has("status"))
+    then (if (.description // "") == "" then .status
+          else "\(.status) — \(.description)" end)
+    else map_values(fold)
+    end
+  elif type == "array" then map(fold)
+  else . end;
+fold'
+
+readonly OUTPUT_FORMAT_DEFAULT="text"
+OUTPUT_FORMAT="$OUTPUT_FORMAT_DEFAULT"
+
+# output_format_set <value> -- validate and assign, for the flag loops
+output_format_set() {
+    case "$1" in
+        json|text|yaml) OUTPUT_FORMAT="$1" ;;
+        *) die "$E_ARGS" "invalid --output-format: '$1' (expected json, text or yaml)" ;;
+    esac
+}
+
+# render_output <json> -- emit per $OUTPUT_FORMAT
+render_output() {
+    local json="$1"
+    case "$OUTPUT_FORMAT" in
+        json)      printf '%s' "$json" | jq . ;;
+        text|yaml) printf '%s' "$json" | jq "$FOLD_FILTER" | yq -y . ;;
+        *)         die "$E_ARGS" "invalid output format: '$OUTPUT_FORMAT'" ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# 5. File helpers
+# ---------------------------------------------------------------------------
+
+ensure_trailing_newline() {
+    local file="$1"
+    if [ -s "$file" ] && [ "$(tail -c1 "$file" | wc -l)" -eq 0 ]; then
+        printf '\n' >> "$file"
+    fi
+}
+
+atomic_write() {
+    local file="$1" mode="$2" tmp
+    tmp="$(mktemp "${file}.XXXXXX")"
+    CLEANUP_TMPFILES+=("$tmp")
+    cat > "$tmp"
+    chmod "$mode" "$tmp"
+    mv "$tmp" "$file"
+}
+
+block_marker_open() {
+    local id="${1:-}"
+    if [ -n "$id" ]; then
+        printf '# >>> git-utils %s >>>' "$id"
+    else
+        printf '# >>> git-utils >>>'
+    fi
+}
+
+block_marker_close() {
+    local id="${1:-}"
+    if [ -n "$id" ]; then
+        printf '# <<< git-utils %s <<<' "$id"
+    else
+        printf '# <<< git-utils <<<'
+    fi
+}
+
+# block_upsert <file> <sentinel_id> <content>
+# <content> is the full block text, sentinel lines included.
+block_upsert() {
+    local file="$1" sentinel_id="$2" content="$3"
+    local open close_marker tmp mode
+
+    open="$(block_marker_open "$sentinel_id")"
+    close_marker="$(block_marker_close "$sentinel_id")"
+
+    if [ -e "$file" ]; then
+        mode="$(stat -c '%a' "$file")"
+    else
+        : > "$file"
+        mode="644"
+    fi
+    ensure_trailing_newline "$file"
+
+    tmp="$(mktemp "${file}.XXXXXX")"
+    CLEANUP_TMPFILES+=("$tmp")
+
+    if grep -qF "$open" "$file"; then
+        awk -v open="$open" -v close_marker="$close_marker" -v content="$content" '
+            $0 == open { print content; skip=1; next }
+            $0 == close_marker { skip=0; next }
+            skip { next }
+            { print }
+        ' "$file" > "$tmp"
+    else
+        cat "$file" > "$tmp"
+        printf '%s\n' "$content" >> "$tmp"
+    fi
+
+    chmod "$mode" "$tmp"
+    mv "$tmp" "$file"
+}
+
+# block_delete <file> <sentinel_id>  -- silent no-op if the block is absent
+block_delete() {
+    local file="$1" sentinel_id="$2"
+    local open close esc_open esc_close tmp mode
+
+    [ -f "$file" ] || return 0
+
+    open="$(block_marker_open "$sentinel_id")"
+    close="$(block_marker_close "$sentinel_id")"
+    esc_open="$(printf '%s' "$open" | sed 's/[.[\*^$/]/\\&/g')"
+    esc_close="$(printf '%s' "$close" | sed 's/[.[\*^$/]/\\&/g')"
+
+    mode="$(stat -c '%a' "$file")"
+    tmp="$(mktemp "${file}.XXXXXX")"
+    CLEANUP_TMPFILES+=("$tmp")
+
+    sed "/^${esc_open}\$/,/^${esc_close}\$/d" "$file" > "$tmp" \
+        || die "$E_IO" "failed to update $file"
+
+    chmod "$mode" "$tmp"
+    mv "$tmp" "$file"
+}
+
+# ---------------------------------------------------------------------------
+# 6. Lock helpers
+# ---------------------------------------------------------------------------
+
+# store_lock_writable <fd> -- shared writability pre-check: `exec N>file`
+# is a bash special builtin, and a failed bare-redirect exec TERMINATES THE
+# WHOLE SHELL outright (this bypasses `||` entirely -- it's not a normal
+# command failure). Checking writability first avoids ever attempting the
+# risky exec when it would fail; a permission change in the narrow window
+# between this check and the exec is an accepted, extremely unlikely race.
+#
+# NOTE: never attach `2>/dev/null` (or any redirect) to a *bare* `exec`
+# statement below. Bash applies a bare exec's redirects to the current
+# shell PERMANENTLY, not just to that one statement -- `exec 9>f 2>/dev/null`
+# would silently discard this process's stderr (including every later
+# warn()) for the rest of its run. This is exactly the bug that motivated
+# this comment: it shipped once and silently ate every warning after the
+# first store_lock call.
+store_lock_writable() {
+    if [ -e "$LOCK_FILE" ]; then
+        [ -w "$LOCK_FILE" ]
+    else
+        [ -w "$(dirname "$LOCK_FILE")" ]
+    fi
+}
+
+store_lock() {
+    store_lock_writable || die "$E_IO" "cannot open lock file $LOCK_FILE"
+    exec 9>"$LOCK_FILE" || die "$E_IO" "cannot open lock file $LOCK_FILE"
+    flock -w "$LOCK_WAIT" 9 || die "$E_IO" "could not acquire lock on $LOCK_FILE (busy)"
+}
+
+store_unlock() {
+    exec 9>&-
+}
+
+# store_lock_soft / store_unlock_soft -- like store_lock/store_unlock but
+# return 1 instead of dying on failure to open or acquire the lock.
+# Used only by images_write, whose failures must never affect exit code.
+store_lock_soft() {
+    store_lock_writable || return 1
+    exec 9>"$LOCK_FILE" || return 1
+    flock -w "$LOCK_WAIT" 9 2>/dev/null || { exec 9>&-; return 1; }
+}
+
+store_unlock_soft() {
+    exec 9>&-
+}
+
+# ---------------------------------------------------------------------------
+# 7. Pre-check helpers
+# ---------------------------------------------------------------------------
+
+require_cmds() {
+    local missing=() cmd
+    for cmd in "$@"; do
+        command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
+    done
+    [ "${#missing[@]}" -eq 0 ] && return 0
+
+    local missing_str="" pkgs=() seen="" pkg
+    for cmd in "${missing[@]}"; do
+        if [ -z "$missing_str" ]; then missing_str="$cmd"; else missing_str="$missing_str, $cmd"; fi
+        pkg="${DEP_PACKAGE[$cmd]:-$cmd}"
+        case " $seen " in
+            *" $pkg "*) ;;
+            *) pkgs+=("$pkg"); seen="$seen $pkg" ;;
+        esac
+    done
+    local pkgs_str="" p
+    for p in "${pkgs[@]}"; do
+        if [ -z "$pkgs_str" ]; then pkgs_str="$p"; else pkgs_str="$pkgs_str $p"; fi
+    done
+
+    printf 'error: those commands not available: %s\n' "$missing_str" >&2
+    printf 'please run "sudo apt install %s -y" to install\n' "$pkgs_str" >&2
+    exit "$E_PRECHECK"
+}
+
+# `yq` is a global dependency, not scoped to the commands that format output:
+# the sibling `system-setup` and `setup` scripts in this project already
+# require it, so a host running git-utils has it anyway, and scoping it would
+# buy complexity for no reachable benefit.
+precheck_common() { require_cmds git realpath jq yq; }
+
+# precheck_store_format -- the schema gate, for a store that exists.
+precheck_store_format() {
+    case "$(db_format_state)" in
+        ok) ;;
+        invalid) die "$E_IO" "$REPOS_FILE is not valid JSON" ;;
+        newer)
+            die "$E_DBFORMAT" \
+                "$REPOS_FILE was written by a newer git-utils (schema $(db_schema_version)); this script understands $SCHEMA_VERSION"
+            ;;
+        badschema)
+            die "$E_DBFORMAT" \
+                "$REPOS_FILE has an invalid schema version; run 'git-utils validate' to inspect it"
+            ;;
+        old)
+            die "$E_DBFORMAT" \
+                "$REPOS_FILE is in an old format; run 'git-utils validate --fix' to convert it"
+            ;;
+    esac
+}
+
+# precheck_store -- for commands that read an existing store.
+#
+# NOTE: `validate` must NOT call this. Inspecting and repairing an unusable
+# store is that command's entire purpose, so it calls db_format_state itself
+# and reports the result instead of dying on it.
+precheck_store() {
+    [ -f "$REPOS_FILE" ] || die "$E_PRECHECK" "$REPOS_FILE not found; run 'git-utils repo add' first"
+    precheck_store_format
+}
+
+# precheck_store_creatable -- for the commands that bring the FIRST record into
+# existence (`repo add`, `folder adopt`) and call repos_init themselves. A
+# missing store is fine; a store in an unusable format is not.
+#
+# Without the format gate here, `repo add` against an old flat store would
+# write `.repositories[id]` alongside the existing root-level records and leave
+# the file half in each layout.
+precheck_store_creatable() {
+    [ -f "$REPOS_FILE" ] || return 0
+    precheck_store_format
+}
+
+# ---------------------------------------------------------------------------
+# 8. Parsing layer
+# ---------------------------------------------------------------------------
+
+validate_part() {
+    local value="$1" minlen="$2" label="$3"
+    if [[ ! "$value" =~ ^[$CHARSET]+$ ]]; then
+        die "$E_ARGS" "invalid $label: '$value'"
+    fi
+    if [ "${#value}" -lt "$minlen" ]; then
+        die "$E_ARGS" "invalid $label: '$value' (minimum length $minlen)"
+    fi
+}
+
+# parse_repo_name <value>  -- sets REPO_ORG, REPO_NAME, REPO_BRANCH
+parse_repo_name() {
+    local input="$1"
+    local -a parts
+    IFS='/' read -r -a parts <<< "$input"
+    local n="${#parts[@]}"
+
+    case "$n" in
+        3)
+            REPO_ORG="${parts[0]}"
+            REPO_NAME="${parts[1]}"
+            REPO_BRANCH="${parts[2]}"
+            ;;
+        2)
+            REPO_ORG="${parts[0]}"
+            REPO_NAME="${parts[1]}"
+            REPO_BRANCH="${GH_DEFAULT_BRANCH:-$DEFAULT_BRANCH_FALLBACK}"
+            ;;
+        1)
+            REPO_NAME="${parts[0]}"
+            [ -n "${GH_DEFAULT_ORG:-}" ] || die "$E_ARGS" "no org given and GH_DEFAULT_ORG is not set"
+            REPO_ORG="$GH_DEFAULT_ORG"
+            REPO_BRANCH="${GH_DEFAULT_BRANCH:-$DEFAULT_BRANCH_FALLBACK}"
+            ;;
+        *)
+            die "$E_ARGS" "invalid repo name: '$input'"
+            ;;
+    esac
+
+    validate_part "$REPO_ORG" 3 "org"
+    validate_part "$REPO_NAME" 3 "name"
+    validate_part "$REPO_BRANCH" 1 "branch"
+}
+
+# resolve_target [<value>]  -- sets TARGET_KIND (path|fullname|key), TARGET_VALUE
+resolve_target() {
+    local value="${1:-}" raw="${1:-}"
+    [ -n "$raw" ] || raw="."
+
+    case "$raw" in
+        .|..|/*|./*|../*|~*)
+            TARGET_KIND="path"
+            TARGET_VALUE="$(realpath -m -- "$raw")"
+            return
+            ;;
+    esac
+
+    if [[ "$value" == */* ]]; then
+        TARGET_KIND="fullname"
+        parse_repo_name "$value"
+        TARGET_VALUE="$value"
+    else
+        TARGET_KIND="key"
+        validate_part "$value" 3 "key"
+        TARGET_VALUE="$value"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 9. Store layer -- db_* / repos_*
+# ---------------------------------------------------------------------------
+
+# db_schema_version [<file>] -- prints the raw .schema value, empty when absent
+db_schema_version() {
+    local file="${1:-$REPOS_FILE}"
+    jq -r 'if type == "object" and has("schema") then (.schema | tostring) else "" end' \
+        "$file" 2>/dev/null || printf ''
+}
+
+# db_format_state [<file>] -- prints one of: ok | old | badschema | invalid | newer
+#
+# Single source of truth for store-format classification. Two consumers with
+# different reactions: precheck_store dies on the result, `validate` renders it
+# as status objects. Writing the classification twice would let them drift.
+#
+# The optional <file> argument is what lets the conversion verify its own temp
+# file with the same code that classifies the real store; no caller passes it
+# until that lands.
+# shellcheck disable=SC2120
+db_format_state() {
+    local file="${1:-$REPOS_FILE}" ver major known_major
+
+    jq empty "$file" >/dev/null 2>&1 || { printf 'invalid\n'; return 0; }
+
+    if ! jq -e 'type == "object" and has("schema") and has("repositories")' \
+            "$file" >/dev/null 2>&1; then
+        printf 'old\n'
+        return 0
+    fi
+
+    # Has the new shape but an unusable version marker. NOT 'old': converting
+    # would wrap the document a second time, giving
+    # {schema, repositories: {schema, repositories}}. Report it instead --
+    # guessing a version for data of unknown vintage is worse than saying so.
+    ver="$(db_schema_version "$file")"
+    if [ -z "$ver" ] || [[ ! "$ver" =~ $SCHEMA_REGEX ]]; then
+        printf 'badschema\n'
+        return 0
+    fi
+
+    major="${ver%%.*}"
+    known_major="${SCHEMA_VERSION%%.*}"
+    if [ "$major" -gt "$known_major" ] 2>/dev/null; then
+        printf 'newer\n'
+        return 0
+    fi
+
+    printf 'ok\n'
+}
+
+# backup_path -- a timestamped name that never collides.
+#
+# Backups are tied to conversions, not to runs, and a conversion happens at
+# most once per store, so these do not accumulate. The collision loop covers
+# two conversions inside the same second; overwriting a backup is never
+# acceptable, since it could be the only clean copy left.
+backup_path() {
+    local ts p n=1
+    ts="$(date -u +%Y%m%dT%H%M%SZ)"
+    p="${REPOS_FILE}.${ts}.bak"
+    while [ -e "$p" ]; do
+        p="${REPOS_FILE}.${ts}-${n}.bak"
+        n=$((n + 1))
+    done
+    printf '%s' "$p"
+}
+
+# db_convert_with_backup -- old flat layout -> schema 1.1. Prints the backup
+# path on success.
+#
+# Order matters: build, VERIFY, back up, then move. A conversion that fails
+# verification leaves the original byte-for-byte intact, writes no backup, and
+# leaves no temp file behind -- so there is no damaged-store state for a later
+# run to find, and no residue from a failed attempt.
+db_convert_with_backup() {
+    local tmp bak
+    tmp="$(mktemp "${REPOS_FILE}.XXXXXX")"
+    CLEANUP_TMPFILES+=("$tmp")
+
+    # A store that already carries a `repositories` object only lost its
+    # version marker -- stamp it. Anything else is the flat pre-1.1 layout and
+    # gets wrapped. Wrapping the former would nest it inside itself.
+    jq --arg v "$SCHEMA_VERSION" \
+        'if (type == "object" and has("repositories") and (.repositories | type == "object"))
+         then .schema = $v
+         else {schema: $v, repositories: .} end' \
+        "$REPOS_FILE" > "$tmp" || return 1
+
+    jq empty "$tmp" >/dev/null 2>&1 || return 1
+    [ "$(db_format_state "$tmp")" = "ok" ] || return 1
+
+    bak="$(backup_path)"
+    cp "$REPOS_FILE" "$bak" || return 1
+    chmod 600 "$bak" || return 1
+
+    chmod 600 "$tmp"
+    mv "$tmp" "$REPOS_FILE" || return 1
+    printf '%s' "$bak"
+}
+
+repos_all_ids() { jq -r '.repositories | keys[]' "$REPOS_FILE"; }
+
+repos_init() {
+    [ -f "$REPOS_FILE" ] || jq -nc --arg v "$SCHEMA_VERSION" \
+        '{schema: $v, repositories: {}}' | atomic_write "$REPOS_FILE" 600
+}
+
+repos_check() {
+    local key="$1"
+    jq -e --arg k "$key" '.repositories | has($k)' "$REPOS_FILE" >/dev/null 2>&1
+}
+
+repos_check_by_name() {
+    local org="$1" name="$2" branch="$3"
+    jq -r --arg org "$org" --arg name "$name" --arg branch "$branch" \
+        '.repositories | to_entries[] | select(.value.org==$org and .value.name==$name and .value.branch==$branch) | .key' \
+        "$REPOS_FILE" | head -n1
+}
+
+repos_find_by_location() {
+    local path="$1"
+    jq -r --arg p "$path" \
+        '.repositories | to_entries[] | select(.value.locations[]?.path==$p) | .key' \
+        "$REPOS_FILE" | head -n1
+}
+
+# repos_load_record <key> -- sets REC_KEY, REC_NAME, REC_ORG, REC_BRANCH, REC_LOCATIONS (array)
+repos_load_record() {
+    local key="$1" json
+    json="$(jq -c --arg k "$key" '.repositories[$k]' "$REPOS_FILE")"
+    REC_KEY="$key"
+    REC_NAME="$(jq -r '.name' <<< "$json")"
+    REC_ORG="$(jq -r '.org' <<< "$json")"
+    REC_BRANCH="$(jq -r '.branch' <<< "$json")"
+    # empty when absent, so callers can apply their own default rather than
+    # seeing the string "null"
+    REC_ORIGIN="$(jq -r 'if has("origin") then .origin else "" end' <<< "$json")"
+    REC_VISIBILITY="$(jq -r 'if has("visibility") then .visibility else "" end' <<< "$json")"
+    REC_FOREIGN="$(jq -r 'if has("foreign") then (.foreign | tostring) else "" end' <<< "$json")"
+    mapfile -t REC_LOCATIONS < <(jq -r '.locations[]?.path' <<< "$json")
+}
+
+# repos_resolve -- dispatches on TARGET_KIND set by resolve_target; exits 5 if not found
+repos_resolve() {
+    local key=""
+    case "$TARGET_KIND" in
+        key)
+            repos_check "$TARGET_VALUE" || die "$E_NOTFOUND" "no repo registered for key '$TARGET_VALUE'"
+            key="$TARGET_VALUE"
+            ;;
+        fullname)
+            key="$(repos_check_by_name "$REPO_ORG" "$REPO_NAME" "$REPO_BRANCH")"
+            [ -n "$key" ] || die "$E_NOTFOUND" "no repo registered for $REPO_ORG/$REPO_NAME/$REPO_BRANCH"
+            ;;
+        path)
+            key="$(repos_find_by_location "$TARGET_VALUE")"
+            [ -n "$key" ] || die "$E_NOTFOUND" "no repo registered at location '$TARGET_VALUE'"
+            ;;
+    esac
+    repos_load_record "$key"
+}
+
+# repos_add -- insert a record for a repo git-utils is creating.
+#
+# Always private and never foreign: `repo add` generates the key pair and
+# writes the sentinel block itself. The origin is composed here, at creation,
+# and stored -- everything downstream reads the stored value rather than
+# recomposing it, which is what lets adopted and public repos work at all.
+repos_add() {
+    local key="$1" org="$2" name="$3" branch="$4" priv="$5" pub="$6" tmp now origin
+    now="$(now_iso8601)"
+    origin="$(clone_url "$key" "$org" "$name")"
+    tmp="$(jq --arg k "$key" --arg name "$name" --arg org "$org" --arg branch "$branch" \
+        --arg priv "$priv" --arg pub "$pub" --arg origin "$origin" --arg now "$now" \
+        '.repositories[$k] = {name:$name, org:$org, branch:$branch,
+                              visibility:"private", foreign:false, origin:$origin,
+                              private_key:$priv, public_key:$pub,
+                              locations: [], images: [],
+                              date_created:$now, date_updated:$now}' \
+        "$REPOS_FILE")" || return 1
+    printf '%s' "$tmp" | atomic_write "$REPOS_FILE" 600
+}
+
+# repos_insert <key> <record_json> -- write a complete record.
+#
+# repos_add composes the fields for `repo add`; this takes a record built by
+# the caller, which is what `folder adopt` needs to write the fields that
+# describe an existing repo rather than a freshly created one.
+repos_insert() {
+    local key="$1" rec="$2" tmp
+    tmp="$(jq --arg k "$key" --argjson r "$rec" '.repositories[$k] = $r' "$REPOS_FILE")" || return 1
+    printf '%s' "$tmp" | atomic_write "$REPOS_FILE" 600
+}
+
+# repos_get_field <key> <field> -- prints the value, or empty when absent.
+#
+# Deliberately NOT `.repositories[$k][$f] // ""`: jq's // treats `false` as
+# empty, so a `foreign: false` field would read back as "" and be
+# indistinguishable from a missing one. has() decides presence, so `false`
+# comes back as the string "false".
+repos_get_field() {
+    jq -r --arg k "$1" --arg f "$2" \
+        'if (.repositories[$k] | has($f)) then .repositories[$k][$f] else "" end' \
+        "$REPOS_FILE"
+}
+
+# repos_has_field <key> <field> -- presence test. Use this, never truthiness:
+# `foreign: false` and `images: []` are present fields with falsy values.
+repos_has_field() {
+    jq -e --arg k "$1" --arg f "$2" '.repositories[$k] | has($f)' "$REPOS_FILE" >/dev/null 2>&1
+}
+
+# repos_set_fields <key> <json_patch> -- merge a patch into the record and
+# stamp date_updated, in one atomic write.
+#
+# date_updated is only stamped when the patch does not carry its own: the
+# backfill sets a missing date_updated to date_created deliberately, and
+# overwriting that with "now" would defeat it.
+repos_set_fields() {
+    local key="$1" patch="$2" tmp
+    tmp="$(jq --arg k "$key" --argjson p "$patch" --arg now "$(now_iso8601)" \
+        '.repositories[$k] += $p
+         | if ($p | has("date_updated")) then .
+           else .repositories[$k].date_updated = $now end' \
+        "$REPOS_FILE")" || return 1
+    printf '%s' "$tmp" | atomic_write "$REPOS_FILE" 600
+}
+
+repos_delete() {
+    local key="$1" tmp
+    tmp="$(jq --arg k "$key" 'del(.repositories[$k])' "$REPOS_FILE")" || return 1
+    printf '%s' "$tmp" | atomic_write "$REPOS_FILE" 600
+}
+
+repos_locations_list() {
+    local key="$1"
+    jq -r --arg k "$key" '.repositories[$k].locations[]?.path' "$REPOS_FILE"
+}
+
+repos_locations_add() {
+    local key="$1" path="$2" tmp
+    if ! repos_check "$key"; then
+        warn "repo record '$key' no longer exists; location not recorded"
+        return 0
+    fi
+    tmp="$(jq --arg k "$key" --arg p "$path" \
+        '.repositories[$k].locations = ((.repositories[$k].locations // []) + [{path:$p}] | unique_by(.path))' \
+        "$REPOS_FILE")" || return 1
+    printf '%s' "$tmp" | atomic_write "$REPOS_FILE" 600
+}
+
+# repos_get_images <key>
+# Prints the stored `images` value: the compact JSON array if the field is
+# present, or the literal string "null" if absent. The null/array
+# distinction lets images_write force exactly one write when migrating a
+# legacy record, even if the freshly computed result is [].
+repos_get_images() {
+    local key="$1"
+    jq -c --arg k "$key" \
+        'if (.repositories[$k] | has("images")) then .repositories[$k].images else null end' \
+        "$REPOS_FILE"
+}
+
+repos_set_images() {
+    local key="$1" images_json="$2" tmp
+    tmp="$(jq --arg k "$key" --argjson imgs "$images_json" \
+        '.repositories[$k].images = $imgs' "$REPOS_FILE")" || return 1
+    printf '%s' "$tmp" | atomic_write "$REPOS_FILE" 600
+}
+
+repos_list() {
+    jq -r '.repositories | to_entries[] | [.key, .value.org, .value.name, .value.branch] | @tsv' "$REPOS_FILE"
+}
+
+# repos_keys -- records with no private_key (public repos) are skipped rather
+# than emitted with a blank first column
+repos_keys() {
+    jq -r '.repositories | to_entries[]
+           | select(.value.private_key != null)
+           | [.key, .value.private_key, .value.org, .value.name, .value.branch] | @tsv' "$REPOS_FILE"
+}
+
+now_iso8601() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+display_url() {
+    local org="$1" name="$2" branch="$3"
+    printf 'https://github.com/%s/%s/%s' "$org" "$name" "$branch"
+}
+
+clone_url() {
+    local key="$1" org="$2" name="$3"
+    printf 'git@%s.repo:%s/%s.git' "$key" "$org" "$name"
+}
+
+# ---------------------------------------------------------------------------
+# 10. Images layer -- images_*
+# ---------------------------------------------------------------------------
+
+# images_read_file <loc> -- source A; prints one image ref per line
+images_read_file() {
+    local loc="$1"
+    local f="$loc/$IMAGES_FILE_NAME"
+    [ -e "$f" ] || return 0
+    if [ -d "$f" ]; then
+        warn "$f is a directory, ignoring"
+        return 0
+    fi
+    if [ ! -r "$f" ]; then
+        warn "$f is not readable, ignoring"
+        return 0
+    fi
+    sed -e 's/\r//g' -e 's/#.*$//' \
+        -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' \
+        -e '/^$/d' "$f"
+}
+
+# images_is_compose_project <loc> -- true/false via exit status
+images_is_compose_project() {
+    local loc="$1" f
+    for f in "$loc/compose.yml" "$loc/compose.yaml" "$loc/docker-compose.yml" "$loc/docker-compose.yaml"; do
+        [ -e "$f" ] && return 0
+    done
+    return 1
+}
+
+# images_compose_available -- v2 plugin probe; never touches the daemon
+images_compose_available() {
+    command -v docker >/dev/null 2>&1 || return 1
+    docker compose version >/dev/null 2>&1
+}
+
+# images_compose_config_json <loc>
+# Prints `docker compose config --format json`, preferring --profile '*'.
+# Verifies the wildcard actually pulled in every declared profile's
+# services by comparing against an explicit --profile <name>... run; falls
+# back to the explicit list if they differ. Costs one extra `config` call
+# only when the compose file declares at least one profile.
+images_compose_config_json() {
+    local loc="$1"
+    local -a declared=()
+    mapfile -t declared < <(cd "$loc" && docker compose config --profiles 2>/dev/null)
+
+    local -a profile_args=(--profile "$COMPOSE_PROFILE_WILDCARD")
+    if [ "${#declared[@]}" -gt 0 ]; then
+        local -a explicit_args=()
+        local p
+        for p in "${declared[@]}"; do explicit_args+=(--profile "$p"); done
+
+        local wildcard_keys explicit_keys
+        wildcard_keys="$(cd "$loc" && docker compose --profile "$COMPOSE_PROFILE_WILDCARD" config --format json 2>/dev/null | jq -rS '.services // {} | keys')"
+        explicit_keys="$(cd "$loc" && docker compose "${explicit_args[@]}" config --format json 2>/dev/null | jq -rS '.services // {} | keys')"
+
+        [ "$wildcard_keys" = "$explicit_keys" ] || profile_args=("${explicit_args[@]}")
+    fi
+
+    ( cd "$loc" && docker compose "${profile_args[@]}" config --format json )
+}
+
+# images_compose_extract <loc> -- source B; prints one image ref per line.
+# Returns 2 (and warns) specifically when `config` itself failed, so the
+# caller's mapfile naturally yields B=∅ without extra plumbing.
+images_compose_extract() {
+    local loc="$1" json
+    json="$(images_compose_config_json "$loc")" || { warn "docker compose config failed for $loc"; return 2; }
+    jq -r '[.services // {} | to_entries[]
+            | select(.value.build == null)
+            | .value.image // empty
+            | select(. != "")] | .[]' <<< "$json"
+}
+
+# images_collect <loc>
+# Prints a compact, sorted, deduplicated JSON array on stdout and returns 0.
+# Returns 1 and prints nothing when the compose contribution is
+# indeterminate (compose project, docker compose unavailable) -- caller
+# must leave the stored `images` value untouched in that case.
+images_collect() {
+    local loc="$1"
+    local -a a_lines=() b_lines=()
+    mapfile -t a_lines < <(images_read_file "$loc")
+
+    if images_is_compose_project "$loc"; then
+        if ! images_compose_available; then
+            warn "docker compose not available; leaving images unchanged for $loc"
+            return 1
+        fi
+        mapfile -t b_lines < <(images_compose_extract "$loc")
+    fi
+
+    printf '%s\n' "${a_lines[@]}" "${b_lines[@]}" \
+        | sed '/^$/d' | sort -u | jq -R . | jq -sc .
+}
+
+# images_write <key> <new_json>
+# Best-effort: skips the write if unchanged, turns every failure (vanished
+# record, lock timeout, unwritable store) into a warning. Never call while
+# already holding the store lock -- store_lock_soft reuses fd 9, and the
+# two lock kinds are never held concurrently in this script.
+images_write() {
+    local key="$1" new_json="$2" current_json
+
+    repos_check "$key" || { warn "repo record '$key' no longer exists; images not recorded"; return 0; }
+
+    current_json="$(repos_get_images "$key")"
+    [ "$new_json" != "$current_json" ] || return 0
+
+    store_lock_soft || { warn "could not acquire lock to update images for '$key'"; return 0; }
+
+    if ! repos_check "$key"; then
+        store_unlock_soft
+        warn "repo record '$key' no longer exists; images not recorded"
+        return 0
+    fi
+    if ! repos_set_images "$key" "$new_json"; then
+        store_unlock_soft
+        warn "failed to write images for '$key'"
+        return 0
+    fi
+    store_unlock_soft
+}
+
+# images_update_record <key> <loc>
+# Orchestrates collect + write for one location. Silent on the
+# indeterminate case beyond images_collect's own warning.
+images_update_record() {
+    local key="$1" loc="$2" new_json
+    new_json="$(images_collect "$loc")" || return 0
+    images_write "$key" "$new_json"
+}
+
+# ---------------------------------------------------------------------------
+# 11. Key layer -- keys_*
+# ---------------------------------------------------------------------------
+
+keys_check() {
+    local key="$1"
+    [ -e "$SSH_DIR/${key}.key" ]
+}
+
+keys_preflight() {
+    [ -w "$SSH_DIR" ] || die "$E_IO" "$SSH_DIR is not writable"
+    if [ -e "$SSH_CONFIG" ]; then
+        [ -w "$SSH_CONFIG" ] || die "$E_IO" "$SSH_CONFIG is not writable"
+    fi
+}
+
+keys_add() {
+    local key="$1" host content
+
+    mkdir -p "$SSH_DIR"
+    chmod 700 "$SSH_DIR"
+    [ -e "$SSH_CONFIG" ] || { : > "$SSH_CONFIG"; chmod 600 "$SSH_CONFIG"; }
+
+    host="$(hostname)"
+    ssh-keygen -t ed25519 \
+        -C "deploy@${host}.${key}" \
+        -f "$SSH_DIR/${key}.key" \
+        -N '' >/dev/null 2>&1 \
+        || die "$E_IO" "failed to generate deploy key for '$key'"
+    chmod 600 "$SSH_DIR/${key}.key"
+
+    content="$(block_marker_open "$key")
+Host ${key}.repo
+    HostName github.com
+    AddKeysToAgent yes
+    StrictHostKeyChecking no
+    PreferredAuthentications publickey
+    IdentityFile ${SSH_DIR}/${key}.key
+
+$(block_marker_close "$key")"
+
+    block_upsert "$SSH_CONFIG" "$key" "$content"
+    chmod 600 "$SSH_CONFIG"
+}
+
+keys_delete() {
+    local key="$1"
+    rm -f "$SSH_DIR/${key}.key" "$SSH_DIR/${key}.key.pub"
+    block_delete "$SSH_CONFIG" "$key"
+    [ -f "$SSH_CONFIG" ] && chmod 600 "$SSH_CONFIG"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# 12. Adoption layer -- adopt_*
+# ---------------------------------------------------------------------------
+
+# adopt_current_branch <loc> -- prints the checked-out branch name.
+#
+# Fails on a git error OR on empty output. The emptiness check is mandatory,
+# not defensive: on a detached HEAD `git branch --show-current` prints nothing
+# and exits 0, so an exit-code check alone would let an empty branch into the
+# record -- and `repo update` would then run `git reset --hard "origin/"`.
+adopt_current_branch() {
+    local loc="$1" branch
+    branch="$(git -C "$loc" branch --show-current 2>/dev/null)" || return 1
+    [ -n "$branch" ] || return 1
+    printf '%s\n' "$branch"
+}
+
+# adopt_read_origin <loc> -- prints the origin remote URL; fails if absent.
+#
+# `git config --get remote.origin.url`, NOT `git remote get-url`: the latter
+# expands url.<base>.insteadOf rewrites, so on a host that has one configured
+# it returns the rewritten target instead of what the repo actually declares.
+# The configured value is the right thing to store -- git applies the same
+# rewrite again at clone time, whereas a baked-in rewritten URL would be wrong
+# anywhere the rewrite is not configured.
+adopt_read_origin() {
+    local loc="$1" url
+    url="$(git -C "$loc" config --get remote.origin.url 2>/dev/null)" || return 1
+    [ -n "$url" ] || return 1
+    printf '%s\n' "$url"
+}
+
+# adopt_parse_origin <url> -- sets ORIGIN_VISIBILITY, ORIGIN_HOST, ORIGIN_ORG,
+# ORIGIN_NAME. Returns 1 when the URL is not one of the two supported forms.
+#
+#   git@<host>:<org>/<name>[.git]        -> private
+#   https://<host>/<org>/<name>[.git]    -> public
+#
+# The check is purely structural; the caller validates the parts against the
+# id/org/name charset rules. `.git` is stripped with ${var%.git} rather than an
+# optional regex group because bash ERE has no lazy quantifiers, so
+# `(.+?)(\.git)?$` cannot be expressed and the greedy form would swallow it.
+# shellcheck disable=SC2034  # consumed by cmd_folder_adopt (phase 6)
+adopt_parse_origin() {
+    local url="$1"
+    url="${url%/}"
+
+    if [[ "$url" =~ ^git@([^:]+):([^/]+)/(.+)$ ]]; then
+        ORIGIN_VISIBILITY="private"
+        ORIGIN_HOST="${BASH_REMATCH[1]}"
+        ORIGIN_ORG="${BASH_REMATCH[2]}"
+        ORIGIN_NAME="${BASH_REMATCH[3]%.git}"
+    elif [[ "$url" =~ ^https://([^/]+)/([^/]+)/(.+)$ ]]; then
+        ORIGIN_VISIBILITY="public"
+        ORIGIN_HOST="${BASH_REMATCH[1]}"
+        ORIGIN_ORG="${BASH_REMATCH[2]}"
+        ORIGIN_NAME="${BASH_REMATCH[3]%.git}"
+    else
+        return 1
+    fi
+
+    # A remaining slash means nested groups (GitLab-style org/sub/name), which
+    # this record schema cannot represent. Reject here so the caller reports
+    # "unparseable origin" rather than a confusing id-validation error later.
+    case "$ORIGIN_NAME" in */*) return 1 ;; esac
+    [ -n "$ORIGIN_HOST" ] && [ -n "$ORIGIN_ORG" ] && [ -n "$ORIGIN_NAME" ]
+}
+
+# adopt_find_identity <host_alias> -- prints the IdentityFile path declared for
+# a Host alias in ~/.ssh/config, with a leading ~/ expanded.
+#
+# Written for hand-maintained config, which is what adoption targets:
+#   - keywords are case-insensitive (`host`, `identityfile` are legal)
+#   - a Host line may list several aliases and patterns; only an EXACT match
+#     counts, so a `Host *` catch-all is never mistaken for this repo's block
+#   - the block ends at the next Host/Match line, or EOF
+#   - trailing `# comments` are stripped
+#
+# Not handled (out of scope, per the specification): `Include` directives, and
+# the `Keyword=Value` spelling.
+adopt_find_identity() {
+    local host="$1" path
+    [ -f "$SSH_CONFIG" ] || return 1
+
+    path="$(awk -v want="$host" '
+        {
+            line = $0
+            sub(/#.*/, "", line)
+            n = split(line, t, /[ \t]+/)
+            i = 1
+            while (i <= n && t[i] == "") i++
+            if (i > n) next
+
+            kw = tolower(t[i])
+            if (kw == "host" || kw == "match") {
+                inblock = 0
+                if (kw == "host") {
+                    for (j = i + 1; j <= n; j++) if (t[j] == want) inblock = 1
+                }
+                next
+            }
+            if (inblock && kw == "identityfile" && (i + 1) <= n) {
+                print t[i + 1]
+                exit
+            }
+        }
+    ' "$SSH_CONFIG")"
+
+    [ -n "$path" ] || return 1
+
+    # A literal "~/" read out of the config file -- nothing has expanded it,
+    # since it arrived as text. git-utils writes absolute paths itself, so this
+    # matters precisely for the hand-written blocks adoption targets.
+    if [ "$path" != "${path#\~/}" ]; then
+        path="$HOME/${path#\~/}"
+    fi
+    printf '%s\n' "$path"
+}
+
+# adopt_block_exists <repo_id> -- does ~/.ssh/config hold the git-utils
+# sentinel block for this id?
+#
+# This is the shared `foreign` test: that block is written only by `repo add`,
+# so its presence proves git-utils created the repo's key material. Both
+# `folder adopt` and the `repo validate --fix` backfill call this one function,
+# which is what stops the two from ever disagreeing.
+adopt_block_exists() {
+    [ -f "$SSH_CONFIG" ] || return 1
+    grep -qF "$(block_marker_open "$1")" "$SSH_CONFIG"
+}
+
+# ---------------------------------------------------------------------------
+# 13. Validation layer -- fv_* / rv_* / db_validate
+# ---------------------------------------------------------------------------
+
+# fv_run <abs_path> -- prints the folder-validate JSON; returns 1 when any
+# check Failed, 0 otherwise.
+#
+# The command is a thin wrapper around this. Higher levels call it as a shell
+# function, never as a subprocess: `repo validate` runs it once per location,
+# and re-entering the script would repeat every pre-check and re-read the store
+# for each one.
+fv_run() {
+    local loc="$1"
+    local s_location s_tracking s_origin id rc=0
+
+    if [ -d "$loc" ]; then
+        s_location="$(status_obj 0 "Ok")"
+    else
+        s_location="$(status_obj "$E_NOTFOUND" "Failed" "Folder does not exist")"
+    fi
+
+    id="$(repos_find_by_location "$loc" || true)"
+    if [ -n "$id" ]; then
+        s_tracking="$(status_obj 0 "Ok")"
+    else
+        s_tracking="$(status_obj "$E_NOTFOUND" "Failed" "Folder is not tracked")"
+    fi
+
+    # `origin` is Skipped whenever an earlier check already explains the
+    # problem, so one fault is not counted twice. It is NOT skipped for a
+    # tracked folder that exists but is not a git repo: nothing else reports
+    # that, and skipping it would let a rotted location pass as healthy.
+    if [ ! -d "$loc" ]; then
+        s_origin="$(status_obj 0 "Skipped" "Folder does not exist")"
+    elif [ -z "$id" ]; then
+        s_origin="$(status_obj 0 "Skipped" "Folder is not tracked")"
+    elif ! folder_is_git "$loc"; then
+        s_origin="$(status_obj "$E_GITFOLDER" "Failed" "Folder is not a git repo")"
+    else
+        local url branch e_origin e_branch
+        url="$(adopt_read_origin "$loc" || true)"
+        branch="$(adopt_current_branch "$loc" || true)"
+        e_origin="$(repos_get_field "$id" origin)"
+        e_branch="$(repos_get_field "$id" branch)"
+
+        if [ -z "$url" ]; then
+            s_origin="$(status_obj "$E_MISMATCH" "Failed" "Repo has no 'origin' remote")"
+        elif [ -z "$e_origin" ]; then
+            # a record defect, not a folder defect -- repo validate's `fields`
+            # check is what reports it, and --fix is what repairs it
+            s_origin="$(status_obj 0 "Skipped" "Record has no origin to compare")"
+        elif [ "$url" != "$e_origin" ]; then
+            s_origin="$(status_obj "$E_MISMATCH" "Failed" "Origin does not match the record")"
+        elif [ -z "$branch" ]; then
+            s_origin="$(status_obj "$E_MISMATCH" "Failed" "Cannot determine the current branch")"
+        elif [ "$branch" != "$e_branch" ]; then
+            s_origin="$(status_obj "$E_MISMATCH" "Failed" "Branch '$branch' does not match the record's '$e_branch'")"
+        else
+            s_origin="$(status_obj 0 "Ok")"
+        fi
+    fi
+
+    jq -nc --argjson l "$s_location" --argjson t "$s_tracking" --argjson o "$s_origin" \
+        '{location: $l, tracking: $t, origin: $o}'
+
+    local s
+    for s in "$s_location" "$s_tracking" "$s_origin"; do
+        if status_failed "$s"; then rc=1; fi
+    done
+    return "$rc"
+}
+
+# RV_REQUIRED_FIELDS -- every record must carry these. private_key/public_key
+# are added for private repos only.
+#
+# An array, not a space-separated string: this script runs with IFS=$'\n\t',
+# so word-splitting an unquoted string does NOT split on spaces and the whole
+# list would be iterated as a single value.
+declare -ra RV_REQUIRED_FIELDS=(
+    name org branch visibility foreign origin
+    locations images date_created date_updated
+)
+
+# rv_birth_date <loc> -- best guess at when a checkout came into existence.
+#
+# `stat -c %W` returns 0 on the many kernel/filesystem combinations that do not
+# record a birth time, which is why this falls through to mtime, then to the
+# repo's first commit, then to now. A missing timestamp must never abort a
+# repair run.
+rv_birth_date() {
+    local ref="${1:-}" ts="" first=""
+
+    if [ -n "$ref" ] && [ -d "$ref" ]; then
+        ts="$(stat -c '%W' "$ref" 2>/dev/null || printf '0')"
+        case "$ts" in ''|0|-) ts="$(stat -c '%Y' "$ref" 2>/dev/null || printf '')" ;; esac
+        if [ -n "$ts" ] && [ "$ts" != "0" ]; then
+            if date -u -d "@$ts" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null; then
+                return 0
+            fi
+        fi
+        first="$(git -C "$ref" log --max-parents=0 --format=%aI 2>/dev/null | tail -n1 || printf '')"
+        if [ -n "$first" ]; then
+            if date -u -d "$first" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null; then
+                return 0
+            fi
+        fi
+    fi
+    now_iso8601
+}
+
+# rv_fix <repo_id> -- prune dead locations and backfill missing fields, in a
+# single locked write. Prints the names of what it repaired, comma-separated;
+# prints nothing when there was nothing to do.
+#
+# Pruning comes first so the backfill reads origin and dates from a location
+# that actually survives.
+rv_fix() {
+    local id="$1"
+    local -a stored=() alive=()
+    local patch="{}" changed="" loc
+
+    mapfile -t stored < <(repos_locations_list "$id")
+    for loc in "${stored[@]}"; do
+        if [ -d "$loc" ]; then alive+=("$loc"); fi
+    done
+
+    _rv_add() {   # _rv_add <field> <jq-arg-type> <value>
+        if [ "$2" = "json" ]; then
+            patch="$(jq -c --arg f "$1" --argjson v "$3" '. + {($f): $v}' <<< "$patch")"
+        else
+            patch="$(jq -c --arg f "$1" --arg v "$3" '. + {($f): $v}' <<< "$patch")"
+        fi
+        if [ -z "$changed" ]; then changed="$1"; else changed="$changed, $1"; fi
+    }
+
+    # locations: prune, or create when the field is missing entirely
+    if [ "${#alive[@]}" -ne "${#stored[@]}" ]; then
+        local locs_json="[]"
+        if [ "${#alive[@]}" -gt 0 ]; then
+            locs_json="$(printf '%s\n' "${alive[@]}" | jq -R . | jq -sc 'map({path: .})')"
+        fi
+        _rv_add locations json "$locs_json"
+    elif ! repos_has_field "$id" locations; then
+        _rv_add locations json "[]"
+    fi
+
+    if ! repos_has_field "$id" images; then
+        _rv_add images json "[]"
+    fi
+
+    local ref=""
+    if [ "${#alive[@]}" -gt 0 ]; then ref="${alive[0]}"; fi
+
+    # origin: read it from a surviving checkout, else compose the convention
+    local origin_eff
+    origin_eff="$(repos_get_field "$id" origin)"
+    if ! repos_has_field "$id" origin; then
+        local o="" org name
+        if [ -n "$ref" ] && folder_is_git "$ref"; then
+            o="$(adopt_read_origin "$ref" || printf '')"
+        fi
+        if [ -z "$o" ]; then
+            org="$(repos_get_field "$id" org)"
+            name="$(repos_get_field "$id" name)"
+            if [ -n "$org" ] && [ -n "$name" ]; then
+                o="$(clone_url "$id" "$org" "$name")"
+            fi
+        fi
+        if [ -n "$o" ]; then
+            origin_eff="$o"
+            _rv_add origin str "$o"
+        fi
+    fi
+
+    if ! repos_has_field "$id" visibility; then
+        local v="private"
+        if [ -n "$origin_eff" ] && adopt_parse_origin "$origin_eff"; then
+            v="$ORIGIN_VISIBILITY"
+        fi
+        _rv_add visibility str "$v"
+    fi
+
+    # the same sentinel test folder adopt uses, so the two cannot disagree
+    if ! repos_has_field "$id" foreign; then
+        local fo="true"
+        if adopt_block_exists "$id"; then fo="false"; fi
+        _rv_add foreign json "$fo"
+    fi
+
+    local created_eff
+    created_eff="$(repos_get_field "$id" date_created)"
+    if ! repos_has_field "$id" date_created; then
+        created_eff="$(rv_birth_date "$ref")"
+        _rv_add date_created str "$created_eff"
+    fi
+
+    if ! repos_has_field "$id" date_updated; then
+        local du="$created_eff"
+        if [ -z "$du" ]; then du="$(now_iso8601)"; fi
+        _rv_add date_updated str "$du"
+    fi
+
+    unset -f _rv_add
+    [ -n "$changed" ] || return 0
+
+    store_lock
+    if ! repos_set_fields "$id" "$patch"; then
+        store_unlock
+        warn "failed to write repairs for '$id' to $REPOS_FILE"
+        return 0
+    fi
+    store_unlock
+
+    printf '%s' "$changed"
+}
+
+# rv_run <repo_id> [<fix>] -- prints the repo-validate JSON; returns health.code.
+#
+# All validation results are nested under `checks` so they can never collide
+# with record fields: `locations` exists in both, as an array in the record and
+# as a per-path map of folder-validate results in the checks.
+rv_run() {
+    local id="$1" fix="${2:-0}"
+    local s_fields s_keys s_ssh s_health
+    local vis foreign rc=0 fixed=""
+
+    # The repair runs first, so everything below reads the repaired state --
+    # repos_get_field, repos_has_field and the final projection all re-read the
+    # store, so the emitted record shows the fixed values rather than the ones
+    # the run started with.
+    if [ "$fix" = "1" ]; then
+        fixed="$(rv_fix "$id")"
+        # images are re-read only under --fix: it writes the record, and a run
+        # without --fix must not mutate the store at all
+        local -a fixlocs=()
+        mapfile -t fixlocs < <(repos_locations_list "$id")
+        if [ "${#fixlocs[@]}" -gt 0 ]; then
+            images_update_record "$id" "${fixlocs[0]}"
+        fi
+    fi
+
+    vis="$(repos_get_field "$id" visibility)"
+    foreign="$(repos_get_field "$id" foreign)"
+
+    # --- fields -----------------------------------------------------------
+    local missing_str="" f
+    for f in "${RV_REQUIRED_FIELDS[@]}"; do
+        if ! repos_has_field "$id" "$f"; then
+            if [ -z "$missing_str" ]; then missing_str="$f"; else missing_str="$missing_str, $f"; fi
+        fi
+    done
+    if [ "$vis" = "private" ]; then
+        for f in private_key public_key; do
+            if ! repos_has_field "$id" "$f"; then
+                if [ -z "$missing_str" ]; then missing_str="$f"; else missing_str="$missing_str, $f"; fi
+            fi
+        done
+    fi
+    # Still-missing fields outrank a partial repair: name, org and branch have
+    # nothing to be backfilled from, so a --fix run can legitimately leave the
+    # record incomplete and must say so rather than claim "Fixed".
+    if [ -n "$missing_str" ]; then
+        s_fields="$(status_obj "$E_DBFORMAT" "Failed" "Missing fields: $missing_str")"
+    elif [ -n "$fixed" ]; then
+        s_fields="$(status_obj 0 "Fixed" "Repaired: $fixed")"
+    else
+        s_fields="$(status_obj 0 "Ok")"
+    fi
+
+    # --- keys -------------------------------------------------------------
+    if [ "$vis" != "private" ]; then
+        s_keys="$(status_obj 0 "Skipped" "Not a private repo")"
+    else
+        local priv pub absent=""
+        priv="$(repos_get_field "$id" private_key)"
+        pub="$(repos_get_field "$id" public_key)"
+        if [ -z "$priv" ] || [ ! -f "$priv" ]; then absent="${priv:-<unset>}"; fi
+        if [ -z "$pub" ] || [ ! -f "$pub" ]; then
+            if [ -z "$absent" ]; then absent="${pub:-<unset>}"; else absent="$absent, ${pub:-<unset>}"; fi
+        fi
+        if [ -z "$absent" ]; then
+            s_keys="$(status_obj 0 "Ok")"
+        else
+            s_keys="$(status_obj 1 "Failed" "Deploy key files not found: $absent")"
+        fi
+    fi
+
+    # --- ssh --------------------------------------------------------------
+    if [ "$vis" != "private" ]; then
+        s_ssh="$(status_obj 0 "Skipped" "Not a private repo")"
+    elif [ "$foreign" = "true" ]; then
+        s_ssh="$(status_obj 0 "Skipped" "Foreign repo; git-utils does not manage its ssh config")"
+    elif adopt_block_exists "$id"; then
+        s_ssh="$(status_obj 0 "Ok")"
+    else
+        s_ssh="$(status_obj 1 "Failed" "Missing sentinel delimited block")"
+    fi
+
+    # --- locations --------------------------------------------------------
+    local -a locs=()
+    mapfile -t locs < <(repos_locations_list "$id")
+    local loc_map="{}" loc fvjson loc_failed=0
+    for loc in "${locs[@]}"; do
+        if fvjson="$(fv_run "$loc")"; then :; else loc_failed=1; fi
+        loc_map="$(jq -c --arg p "$loc" --argjson r "$fvjson" '. + {($p): $r}' <<< "$loc_map")"
+    done
+
+    # --- health -----------------------------------------------------------
+    local failed="$loc_failed" s
+    for s in "$s_fields" "$s_keys" "$s_ssh"; do
+        if status_failed "$s"; then failed=1; fi
+    done
+
+    if [ "$failed" -eq 1 ]; then
+        s_health="$(status_obj 1 "Failed")"
+        rc=1
+    elif [ "${#locs[@]}" -eq 0 ]; then
+        s_health="$(status_obj 0 "Warning" "Repository has no locations")"
+    else
+        s_health="$(status_obj 0 "Ok")"
+    fi
+
+    jq -c --arg k "$id" \
+        --argjson fields "$s_fields" --argjson keys "$s_keys" --argjson ssh "$s_ssh" \
+        --argjson locs "$loc_map" --argjson health "$s_health" \
+        '{id: $k} + .repositories[$k]
+         + {checks: {fields: $fields, keys: $keys, ssh: $ssh, locations: $locs, health: $health}}' \
+        "$REPOS_FILE"
+
+    return "$rc"
+}
+
+# db_validate [<fix>] -- prints the whole-store validation JSON; returns 1 if
+# anything failed.
+#
+# Each step stops the run when it fails, because the next one cannot be
+# evaluated: there is no schema to check in an unparseable file, and no records
+# to walk in a layout that has not been converted.
+db_validate() {
+    local fix="${1:-0}"
+    local s_db s_schema state rc=0
+
+    if [ ! -f "$REPOS_FILE" ]; then
+        s_db="$(status_obj "$E_NOTFOUND" "Failed" "Database file not found: $REPOS_FILE")"
+        jq -nc --argjson d "$s_db" '{database: $d}'
+        return 1
+    fi
+
+    state="$(db_format_state)"
+
+    if [ "$state" = "invalid" ]; then
+        # no repair path: nothing can be recovered from a file that does not parse
+        s_db="$(status_obj "$E_IO" "Failed" "Unable to parse database file")"
+        jq -nc --argjson d "$s_db" '{database: $d}'
+        return 1
+    fi
+
+    if [ "$state" = "old" ]; then
+        if [ "$fix" != "1" ]; then
+            s_db="$(status_obj "$E_DBFORMAT" "Failed" "Database is in old format")"
+            jq -nc --argjson d "$s_db" '{database: $d}'
+            return 1
+        fi
+        local bak
+        store_lock
+        if ! bak="$(db_convert_with_backup)"; then
+            store_unlock
+            s_db="$(status_obj "$E_IO" "Failed" "Conversion failed; database left unchanged")"
+            jq -nc --argjson d "$s_db" '{database: $d}'
+            return 1
+        fi
+        store_unlock
+        s_db="$(status_obj 0 "Fixed" "Converted to schema $SCHEMA_VERSION; backup written to $bak")"
+        state="$(db_format_state)"
+    else
+        s_db="$(status_obj 0 "Ok")"
+    fi
+
+    if [ "$state" != "ok" ]; then
+        s_schema="$(status_obj 1 "Failed" "Database schema is in invalid format or missing")"
+        jq -nc --argjson d "$s_db" --argjson s "$s_schema" '{database: $d, schema: $s}'
+        return 1
+    fi
+    s_schema="$(status_obj 0 "Ok")"
+
+    # Per record. --fix propagates: without it a --fix run would convert the
+    # layout and then leave every record missing its new fields.
+    #
+    # The store lock is NOT held here -- rv_fix takes it per repo, and holding
+    # it across this loop would deadlock against itself.
+    local -a ids=()
+    mapfile -t ids < <(repos_all_ids)
+    local reps="[]" id out
+    for id in "${ids[@]}"; do
+        if out="$(rv_run "$id" "$fix")"; then :; else rc=1; fi
+        reps="$(jq -c --argjson r "$out" '. + [$r]' <<< "$reps")"
+    done
+
+    jq -nc --argjson d "$s_db" --argjson s "$s_schema" --argjson r "$reps" \
+        '{database: $d, schema: $s, repositories: $r}'
+    return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# 14. Command implementations
+# ---------------------------------------------------------------------------
+
+cmd_setup() {
+    local opt_org="" opt_branch=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_setup; exit 0 ;;
+            -o|--default-org)
+                [ $# -ge 2 ] || die "$E_ARGS" "--default-org requires a value"
+                opt_org="$2"; shift 2 ;;
+            --default-org=*) opt_org="${1#*=}"; shift ;;
+            -b|--default-branch)
+                [ $# -ge 2 ] || die "$E_ARGS" "--default-branch requires a value"
+                opt_branch="$2"; shift 2 ;;
+            --default-branch=*) opt_branch="${1#*=}"; shift ;;
+            --) shift ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) die "$E_ARGS" "unexpected argument: $1" ;;
+        esac
+    done
+
+    [ -z "$opt_org" ] || validate_part "$opt_org" 3 "org"
+    [ -z "$opt_branch" ] || validate_part "$opt_branch" 1 "branch"
+
+    local sbin=""
+    if [ -d /usr/local/sbin ]; then
+        sbin=/usr/local/sbin
+    elif [ -d /usr/sbin ]; then
+        sbin=/usr/sbin
+    else
+        die "$E_PRECHECK" "neither /usr/local/sbin nor /usr/sbin exists"
+    fi
+
+    local SUDO=""
+    if [ ! -w "$sbin" ]; then
+        command -v sudo >/dev/null 2>&1 || die "$E_PRECHECK" "$sbin is not writable and sudo is not available"
+        SUDO="sudo"
+    fi
+
+    local self
+    self="$(realpath "${BASH_SOURCE[0]}")"
+
+    if [ -e "$sbin/git-utils" ] || [ -L "$sbin/git-utils" ]; then
+        local existing
+        existing="$(realpath -m "$sbin/git-utils" 2>/dev/null || printf '')"
+        if [ "$existing" = "$self" ]; then
+            warn "$sbin/git-utils already points here, leaving it"
+        else
+            warn "$sbin/git-utils already exists and points at '${existing:-?}', not '$self'; leaving it"
+        fi
+    else
+        $SUDO ln -s "$self" "$sbin/git-utils"
+    fi
+
+    # Outside the branch above, deliberately. `git reset --hard` restores this
+    # script with whatever mode git recorded for it, so an update of the repo
+    # can strip the executable bit and every later run fails with "Permission
+    # denied". Re-running setup has to be able to repair that on its own --
+    # otherwise the only cure is deleting the symlink first, which is not
+    # something a user would guess.
+    if [ ! -x "$self" ]; then
+        $SUDO chmod +x "$self" || die "$E_IO" "cannot make $self executable"
+        info "restored the executable bit on $self"
+    fi
+
+    local existing_org="" existing_branch=""
+    if [ -f "$BASHRC" ]; then
+        local block
+        block="$(awk -v open="$(block_marker_open "")" -v close_marker="$(block_marker_close "")" \
+            '$0==open{f=1;next} $0==close_marker{f=0} f' "$BASHRC")"
+        existing_org="$(printf '%s\n' "$block" | sed -n 's/^export GH_DEFAULT_ORG="\(.*\)"$/\1/p')"
+        existing_branch="$(printf '%s\n' "$block" | sed -n 's/^export GH_DEFAULT_BRANCH="\(.*\)"$/\1/p')"
+    fi
+
+    local final_org="${opt_org:-$existing_org}"
+    local final_branch="${opt_branch:-$existing_branch}"
+
+    local path_needed=1
+    case ":$PATH:" in
+        *":$sbin:"*) path_needed=0 ;;
+    esac
+
+    local body=""
+    [ "$path_needed" -eq 1 ] && body+="export PATH=\"\$PATH:$sbin\""$'\n'
+    [ -n "$final_org" ] && body+="export GH_DEFAULT_ORG=\"$final_org\""$'\n'
+    [ -n "$final_branch" ] && body+="export GH_DEFAULT_BRANCH=\"$final_branch\""$'\n'
+
+    local content
+    content="$(block_marker_open "")"$'\n'"${body}$(block_marker_close "")"
+
+    block_upsert "$BASHRC" "" "$content"
+
+    [ -n "$final_org" ] && export GH_DEFAULT_ORG="$final_org"
+    [ -n "$final_branch" ] && export GH_DEFAULT_BRANCH="$final_branch"
+
+    info "setup complete."
+    info "note: already-open shells need 'source ~/.bashrc' to pick up the changes."
+}
+
+cmd_repo_add() {
+    local name_flag=""
+    local args=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_repo_add; exit 0 ;;
+            -n|--name)
+                [ $# -ge 2 ] || die "$E_ARGS" "--name requires a value"
+                name_flag="$2"; shift 2 ;;
+            --name=*) name_flag="${1#*=}"; shift ;;
+            --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    [ "${#args[@]}" -ge 1 ] || { help_repo_add; exit "$E_ARGS"; }
+    [ "${#args[@]}" -le 1 ] || die "$E_ARGS" "unexpected argument: ${args[1]}"
+    local repo_arg="${args[0]}"
+
+    require_cmds git realpath jq yq ssh-keygen
+    precheck_store_creatable
+
+    parse_repo_name "$repo_arg"
+    local key="${name_flag:-$REPO_NAME}"
+    validate_part "$key" 3 "key"
+
+    if [ -e "$SSH_DIR" ]; then
+        [ -w "$SSH_DIR" ] || die "$E_IO" "$SSH_DIR is not writable"
+    else
+        mkdir -p "$SSH_DIR" || die "$E_IO" "cannot create $SSH_DIR"
+        chmod 700 "$SSH_DIR" || die "$E_IO" "cannot set permissions on $SSH_DIR"
+    fi
+    if [ -e "$SSH_CONFIG" ]; then
+        [ -w "$SSH_CONFIG" ] || die "$E_IO" "$SSH_CONFIG is not writable"
+    else
+        { : > "$SSH_CONFIG"; } 2>/dev/null || die "$E_IO" "cannot create $SSH_CONFIG"
+        chmod 600 "$SSH_CONFIG" || die "$E_IO" "cannot set permissions on $SSH_CONFIG"
+    fi
+    if [ -e "$REPOS_FILE" ]; then
+        [ -w "$REPOS_FILE" ] || die "$E_IO" "$REPOS_FILE is not writable"
+    else
+        [ -w "$HOME" ] || die "$E_IO" "$HOME is not writable"
+    fi
+
+    store_lock
+    repos_init
+    if repos_check "$key"; then
+        store_unlock
+        die "$E_EXISTS" "repo key '$key' is already registered"
+    fi
+    if keys_check "$key"; then
+        store_unlock
+        die "$E_EXISTS" "deploy key '$key' already exists"
+    fi
+
+    keys_add "$key"
+
+    if ! repos_add "$key" "$REPO_ORG" "$REPO_NAME" "$REPO_BRANCH" \
+            "$SSH_DIR/${key}.key" "$SSH_DIR/${key}.key.pub"; then
+        keys_delete "$key"
+        store_unlock
+        die "$E_IO" "failed to write $REPOS_FILE; rolled back deploy key"
+    fi
+    store_unlock
+
+    local host; host="$(hostname)"
+    cat << EOF
+
+Add following key to Github deployment keys:
+
+   Key name: ${host}.${key}
+   Key value:
+   $(cat "$SSH_DIR/${key}.key.pub")
+
+Then use following command to clone github repository:
+
+   git-utils repo clone ${key}
+
+EOF
+}
+
+cmd_repo_delete() {
+    local force=0
+    local args=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_repo_delete; exit 0 ;;
+            -f|--force) force=1; shift ;;
+            --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    [ "${#args[@]}" -le 1 ] || die "$E_ARGS" "unexpected argument: ${args[1]}"
+    local target="${args[0]:-}"
+    FORCE="$force"
+
+    precheck_common
+    precheck_store
+
+    resolve_target "$target"
+    repos_resolve
+
+    # git-utils only removes key material it created. A foreign repo's keys and
+    # Host block were written by someone else -- possibly shared with other
+    # repos -- and a public repo has none. Absent fields default to the
+    # pre-adoption world, where every record was private and git-utils-made.
+    local owns_keys=0
+    if [ "${REC_VISIBILITY:-private}" = "private" ] && [ "${REC_FOREIGN:-false}" != "true" ]; then
+        owns_keys=1
+    fi
+
+    # only meaningful when we are actually going to touch ~/.ssh
+    if [ "$owns_keys" -eq 1 ]; then
+        keys_preflight
+    fi
+
+    local loc
+    for loc in "${REC_LOCATIONS[@]}"; do
+        [ "$TARGET_KIND" = "path" ] && [ "$loc" = "$TARGET_VALUE" ] && continue
+        [ -e "$loc" ] || warn "recorded location no longer exists: $loc"
+    done
+
+    if [ "$TARGET_KIND" = "path" ] && [ -d "$TARGET_VALUE/.git" ]; then
+        local dirty
+        dirty="$(cd "$TARGET_VALUE" && git status --porcelain --ignored)"
+        if [ -n "$dirty" ]; then
+            confirm "'$TARGET_VALUE' has untracked/ignored files. Delete anyway?" || exit 0
+        fi
+    fi
+
+    local del_key="$REC_KEY"
+    local -a del_locations=("${REC_LOCATIONS[@]}")
+
+    store_lock
+    if [ "$owns_keys" -eq 1 ]; then
+        keys_delete "$del_key"
+    fi
+    repos_delete "$del_key"
+    store_unlock
+
+    if [ "$TARGET_KIND" = "path" ]; then
+        case "$TARGET_VALUE" in
+            "/"|"$HOME") die "$E_IO" "refusing to delete $TARGET_VALUE" ;;
+        esac
+        local recorded_match=0 rl
+        for rl in "${del_locations[@]}"; do
+            [ "$rl" = "$TARGET_VALUE" ] && recorded_match=1
+        done
+        [ "$recorded_match" -eq 1 ] || die "$E_IO" "refusing to delete '$TARGET_VALUE': not a recorded location"
+
+        if ! rm -rf "$TARGET_VALUE"; then
+            warn "failed to remove folder; orphaned path: $TARGET_VALUE"
+            exit "$E_IO"
+        fi
+    fi
+
+    info "deleted repo '$del_key'"
+}
+
+cmd_repo_clone() {
+    local args=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_repo_clone; exit 0 ;;
+            --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    [ "${#args[@]}" -ge 1 ] || { help_repo_clone; exit "$E_ARGS"; }
+    [ "${#args[@]}" -le 2 ] || die "$E_ARGS" "unexpected argument: ${args[2]}"
+    local target="${args[0]}" dest="${args[1]:-}"
+
+    precheck_common
+    precheck_store
+
+    resolve_target "$target"
+    [ "$TARGET_KIND" != "path" ] || die "$E_ARGS" "repo clone requires a repo key or full repo name, not a path"
+
+    repos_resolve
+
+    local out="${dest:-$REC_NAME}"
+    [ ! -e "$out" ] || die "$E_EXISTS" "destination '$out' already exists"
+
+    # The record's own origin, not a recomposed one: a foreign repo clones
+    # through its real Host alias and a public one over https, and neither is
+    # expressible as git@<id>.repo:<org>/<name>.git.
+    local url="$REC_ORIGIN"
+    if [ -z "$url" ]; then
+        url="$(clone_url "$REC_KEY" "$REC_ORG" "$REC_NAME")"
+        warn "record '$REC_KEY' has no origin; falling back to '$url' (run 'git-utils repo validate $REC_KEY --fix')"
+    fi
+
+    git clone -b "$REC_BRANCH" "$url" "$out" \
+        || die "$E_IO" "git clone failed"
+
+    local abs; abs="$(realpath -m -- "$out")"
+    store_lock
+    repos_locations_add "$REC_KEY" "$abs"
+    store_unlock
+
+    images_update_record "$REC_KEY" "$abs"
+
+    info "cloned into $out"
+}
+
+cmd_repo_update() {
+    local all=0
+    local args=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_repo_update; exit 0 ;;
+            -a|--all) all=1; shift ;;
+            --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    [ "${#args[@]}" -le 1 ] || die "$E_ARGS" "unexpected argument: ${args[1]}"
+    local target="${args[0]:-}"
+
+    precheck_common
+    precheck_store
+
+    resolve_target "$target"
+    repos_resolve
+
+    local -a targets=()
+    if [ "$TARGET_KIND" = "path" ] && [ "$all" -ne 1 ]; then
+        targets=("$TARGET_VALUE")
+        local loc
+        for loc in "${REC_LOCATIONS[@]}"; do
+            [ "$loc" = "$TARGET_VALUE" ] || warn "not updating other tracked location: $loc"
+        done
+    else
+        targets=("${REC_LOCATIONS[@]}")
+    fi
+
+    local -a failed=() succeeded=()
+    local loc
+    for loc in "${targets[@]}"; do
+        if [ ! -d "$loc" ] || [ ! -d "$loc/.git" ]; then
+            warn "skipping missing or non-git location: $loc"
+            continue
+        fi
+        if ( cd "$loc" && git fetch origin && git reset --hard "origin/$REC_BRANCH" && git clean -fd ); then
+            succeeded+=("$loc")
+        else
+            failed+=("$loc")
+        fi
+    done
+
+    # Image collection happens once per invocation, regardless of --all:
+    #   TARGET_KIND=path         -> only that exact path, and only if it succeeded
+    #   TARGET_KIND=key|fullname -> first location in REC_LOCATIONS order that succeeded
+    local collect_loc="" l
+    if [ "$TARGET_KIND" = "path" ]; then
+        for l in "${succeeded[@]}"; do
+            [ "$l" = "$TARGET_VALUE" ] && collect_loc="$TARGET_VALUE"
+        done
+    else
+        for loc in "${REC_LOCATIONS[@]}"; do
+            for l in "${succeeded[@]}"; do
+                [ "$l" = "$loc" ] && collect_loc="$loc"
+            done
+            [ -n "$collect_loc" ] && break
+        done
+    fi
+    [ -z "$collect_loc" ] || images_update_record "$REC_KEY" "$collect_loc"
+
+    if [ "${#failed[@]}" -gt 0 ]; then
+        warn "update failed for:"
+        for loc in "${failed[@]}"; do
+            warn "  $loc"
+        done
+        exit "$E_IO"
+    fi
+}
+
+cmd_repo_info() {
+    local args=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_repo_info; exit 0 ;;
+            --output-format)
+                [ $# -ge 2 ] || die "$E_ARGS" "--output-format requires a value"
+                output_format_set "$2"; shift 2 ;;
+            --output-format=*) output_format_set "${1#*=}"; shift ;;
+            --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    [ "${#args[@]}" -le 1 ] || die "$E_ARGS" "unexpected argument: ${args[1]}"
+
+    precheck_common
+    precheck_store
+
+    # all three target forms, resolved exactly as repo update/delete resolve
+    # theirs; no argument means the current folder
+    resolve_target "${args[0]:-}"
+    repos_resolve
+
+    # `{id: $k} + record` puts id first: jq preserves insertion order, and so
+    # does the yq renderer.
+    render_output "$(jq -c --arg k "$REC_KEY" '{id: $k} + .repositories[$k]' "$REPOS_FILE")"
+}
+
+# folder_is_git <path> -- is this folder a git repo root?
+#
+# `-e` rather than `-d`: a linked worktree or submodule has .git as a *file*.
+# (The older `-d "$loc/.git"` tests in repo update/delete predate this and are
+# left alone here; unifying them is a separate cleanup.)
+folder_is_git() { [ -e "$1/.git" ]; }
+
+# folder_resolve [<arg>] -- folder commands are filesystem-addressed, so a
+# bare token is a relative path, never a repo key. -m: the path is allowed
+# not to exist, since "Not Found" is one of the answers.
+folder_resolve() { realpath -m -- "${1:-$PWD}"; }
+
+cmd_folder_status() {
+    local args=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_folder_status; exit 0 ;;
+            --output-format)
+                [ $# -ge 2 ] || die "$E_ARGS" "--output-format requires a value"
+                output_format_set "$2"; shift 2 ;;
+            --output-format=*) output_format_set "${1#*=}"; shift ;;
+            --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    [ "${#args[@]}" -le 1 ] || die "$E_ARGS" "unexpected argument: ${args[1]}"
+
+    precheck_common
+    precheck_store
+
+    local path status code=0
+    path="$(folder_resolve "${args[0]:-}")"
+
+    # ordered, first failure wins
+    if [ ! -d "$path" ]; then
+        status="$(status_obj "$E_NOTFOUND" "Not Found" "Folder doesnt exist")"
+        code=1
+    elif ! folder_is_git "$path"; then
+        status="$(status_obj "$E_GITFOLDER" "Not Git Folder" "Folder is not a git repo")"
+        code=1
+    elif [ -z "$(repos_find_by_location "$path")" ]; then
+        status="$(status_obj "$E_NOTFOUND" "Not Tracked" "Git repo is not tracked")"
+        code=1
+    else
+        status="$(status_obj 0 "Ok")"
+    fi
+
+    render_output "$(jq -nc --argjson s "$status" '{status: $s}')"
+    exit "$code"
+}
+
+cmd_validate() {
+    local args=()
+    local fix=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_validate; exit 0 ;;
+            --fix) fix=1; shift ;;
+            --output-format)
+                [ $# -ge 2 ] || die "$E_ARGS" "--output-format requires a value"
+                output_format_set "$2"; shift 2 ;;
+            --output-format=*) output_format_set "${1#*=}"; shift ;;
+            --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    [ "${#args[@]}" -eq 0 ] || die "$E_ARGS" "unexpected argument: ${args[0]}"
+
+    require_cmds git realpath jq yq
+    # deliberately NOT precheck_store: inspecting and repairing a store this
+    # script cannot otherwise use is the entire point of this command
+
+    local out rc=0
+    out="$(db_validate "$fix")" || rc=$?
+    render_output "$out"
+    exit "$rc"
+}
+
+cmd_repo_validate() {
+    local args=()
+    local fix=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_repo_validate; exit 0 ;;
+            --fix) fix=1; shift ;;
+            --output-format)
+                [ $# -ge 2 ] || die "$E_ARGS" "--output-format requires a value"
+                output_format_set "$2"; shift 2 ;;
+            --output-format=*) output_format_set "${1#*=}"; shift ;;
+            --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    [ "${#args[@]}" -ge 1 ] || { help_repo_validate; exit "$E_ARGS"; }
+    [ "${#args[@]}" -le 1 ] || die "$E_ARGS" "unexpected argument: ${args[1]}"
+
+    precheck_common
+    precheck_store
+
+    resolve_target "${args[0]}"
+    [ "$TARGET_KIND" != "path" ] \
+        || die "$E_ARGS" "repo validate takes a repo key or full repo name, not a path (use 'folder validate')"
+    repos_resolve
+
+    local out rc=0
+    out="$(rv_run "$REC_KEY" "$fix")" || rc=$?
+    render_output "$out"
+    exit "$rc"
+}
+
+cmd_folder_validate() {
+    local args=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_folder_validate; exit 0 ;;
+            --output-format)
+                [ $# -ge 2 ] || die "$E_ARGS" "--output-format requires a value"
+                output_format_set "$2"; shift 2 ;;
+            --output-format=*) output_format_set "${1#*=}"; shift ;;
+            --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    [ "${#args[@]}" -le 1 ] || die "$E_ARGS" "unexpected argument: ${args[1]}"
+
+    precheck_common
+    precheck_store
+
+    local loc out rc=0
+    loc="$(folder_resolve "${args[0]:-}")"
+    out="$(fv_run "$loc")" || rc=1
+    render_output "$out"
+    exit "$rc"
+}
+
+cmd_folder_adopt() {
+    local name_flag=""
+    local args=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_folder_adopt; exit 0 ;;
+            -n|--name)
+                [ $# -ge 2 ] || die "$E_ARGS" "--name requires a value"
+                name_flag="$2"; shift 2 ;;
+            --name=*) name_flag="${1#*=}"; shift ;;
+            --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    [ "${#args[@]}" -le 1 ] || die "$E_ARGS" "unexpected argument: ${args[1]}"
+
+    precheck_common
+    # adopt creates the store when it is the first thing the user runs
+    precheck_store_creatable
+
+    local loc
+    loc="$(folder_resolve "${args[0]:-}")"
+    [ -d "$loc" ] || die "$E_NOTFOUND" "folder does not exist: $loc"
+    folder_is_git "$loc" || die "$E_GITFOLDER" "not a git repo: $loc"
+
+    local branch url
+    branch="$(adopt_current_branch "$loc")" \
+        || die "$E_GITOUTPUT" "cannot determine the current branch of '$loc' (detached HEAD?)"
+    url="$(adopt_read_origin "$loc")" \
+        || die "$E_GITOUTPUT" "cannot read the 'origin' remote of '$loc'"
+    adopt_parse_origin "$url" \
+        || die "$E_GITOUTPUT" "unsupported origin URL: '$url'"
+
+    # Only the id is validated. org, name and branch are recorded as they are:
+    # adoption describes a repo that already exists, so rejecting, say, a
+    # two-character org or a branch containing '/' would refuse to track real
+    # repos over rules that exist to constrain what `repo add` *creates*.
+    local repo_id="${name_flag:-$ORIGIN_NAME}"
+    validate_part "$repo_id" 3 "id"
+
+    store_lock
+    repos_init
+
+    # Is this exact folder already tracked?
+    local tracked_id
+    tracked_id="$(repos_find_by_location "$loc")"
+    if [ -n "$tracked_id" ]; then
+        if [ "$tracked_id" = "$repo_id" ]; then
+            store_unlock
+            info "already tracked as '$repo_id': $loc"
+            exit 0
+        fi
+        store_unlock
+        die "$E_MISMATCH" "'$loc' is already tracked under a different id: '$tracked_id'"
+    fi
+
+    # Does a record with this id already exist? If it describes the same repo,
+    # this is just another checkout of it.
+    #
+    # Both of these run BEFORE key discovery: appending a location needs no
+    # keys, so requiring them here would fail adoptions for no reason.
+    if repos_check "$repo_id"; then
+        local e_origin e_org e_name e_branch
+        e_origin="$(repos_get_field "$repo_id" origin)"
+        e_org="$(repos_get_field "$repo_id" org)"
+        e_name="$(repos_get_field "$repo_id" name)"
+        e_branch="$(repos_get_field "$repo_id" branch)"
+        if [ "$e_origin" = "$url" ] && [ "$e_org" = "$ORIGIN_ORG" ] \
+           && [ "$e_name" = "$ORIGIN_NAME" ] && [ "$e_branch" = "$branch" ]; then
+            if ! repos_locations_add "$repo_id" "$loc"; then
+                store_unlock
+                die "$E_IO" "failed to write $REPOS_FILE"
+            fi
+            store_unlock
+            info "added location to '$repo_id': $loc"
+            exit 0
+        fi
+        store_unlock
+        die "$E_MISMATCH" "repo id '$repo_id' already describes a different repo"
+    fi
+
+    # New record. Private repos need their key pair located first.
+    local priv="" pub=""
+    if [ "$ORIGIN_VISIBILITY" = "private" ]; then
+        if ! priv="$(adopt_find_identity "$ORIGIN_HOST")"; then
+            store_unlock
+            die "$E_IO" "no IdentityFile for Host '$ORIGIN_HOST' in $SSH_CONFIG"
+        fi
+        pub="${priv}.pub"
+        if [ ! -f "$priv" ] || [ ! -f "$pub" ]; then
+            store_unlock
+            die "$E_IO" "deploy key pair not found: $priv and $pub"
+        fi
+    fi
+
+    # The shared foreign test: false only when repo add's own sentinel block is
+    # still present, which means git-utils created this repo's key material and
+    # merely lost the record.
+    local foreign="true"
+    if adopt_block_exists "$repo_id"; then
+        foreign="false"
+    fi
+
+    local now rec
+    now="$(now_iso8601)"
+    rec="$(jq -nc \
+        --arg name "$ORIGIN_NAME" --arg org "$ORIGIN_ORG" --arg branch "$branch" \
+        --arg vis "$ORIGIN_VISIBILITY" --argjson foreign "$foreign" --arg origin "$url" \
+        --arg priv "$priv" --arg pub "$pub" --arg loc "$loc" --arg now "$now" \
+        '{name:$name, org:$org, branch:$branch, visibility:$vis, foreign:$foreign, origin:$origin}
+         + (if $priv == "" then {} else {private_key:$priv, public_key:$pub} end)
+         + {locations: [{path:$loc}], images: [], date_created:$now, date_updated:$now}')"
+
+    if ! repos_insert "$repo_id" "$rec"; then
+        store_unlock
+        die "$E_IO" "failed to write $REPOS_FILE"
+    fi
+    store_unlock
+
+    images_update_record "$repo_id" "$loc"
+
+    info "adopted '$repo_id' ($ORIGIN_VISIBILITY, foreign=$foreign) at $loc"
+}
+
+cmd_repo_list() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_repo_list; exit 0 ;;
+            *) die "$E_ARGS" "unexpected argument: $1" ;;
+        esac
+    done
+    precheck_common
+    precheck_store
+    while IFS=$'\t' read -r key org name branch; do
+        [ -n "$key" ] || continue
+        printf '%s %s\n' "$key" "$(display_url "$org" "$name" "$branch")"
+    done < <(repos_list)
+}
+
+cmd_repo_keys() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_repo_keys; exit 0 ;;
+            *) die "$E_ARGS" "unexpected argument: $1" ;;
+        esac
+    done
+    precheck_common
+    precheck_store
+    while IFS=$'\t' read -r key priv org name branch; do
+        [ -n "$key" ] || continue
+        printf '%s %s\n' "$priv" "$(display_url "$org" "$name" "$branch")"
+    done < <(repos_keys)
+}
+
+# ---------------------------------------------------------------------------
+# 15. Help screens
+# ---------------------------------------------------------------------------
+
+help_main() {
+    cat << 'EOF'
+git-utils - manage tracked git/GitHub repos and their deploy keys
+
+Usage:
+  git-utils setup [-o <org>] [-b <branch>]
+
+  git-utils repo add <org/name[/branch]> [-n <key>]
+  git-utils repo clone <repo> [<folder_name>]
+  git-utils repo update [<repo_or_path>] [-a]
+  git-utils repo delete [<repo_or_path>] [-f]
+  git-utils repo list
+  git-utils repo keys
+  git-utils repo info [<repo_or_path>]
+  git-utils repo validate <repo> [--fix]
+
+  git-utils folder status [<path>]
+  git-utils folder validate [<path>]
+  git-utils folder adopt [<path>] [-n <id>]
+
+  git-utils validate [--fix]
+
+Repo commands accept a repo key, a full org/name/branch, or the path of a
+cloned folder. Folder commands always take a filesystem path.
+
+repo info, repo validate, folder status, folder validate and validate
+accept --output-format json|text|yaml (default text).
+
+Aliases:
+  git-utils repos ...   same as 'git-utils repo ...'
+  git-utils update ...  same as 'git-utils repo update ...'
+
+There is no 'folders' alias; the folder group is spelled out in full.
+
+Run 'git-utils <command> -h' for command-specific help.
+EOF
+}
+
+help_repo_info() {
+    cat << 'EOF'
+git-utils repo info [<repo_key_or_full_name_or_path>]
+                    [--output-format json|text|yaml]
+
+Prints one repo record, with its id as the first field. With no argument
+the current folder is used.
+
+The argument may be a repo key, a full repo name (org/name/branch), or a
+path to a cloned folder — the same three forms 'repo update' and
+'repo delete' accept. Exits 5 if nothing matches.
+EOF
+}
+
+help_validate() {
+    cat << 'EOF'
+git-utils validate [--fix] [--output-format json|text|yaml]
+
+Checks the whole store: that it parses, that it is in a layout this
+script understands, that its schema version is one it knows, and then
+every record in turn.
+
+With --fix it also repairs. An old-format store is converted to the
+current schema, and --fix carries down into each record, so locations
+that no longer exist are pruned and missing fields are backfilled.
+
+The conversion is the one operation that rewrites the whole file, so it
+is built and verified before anything irreversible happens, and the
+original is copied to a timestamped ~/.repositories.json.<UTC>.bak first.
+Backups are never overwritten. A conversion that fails verification
+leaves the store untouched and writes no backup at all.
+
+An unparseable store cannot be repaired and is only reported.
+
+Exits 0 when everything checks out, 1 otherwise.
+EOF
+}
+
+help_repo_validate() {
+    cat << 'EOF'
+git-utils repo validate <repo_key_or_full_name> [--fix]
+                        [--output-format json|text|yaml]
+
+Checks one repo record. Prints the record with a 'checks' object added:
+
+  fields     every field the schema requires is present
+  keys       the deploy key pair exists on disk    (private repos)
+  ssh        ~/.ssh/config holds its sentinel block (private, non-foreign)
+  locations  folder validate run against each recorded location
+  health     the overall verdict
+
+Checks that do not apply read 'Skipped'. A healthy record with no
+locations reports health 'Warning' and still exits 0.
+
+With --fix it also repairs, in this order: locations pointing at folders
+that no longer exist are pruned, then missing fields are backfilled from
+whatever survives, then images are re-read. Fields with nothing to infer
+them from (name, org, branch) are left alone and still report Failed.
+Without --fix nothing is written.
+
+Takes a repo key or a full repo name; for a path use 'folder validate'.
+Exits 0 when healthy, 1 when any check failed.
+EOF
+}
+
+help_folder_validate() {
+    cat << 'EOF'
+git-utils folder validate [<path>] [--output-format json|text|yaml]
+
+Checks one cloned folder against the store. With no argument the current
+folder is used. There is no --fix; nothing is repaired or written.
+
+  location  the folder exists
+  tracking  the folder is in some record's locations
+  origin    the folder's origin remote and current branch match the record
+
+A check reads 'Skipped' when an earlier one already explains the problem,
+so a single fault is not reported twice.
+
+Exits 0 when every check passes, 1 otherwise. The per-check codes appear
+in the output, not in the exit code.
+EOF
+}
+
+help_folder_adopt() {
+    cat << 'EOF'
+git-utils folder adopt [<path>] [-n|--name <id>]
+
+Registers an existing local git repo. With no argument the current folder
+is used. The repo id defaults to the repo name parsed from the origin;
+override it with --name.
+
+The origin must be one of:
+
+  git@<host>:<org>/<name>.git       a private repo, keys looked up in
+                                    ~/.ssh/config by the Host alias
+  https://<host>/<org>/<name>       a public repo, no keys
+
+Adopt only reads. It never rewrites the repo's remote, its keys, or
+~/.ssh/config, and records the repo as 'foreign' unless git-utils' own
+sentinel block is still present for that id -- so 'repo delete' will not
+remove key material git-utils did not create.
+
+Adopting a folder that is already tracked does nothing. Adopting a second
+checkout of an already-tracked repo appends a location.
+
+Exits: 5 no such folder, 6 not a git repo, 8 conflicts with an existing
+record, 10 unusable origin or detached HEAD, 3 deploy keys not found.
+EOF
+}
+
+help_folder_status() {
+    cat << 'EOF'
+git-utils folder status [<path>] [--output-format json|text|yaml]
+
+Reports whether a folder is a tracked git repo. With no argument the
+current folder is used. The argument is always a filesystem path, never
+a repo key.
+
+Checks run in order and stop at the first failure:
+
+  code 5  Not Found        the folder does not exist
+  code 6  Not Git Folder   the folder is not a git repo
+  code 5  Not Tracked      the git repo is not in the store
+
+Exits 0 when the folder is a tracked git repo, 1 otherwise. The status
+code above appears in the output, not in the exit code.
+EOF
+}
+
+help_setup() {
+    cat << 'EOF'
+git-utils setup [-o|--default-org <org>] [-b|--default-branch <branch>]
+
+Installs git-utils as a symlink in /usr/local/sbin (or /usr/sbin) and
+configures GH_DEFAULT_ORG / GH_DEFAULT_BRANCH in ~/.bashrc.
+
+Already-open shells must run 'source ~/.bashrc' to see the changes.
+EOF
+}
+
+help_repo_add() {
+    cat << 'EOF'
+git-utils repo add <org/name/branch | org/name | name> [-n|--name <key>]
+
+Registers a repo and generates a GitHub deploy key for it.
+If <org> is omitted, GH_DEFAULT_ORG must be set.
+If <branch> is omitted, GH_DEFAULT_BRANCH (or 'main') is used.
+The registered key defaults to the repo name; override with --name.
+EOF
+}
+
+help_repo_delete() {
+    cat << 'EOF'
+git-utils repo delete [<repo_key_or_full_name_or_path>] [-f|--force]
+
+Removes a tracked repo, its deploy key, and (if a path/current folder
+was given) the cloned folder itself. With no argument, the current
+folder is used.
+
+Key material is only removed when git-utils created it. An adopted
+(foreign) repo keeps its key pair and its ~/.ssh/config block, and a
+public repo has none -- in both cases only the record and the folder go.
+EOF
+}
+
+help_repo_clone() {
+    cat << 'EOF'
+git-utils repo clone <repo_key_or_full_name> [<folder_name>]
+
+Clones a tracked repo from the origin recorded for it, which for a repo
+added by git-utils goes through its deploy key. Defaults the destination
+folder to the repo name.
+EOF
+}
+
+help_repo_update() {
+    cat << 'EOF'
+git-utils repo update [<repo_key_or_full_name_or_path>] [-a|--all]
+
+Fetches and hard-resets a tracked repo to its remote branch. With no
+argument, the current folder is used. With a path and without --all,
+only that location is updated; --all updates every tracked location.
+EOF
+}
+
+help_repo_list() {
+    cat << 'EOF'
+git-utils repo list
+
+Lists each registered repo key with its display URL.
+EOF
+}
+
+help_repo_keys() {
+    cat << 'EOF'
+git-utils repo keys
+
+Lists each registered repo's deploy key file path with its display URL.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# 16. Argument router
+# ---------------------------------------------------------------------------
+
+main() {
+    local cmd="${1:-}"
+    case "$cmd" in
+        "")
+            help_main
+            exit "$E_ARGS"
+            ;;
+        -h|--help)
+            help_main
+            exit 0
+            ;;
+        setup)
+            shift
+            cmd_setup "$@"
+            ;;
+        repo|repos)
+            shift
+            local sub="${1:-}"
+            case "$sub" in
+                "")
+                    help_main
+                    exit "$E_ARGS"
+                    ;;
+                -h|--help)
+                    help_main
+                    exit 0
+                    ;;
+                add) shift; cmd_repo_add "$@" ;;
+                delete) shift; cmd_repo_delete "$@" ;;
+                clone) shift; cmd_repo_clone "$@" ;;
+                update) shift; cmd_repo_update "$@" ;;
+                list) shift; cmd_repo_list "$@" ;;
+                keys) shift; cmd_repo_keys "$@" ;;
+                info) shift; cmd_repo_info "$@" ;;
+                validate) shift; cmd_repo_validate "$@" ;;
+                *)
+                    help_main
+                    exit "$E_ARGS"
+                    ;;
+            esac
+            ;;
+        folder)
+            # deliberately no 'folders' alias -- the folder group is spelled out
+            shift
+            local fsub="${1:-}"
+            case "$fsub" in
+                "")
+                    help_main
+                    exit "$E_ARGS"
+                    ;;
+                -h|--help)
+                    help_main
+                    exit 0
+                    ;;
+                status) shift; cmd_folder_status "$@" ;;
+                adopt) shift; cmd_folder_adopt "$@" ;;
+                validate) shift; cmd_folder_validate "$@" ;;
+                *)
+                    help_main
+                    exit "$E_ARGS"
+                    ;;
+            esac
+            ;;
+        validate)
+            shift
+            cmd_validate "$@"
+            ;;
+        update)
+            shift
+            cmd_repo_update "$@"
+            ;;
+        *)
+            help_main
+            exit "$E_ARGS"
+            ;;
+    esac
+}
+
+main "$@"
