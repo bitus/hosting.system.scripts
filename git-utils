@@ -680,14 +680,6 @@ repos_locations_add() {
     printf '%s' "$tmp" | atomic_write "$REPOS_FILE" 600
 }
 
-repos_locations_remove() {
-    local key="$1" path="$2" tmp
-    tmp="$(jq --arg k "$key" --arg p "$path" \
-        '.repositories[$k].locations = ((.repositories[$k].locations // []) | map(select(.path != $p)))' \
-        "$REPOS_FILE")" || return 1
-    printf '%s' "$tmp" | atomic_write "$REPOS_FILE" 600
-}
-
 # repos_get_images <key>
 # Prints the stored `images` value: the compact JSON array if the field is
 # present, or the literal string "null" if absent. The null/array
@@ -2151,18 +2143,27 @@ git-utils - manage tracked git/GitHub repos and their deploy keys
 
 Usage:
   git-utils setup [-o <org>] [-b <branch>]
+
   git-utils repo add <org/name[/branch]> [-n <key>]
-  git-utils repo delete [<repo_or_path>] [-f]
   git-utils repo clone <repo> [<folder_name>]
   git-utils repo update [<repo_or_path>] [-a]
+  git-utils repo delete [<repo_or_path>] [-f]
   git-utils repo list
   git-utils repo keys
   git-utils repo info [<repo_or_path>]
-  git-utils repo validate <repo>
+  git-utils repo validate <repo> [--fix]
+
   git-utils folder status [<path>]
-  git-utils folder adopt [<path>] [-n <id>]
   git-utils folder validate [<path>]
+  git-utils folder adopt [<path>] [-n <id>]
+
   git-utils validate [--fix]
+
+Repo commands accept a repo key, a full org/name/branch, or the path of a
+cloned folder. Folder commands always take a filesystem path.
+
+repo info, repo validate, folder status, folder validate and validate
+accept --output-format json|text|yaml (default text).
 
 Aliases:
   git-utils repos ...   same as 'git-utils repo ...'
@@ -2333,6 +2334,10 @@ git-utils repo delete [<repo_key_or_full_name_or_path>] [-f|--force]
 Removes a tracked repo, its deploy key, and (if a path/current folder
 was given) the cloned folder itself. With no argument, the current
 folder is used.
+
+Key material is only removed when git-utils created it. An adopted
+(foreign) repo keeps its key pair and its ~/.ssh/config block, and a
+public repo has none -- in both cases only the record and the folder go.
 EOF
 }
 
@@ -2340,7 +2345,8 @@ help_repo_clone() {
     cat << 'EOF'
 git-utils repo clone <repo_key_or_full_name> [<folder_name>]
 
-Clones a tracked repo using its deploy key. Defaults the destination
+Clones a tracked repo from the origin recorded for it, which for a repo
+added by git-utils goes through its deploy key. Defaults the destination
 folder to the repo name.
 EOF
 }
