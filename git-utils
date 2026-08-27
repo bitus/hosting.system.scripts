@@ -1490,10 +1490,26 @@ cmd_setup() {
     self="$(realpath "${BASH_SOURCE[0]}")"
 
     if [ -e "$sbin/git-utils" ] || [ -L "$sbin/git-utils" ]; then
-        warn "$sbin/git-utils already exists, skipping symlink"
+        local existing
+        existing="$(realpath -m "$sbin/git-utils" 2>/dev/null || printf '')"
+        if [ "$existing" = "$self" ]; then
+            warn "$sbin/git-utils already points here, leaving it"
+        else
+            warn "$sbin/git-utils already exists and points at '${existing:-?}', not '$self'; leaving it"
+        fi
     else
         $SUDO ln -s "$self" "$sbin/git-utils"
-        $SUDO chmod +x "$self"
+    fi
+
+    # Outside the branch above, deliberately. `git reset --hard` restores this
+    # script with whatever mode git recorded for it, so an update of the repo
+    # can strip the executable bit and every later run fails with "Permission
+    # denied". Re-running setup has to be able to repair that on its own --
+    # otherwise the only cure is deleting the symlink first, which is not
+    # something a user would guess.
+    if [ ! -x "$self" ]; then
+        $SUDO chmod +x "$self" || die "$E_IO" "cannot make $self executable"
+        info "restored the executable bit on $self"
     fi
 
     local existing_org="" existing_branch=""
