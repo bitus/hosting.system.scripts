@@ -1035,8 +1035,10 @@ dev_partitions() {
 
 # dev_state <device> -- echoes blank | single | unsafe
 #
-# This classification is the guard between a --force typo and somebody's data,
-# so it errs towards "unsafe" whenever the disk is not obviously ours to take.
+# `init` acts on `blank` and refuses everything else, so only that boundary is
+# load-bearing; the split between `single` and `unsafe` is kept because it is
+# what `hdd_describe` and the refusal message are describing. Errs towards
+# "unsafe" whenever the disk is not obviously ours to take.
 dev_state() {
     local dev="$1" parts n=0
     parts="$(dev_partitions "$dev")"
@@ -1122,6 +1124,23 @@ part_is_partition() {
 partition_managed() {
     [ -f "$FSTAB_FILE" ] || return 1
     grep -qF "$(block_marker_open "$1")" "$FSTAB_FILE"
+}
+
+# all_partitions_managed <device> -- true when EVERY partition on <device> has
+# a block of ours in fstab.
+#
+# An empty partition list is deliberately FALSE. "All zero partitions are
+# managed" is vacuously true and completely wrong here: it would wave through
+# a disk carrying a raw filesystem or RAID signature with no partition table,
+# which is precisely the shape this gate exists to refuse.
+all_partitions_managed() {
+    local dev="$1" p found=0
+    while read -r p; do
+        [ -n "$p" ] || continue
+        found=1
+        partition_managed "/dev/$p" || return 1
+    done <<< "$(dev_partitions "$dev")"
+    [ "$found" = "1" ]
 }
 
 # partition_in_fstab <part> -- true when <part> appears in fstab AT ALL.
@@ -1257,32 +1276,45 @@ hdd_fstab_rollback() {
     return 0
 }
 
+# hdd_fstab_write <part> <uuid>
+#
+# The block is keyed on the PARTITION, not the disk. A disk can hold several
+# partitions that this tool manages independently - `add` and `remove` both
+# depend on being able to name one of them - and a disk-keyed block cannot
+# express that.
 hdd_fstab_write() {
-    local uuid="$1" content tmp
+    local part="$1" uuid="$2" content tmp
 
     backup_once "$FSTAB_FILE"
     hdd_fstab_snapshot
 
-    # Our own block first, so the legacy-line sweep below cannot eat it.
+    # Our own blocks first, so the legacy-line sweep below cannot eat them.
+    # Both keys: releases before 2026-08-30 keyed the block on the whole
+    # device, and re-keying it is the migration.
+    block_delete "$FSTAB_FILE" "$part"
     block_delete "$FSTAB_FILE" "$HDD_DEVICE"
 
-    # Reconcile: drop any line that refers to this device by PATH, or that
-    # claims our mount point. Device names are not stable across reboots -
-    # that instability is exactly why the replacement keys on UUID.
+    # Reconcile: drop any line that names this partition, or that claims our
+    # mount point. Device names are not stable across reboots - that
+    # instability is exactly why the replacement keys on UUID.
+    #
+    # An exact match on $1, not a prefix: the old prefix test was written for
+    # a disk-keyed block and would match /dev/sdb1 while sweeping /dev/sdb,
+    # which now means eating a sibling partition's entry.
     tmp="$(mktemp "${FSTAB_FILE}.XXXXXX")"
     CLEANUP_TMPFILES+=("$tmp")
-    awk -v dev="$HDD_DEVICE" -v mnt="$HDD_MOUNT" '
+    awk -v part="$part" -v mnt="$HDD_MOUNT" '
         /^[[:space:]]*#/  { print; next }
         /^[[:space:]]*$/  { print; next }
-        (index($1, dev) == 1) || ($2 == mnt) { next }
+        ($1 == part) || ($2 == mnt) { next }
         { print }
     ' "$FSTAB_FILE" > "$tmp"
     cat "$tmp" > "$FSTAB_FILE"
 
-    content="$(block_marker_open "$HDD_DEVICE")
+    content="$(block_marker_open "$part")
 UUID=$uuid  $HDD_MOUNT  ${FSTAB_TYPE[$HDD_TYPE]}  ${FSTAB_OPTS[$HDD_TYPE]}  0  ${FSTAB_PASS[$HDD_TYPE]}
-$(block_marker_close "$HDD_DEVICE")"
-    block_upsert "$FSTAB_FILE" "$HDD_DEVICE" "$content"
+$(block_marker_close "$part")"
+    block_upsert "$FSTAB_FILE" "$part" "$content"
     return 0
 }
 
@@ -1302,15 +1334,37 @@ hdd_fstab_verify() {
     return 0
 }
 
-hdd_already_configured() {
-    local part="$1" fstype mnt uuid
-    [ "$(dev_state "$HDD_DEVICE")" = "single" ] || return 1
-    fstype="$(part_fstype "$part")"
-    [ "$fstype" = "${FSTAB_TYPE[$HDD_TYPE]}" ] || [ "$fstype" = "$HDD_TYPE" ] || return 1
-    [ "$(mount_point_of "$part")" = "$HDD_MOUNT" ] || return 1
-    uuid="$(part_uuid "$part")"
-    [ -n "$uuid" ] || return 1
-    grep -qF "UUID=$uuid  $HDD_MOUNT  " "$FSTAB_FILE" 2>/dev/null || return 1
+# hdd_migrate_device_block <device> -- re-key a pre-2026-08-30 block.
+#
+# A host provisioned by an earlier release carries a block keyed on the whole
+# disk. To `all_partitions_managed` that is indistinguishable from a disk
+# somebody else partitioned, so `init` would refuse a disk it created itself.
+#
+# The fix is a re-keying, NOT a reconfiguration: the block body is carried
+# across verbatim, so an operator who passes a different --mount does not
+# silently move an existing filesystem. Changing where a managed partition
+# mounts is `hdd remove` followed by `hdd init`.
+#
+# Narrow on purpose - only a single-partition disk, the one shape the old
+# code could produce. Returns non-zero and changes nothing otherwise.
+hdd_migrate_device_block() {
+    local dev="$1" part body
+    partition_managed "$dev" || return 1
+    [ "$(dev_state "$dev")" = "single" ] || return 1
+    part="$(part_name "$dev" 1)"
+
+    # block_extract returns the markers too; the body is what lies between.
+    body="$(block_extract "$FSTAB_FILE" "$dev" | sed '1d;$d')"
+    [ -n "$body" ] || return 1
+
+    info "migrating the fstab block for $dev onto its partition, $part"
+    backup_once "$FSTAB_FILE"
+    hdd_fstab_snapshot
+    block_delete "$FSTAB_FILE" "$dev"
+    block_upsert "$FSTAB_FILE" "$part" "$(block_marker_open "$part")
+$body
+$(block_marker_close "$part")"
+    hdd_fstab_verify
     return 0
 }
 
@@ -1420,7 +1474,6 @@ cmd_hdd_init() {
                 [ $# -ge 2 ] || die "$E_ARGS" "--type requires a value"
                 opt_type="$2"; shift 2 ;;
             --type=*) opt_type="${1#*=}"; shift ;;
-            -f|--force) FORCE=1; shift ;;
             --) shift; [ $# -eq 0 ] || die "$E_ARGS" "unexpected argument: $1" ;;
             -*) die "$E_ARGS" "unknown flag: $1" ;;
             *) die "$E_ARGS" "unexpected argument: $1" ;;
@@ -1443,7 +1496,7 @@ cmd_hdd_init() {
     HDD_DEVICE="$opt_device"
     HDD_MOUNT="$opt_mount"
     HDD_TYPE="$opt_type"
-    debug "resolved: device=$HDD_DEVICE mount=$HDD_MOUNT type=$HDD_TYPE force=$FORCE"
+    debug "resolved: device=$HDD_DEVICE mount=$HDD_MOUNT type=$HDD_TYPE"
 
     require_cmds sfdisk blkid "${MKFS_CMD[$HDD_TYPE]}"
     require_sudo
@@ -1451,57 +1504,33 @@ cmd_hdd_init() {
 
     dev_exists "$HDD_DEVICE" || die "$E_NOTFOUND" "block device '$HDD_DEVICE' not found"
 
-    local part state fstype mnt uuid
+    local part state mnt uuid
     part="$(part_name "$HDD_DEVICE" 1)"
-    if hdd_already_configured "$part"; then
-        info "hdd already configured: $part ($HDD_TYPE) mounted at $HDD_MOUNT"
-        exit "$E_OK"
-    fi
 
     state="$(dev_state "$HDD_DEVICE")"
     debug "device state: $state"
 
+    # `init` provisions a RAW disk and nothing else. Every other shape is
+    # either already ours - in which case there is nothing to do - or somebody
+    # else's, in which case the answer is no. There is no override: reusing an
+    # occupied disk is now an explicit `hdd remove` first.
     case "$state" in
-        unsafe)
-            info "$HDD_DEVICE is not in a state this command will modify on its own:"
-            hdd_describe "$HDD_DEVICE"
-            if [ "$FORCE" != "1" ]; then
-                die "$E_EXISTS" "refusing to touch $HDD_DEVICE (re-run with --force to override)"
-            fi
-            local p
-            for p in $(dev_partitions "$HDD_DEVICE"); do
-                mnt="$(mount_point_of "/dev/$p")"
-                [ -z "$mnt" ] || umount "/dev/$p" || die "$E_IO" "failed to unmount /dev/$p"
-            done
-            hdd_partition
-            hdd_format "$part"
-            ;;
         blank)
             hdd_partition
             hdd_format "$part"
             ;;
-        single)
-            fstype="$(part_fstype "$part")"
-            mnt="$(mount_point_of "$part")"
-            debug "partition $part: fstype='${fstype:-none}' mount='${mnt:-none}'"
-
-            if [ "$fstype" = "${FSTAB_TYPE[$HDD_TYPE]}" ] || [ "$fstype" = "$HDD_TYPE" ]; then
-                # Right filesystem. Only the mount point can be wrong.
-                if [ -n "$mnt" ] && [ "$mnt" != "$HDD_MOUNT" ]; then
-                    if [ "$FORCE" != "1" ]; then
-                        die "$E_EXISTS" "$part is mounted at $mnt, not $HDD_MOUNT (re-run with --force to move it)"
-                    fi
-                    umount "$part" || die "$E_IO" "failed to unmount $part"
-                fi
-            else
-                if [ "$FORCE" != "1" ]; then
-                    die "$E_EXISTS" "$part is formatted as '${fstype:-unformatted}', not '$HDD_TYPE' (re-run with --force to reformat)"
-                fi
-                if [ -n "$mnt" ]; then
-                    umount "$part" || die "$E_IO" "failed to unmount $part"
-                fi
-                hdd_format "$part"
+        *)
+            if all_partitions_managed "$HDD_DEVICE"; then
+                info "hdd already configured: every partition on $HDD_DEVICE is managed by system-setup"
+                exit "$E_OK"
             fi
+            if hdd_migrate_device_block "$HDD_DEVICE"; then
+                info "hdd already configured: $HDD_DEVICE was provisioned by an earlier release"
+                exit "$E_OK"
+            fi
+            info "$HDD_DEVICE carries partitions or data this command did not create:"
+            hdd_describe "$HDD_DEVICE"
+            die "$E_EXISTS" "refusing to touch $HDD_DEVICE; use 'hdd add' to adopt an existing partition, or 'hdd remove' to release one"
             ;;
     esac
 
@@ -1512,7 +1541,7 @@ cmd_hdd_init() {
         mkdir -p "$HDD_MOUNT" || die "$E_IO" "failed to create $HDD_MOUNT"
     fi
 
-    hdd_fstab_write "$uuid"
+    hdd_fstab_write "$part" "$uuid"
     hdd_fstab_verify
 
     mnt="$(mount_point_of "$part")"
@@ -2383,9 +2412,6 @@ file_args_hdd() {
     [ -z "$dev" ] || FILE_ARGS+=(--device "$dev")
     [ -z "$mnt" ] || FILE_ARGS+=(--mount "$mnt")
     [ -z "$typ" ] || FILE_ARGS+=(--type "$typ")
-    # Passed explicitly rather than relying on the global, so the --dry-run
-    # plan line shows exactly what a real run would do.
-    if [ "$FORCE" = "1" ]; then FILE_ARGS+=(--force); fi
 }
 
 file_args_docker() {

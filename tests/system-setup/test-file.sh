@@ -293,70 +293,82 @@ if [ "$LEFT" = 0 ]; then ok; else bad "E-cleanup: $LEFT temp file(s) left behind
 
 
 echo
-echo "=== F: --force for system-setup file ==="
+echo "=== F: the hdd node in a document ==="
 
-# A loop device already formatted xfs; the document asks for ext4. Without
-# --force that must be refused; with it, reformatted.
+# `hdd init` provisions a RAW disk and refuses everything else, with no
+# override of any kind - which is the whole point of these cases. Until
+# 2026-08-30 this block tested `file --force` reformatting an occupied disk;
+# that capability is deliberately gone, so what is left to prove is that a
+# document cannot destroy data and does not need a tty to succeed.
 FIMG=/tmp/ss-f.img
 FMNT=/tmp/ss-fmnt
-sudo umount "$FMNT" 2>/dev/null || true
-sudo rm -f "$FIMG"; sudo mkdir -p "$FMNT"
-truncate -s 512M "$FIMG"
-FLOOP="$(sudo losetup -f --show -P "$FIMG")"
+FLOOP=""
+sudo mkdir -p "$FMNT"
+
+fresh_floop() {
+    sudo umount "$FMNT" 2>/dev/null || true
+    [ -z "$FLOOP" ] || sudo losetup -d "$FLOOP" 2>/dev/null || true
+    sudo rm -f "$FIMG"
+    truncate -s 512M "$FIMG"
+    FLOOP="$(sudo losetup -f --show -P "$FIMG")"
+    sudo sed -i '/# >>> system-setup \/dev\/loop/,/# <<< system-setup \/dev\/loop/d' /etc/fstab
+    sudo sed -i "\#$FMNT#d" /etc/fstab
+}
+
+fdoc() { j "$1" "{\"hdd\":{\"device\":\"$FLOOP\",\"mount\":\"$FMNT\",\"type\":\"ext4\"}}"; }
+
+echo "--- F1: an occupied disk is refused and left alone ---"
+fresh_floop
 printf 'label: gpt
 start=2048, type=linux
 ' | sudo sfdisk "$FLOOP" >/dev/null 2>&1
 sudo udevadm settle
 sudo mkfs.xfs -f "${FLOOP}p1" >/dev/null 2>&1
-sudo sed -i "\#$FMNT#d" /etc/fstab
-
-fdoc() { j "$1" "{\"hdd\":{\"device\":\"$FLOOP\",\"mount\":\"$FMNT\",\"type\":\"ext4\"}}"; }
-
-echo "--- F1: without --force the node is refused ---"
 run F1 4 "hdd      failed \(4\)" file "$(fdoc f1)"
-if [ "$(sudo blkid -s TYPE -o value "${FLOOP}p1")" = xfs ]; then ok; else bad "F1b: disk was modified without --force"; fi
+if [ "$(sudo blkid -s TYPE -o value "${FLOOP}p1")" = xfs ]; then ok; else bad "F1b: disk was modified"; fi
 
-echo "--- F5: --dry-run --force shows the flag and changes nothing ---"
-run F5 0 "would run: system-setup hdd .*--force" file --dry-run --force "$(fdoc f5)"
+echo "--- F5: --dry-run names the command it would actually run ---"
+# `hdd init`, not `hdd` - the node's name and its command differ, and a plan
+# line that prints a command which no longer parses is worse than none.
+run F5 0 "would run: system-setup hdd init .*--device" file --dry-run "$(fdoc f5)"
 if [ "$(sudo blkid -s TYPE -o value "${FLOOP}p1")" = xfs ]; then ok; else bad "F5b: dry run modified the disk"; fi
 
-echo "--- F2/F3/F4: --force permits it, long and short, as a non-root user ---"
-run F2 0 "hdd      ok" file --force "$(fdoc f2)"
-if [ "$(sudo blkid -s TYPE -o value "${FLOOP}p1")" = ext4 ]; then ok; else bad "F2b: not reformatted"; fi
-# F4: the flag has to survive the sudo re-exec. As root there is no re-exec,
-# so this only proves anything when the suite runs unprivileged.
-if [ "$EUID" -ne 0 ]; then ok; else bad "F4: suite is running as root, --force re-exec not exercised"; fi
-sudo mkfs.xfs -f "${FLOOP}p1" >/dev/null 2>&1
-sudo umount "$FMNT" 2>/dev/null || true
-sudo sed -i "\#$FMNT#d" /etc/fstab
-run F3 0 "hdd      ok" file -f "$(fdoc f3)"
-if [ "$(sudo blkid -s TYPE -o value "${FLOOP}p1")" = ext4 ]; then ok; else bad "F3b: short -f did not force"; fi
+echo "--- F2: a blank disk is provisioned from a document ---"
+fresh_floop
+run F2 0 "hdd      ok" file "$(fdoc f2)"
+if [ "$(sudo blkid -s TYPE -o value "${FLOOP}p1")" = ext4 ]; then ok; else bad "F2b: not provisioned"; fi
+if findmnt -n "$FMNT" >/dev/null; then ok; else bad "F2c: not mounted at $FMNT"; fi
+if sudo grep -qF "# >>> system-setup ${FLOOP}p1 >>>" /etc/fstab; then ok; else bad "F2d: fstab block not keyed on the partition"; fi
 
-echo "--- F6: --force through stdin ---"
-sudo mkfs.xfs -f "${FLOOP}p1" >/dev/null 2>&1
-sudo umount "$FMNT" 2>/dev/null || true
-sudo sed -i "\#$FMNT#d" /etc/fstab
+echo "--- F3: a re-run through the document is idempotent ---"
+run F3 0 "hdd      ok" file "$(fdoc f3)"
+
+echo "--- F4: the run survives the sudo re-exec as a non-root user ---"
+if [ "$EUID" -ne 0 ]; then ok; else bad "F4: suite is running as root, the re-exec is not exercised"; fi
+
+echo "--- F6: the same document through stdin ---"
+fresh_floop
 OUT="$(printf 'hdd:
   device: %s
   mount: %s
   type: ext4
-' "$FLOOP" "$FMNT" | bash "$SCRIPT" --force 2>&1)"; RC=$?
+' "$FLOOP" "$FMNT" | bash "$SCRIPT" 2>&1)"; RC=$?
 if [ "$RC" = 0 ] && grep -q 'hdd      ok' <<< "$OUT"; then ok; else bad "F6: rc=$RC :: $(tail -3 <<< "$OUT")"; fi
-if [ "$(sudo blkid -s TYPE -o value "${FLOOP}p1")" = ext4 ]; then ok; else bad "F6b: stdin --force did not take effect"; fi
+if [ "$(sudo blkid -s TYPE -o value "${FLOOP}p1")" = ext4 ]; then ok; else bad "F6b: stdin document did not take effect"; fi
 
 echo "--- F7: no confirmation prompts remain anywhere ---"
 if grep -q 'confirm "' "$SCRIPT"; then bad "F7: a confirm call site still exists"; else ok; fi
 if grep -q '^confirm() {' "$SCRIPT"; then ok; else bad "F7b: confirm() helper was removed; it should stay"; fi
-# The real property: a forcing run completes with NO tty on stdin.
-sudo mkfs.xfs -f "${FLOOP}p1" >/dev/null 2>&1
-sudo umount "$FMNT" 2>/dev/null || true
-sudo sed -i "\#$FMNT#d" /etc/fstab
-OUT="$(bash "$SCRIPT" file --force "$(fdoc f7)" < /dev/null 2>&1)"; RC=$?
-if [ "$RC" = 0 ]; then ok; else bad "F7c: forcing run needed a tty :: $(tail -3 <<< "$OUT")"; fi
+# The real property: an unattended run completes with NO tty on stdin.
+fresh_floop
+OUT="$(bash "$SCRIPT" file "$(fdoc f7)" < /dev/null 2>&1)"; RC=$?
+if [ "$RC" = 0 ]; then ok; else bad "F7c: unattended run needed a tty :: $(tail -3 <<< "$OUT")"; fi
 
 # teardown
 sudo umount "$FMNT" 2>/dev/null || true
-sudo losetup -d "$FLOOP" 2>/dev/null || true
+[ -z "$FLOOP" ] || sudo losetup -d "$FLOOP" 2>/dev/null || true
+sudo sed -i '/# >>> system-setup \/dev\/loop/,/# <<< system-setup \/dev\/loop/d' /etc/fstab
+sudo sed -i "\#$FMNT#d" /etc/fstab
 sudo rm -f "$FIMG"; sudo rmdir "$FMNT" 2>/dev/null || true
 sudo sed -i "\#$FMNT#d" /etc/fstab
 sudo sed -i '/# >>> system-setup \/dev\/loop/,/# <<< system-setup \/dev\/loop/d' /etc/fstab
