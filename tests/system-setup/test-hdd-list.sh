@@ -157,7 +157,7 @@ echo "=== the subcommands are reachable through the router ==="
 # on the placeholder. A stub is load-bearing only until it is replaced.
 run S1 2 "--partition is required" hdd add
 run S2 1 "not implemented" hdd expand
-run S3 1 "not implemented" hdd remove
+run S3 2 "one of --partition or --mount is required" hdd remove
 
 echo
 echo "passed: $PASS   failed: $FAIL"

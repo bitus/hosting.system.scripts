@@ -361,9 +361,12 @@ OUT="$(printf 'hdd:
 if [ "$RC" = 0 ] && grep -q 'hdd      ok' <<< "$OUT"; then ok; else bad "F6: rc=$RC :: $(tail -3 <<< "$OUT")"; fi
 if [ "$(sudo blkid -s TYPE -o value "${FLOOP}p1")" = ext4 ]; then ok; else bad "F6b: stdin document did not take effect"; fi
 
-echo "--- F7: no confirmation prompts remain anywhere ---"
-if grep -q 'confirm "' "$SCRIPT"; then bad "F7: a confirm call site still exists"; else ok; fi
-if grep -q '^confirm() {' "$SCRIPT"; then ok; else bad "F7b: confirm() helper was removed; it should stay"; fi
+echo "--- F7: a document can never reach a confirmation prompt ---"
+if grep -q '^confirm() {' "$SCRIPT"; then ok; else bad "F7: confirm() helper was removed; it should stay"; fi
+# Prompts exist again, on `hdd remove` and `hdd expand`. Neither is reachable
+# from a document: the only hdd node a document has is `hdd init`, which has
+# no prompt. That is the property worth pinning, not "no prompts anywhere".
+if grep -q 'cmd=cmd_hdd_init' "$SCRIPT"; then ok; else bad "F7b: the file hdd node no longer routes to init"; fi
 # The real property: an unattended run completes with NO tty on stdin.
 fresh_floop
 OUT="$(bash "$SCRIPT" file "$(fdoc f7)" < /dev/null 2>&1)"; RC=$?

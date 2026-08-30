@@ -152,17 +152,15 @@ join_sp() {
     printf '%s' "$*"
 }
 
-# Currently UNREACHABLE, and kept deliberately.
+# Reachable from exactly two places: `hdd remove` and `hdd expand`. Both are
+# destructive in a way no other command is, and neither can be reached from a
+# JSON/YAML document - so a config file still cannot make this script prompt,
+# and `system-setup file` remains safe to drive from CI, Ansible or cron.
 #
-# Every former call site sat behind `if [ "$FORCE" != "1" ]; then die; fi`,
-# and this function returns 0 on its first line when FORCE=1 - so no prompt
-# could execute in either branch. Those calls were removed rather than left to
-# imply an interaction that never happened.
-#
-# The function stays because it is part of the helper set shared with
-# git-utils, and because the escape hatch it implements is what any future
-# prompt would need. Note the consequence while there are none: the script is
-# now entirely non-interactive, and safe to drive from CI, Ansible or cron.
+# The no-TTY branch is the load-bearing one. An unattended caller gets a clear
+# refusal naming --force rather than a read that blocks forever, which is what
+# the 2026-08-26 work was actually about; the prompts removed then were removed
+# because they were unreachable, not because prompting is wrong.
 confirm() {
     local prompt="$1" reply
     if [ "$FORCE" = "1" ]; then
@@ -1153,6 +1151,14 @@ hdd_type_of_fstype() {
     return 1
 }
 
+# hdd_block_find <field> <value> -- the managed block's entry whose field
+# <field> equals <value>; empty when there is none. Field 1 is `UUID=...`,
+# field 2 the mount point, which are the two ways `remove` can be asked.
+hdd_block_find() {
+    local f="$1" v="$2"
+    hdd_block_body | awk -v f="$f" -v v="$v" '$f == v { print; exit }'
+}
+
 # mount_in_fstab <mount> -- true when any fstab line already claims this mount
 # point, ours or anyone's.
 mount_in_fstab() {
@@ -1567,7 +1573,136 @@ cmd_hdd() {
 }
 
 cmd_hdd_expand() { not_implemented "hdd expand" "F"; }
-cmd_hdd_remove() { not_implemented "hdd remove" "E"; }
+
+# Set by hdd_remove_checks, read by hdd_remove_apply. Globals rather than a
+# return value because a function called through $( ) runs in a subshell and
+# cannot set anything the caller goes on to read.
+HDD_RM_LINE=""
+HDD_RM_MOUNT=""
+
+# hdd_remove_checks <partition> <mount> -- exactly one of the two is non-empty.
+# Resolves the fstab entry and refuses if there is not exactly one of ours.
+hdd_remove_checks() {
+    local part="$1" mount="$2" uuid
+
+    HDD_RM_LINE=""
+    HDD_RM_MOUNT=""
+
+    if [ -n "$part" ]; then
+        dev_exists "$part" || die "$E_NOTFOUND" "block device '$part' not found"
+        part_is_partition "$part" \
+            || die "$E_ARGS" "$part is a whole disk; 'hdd remove' takes a partition"
+        uuid="$(part_uuid "$part")"
+        [ -n "$uuid" ] || die "$E_IO" "could not read a UUID from $part"
+
+        HDD_RM_LINE="$(hdd_block_find 1 "UUID=$uuid")"
+        if [ -z "$HDD_RM_LINE" ]; then
+            if partition_in_fstab "$part"; then
+                die "$E_EXISTS" "$part has an entry in $FSTAB_FILE that system-setup did not write; it will not be removed"
+            fi
+            die "$E_NOTFOUND" "$part has no entry in $FSTAB_FILE"
+        fi
+    else
+        HDD_RM_LINE="$(hdd_block_find 2 "$mount")"
+        if [ -z "$HDD_RM_LINE" ]; then
+            if mount_in_fstab "$mount"; then
+                die "$E_EXISTS" "$mount has an entry in $FSTAB_FILE that system-setup did not write; it will not be removed"
+            fi
+            die "$E_NOTFOUND" "no entry in $FSTAB_FILE written by system-setup mounts $mount"
+        fi
+    fi
+
+    HDD_RM_MOUNT="$(awk '{ print $2 }' <<< "$HDD_RM_LINE")"
+    [ -n "$HDD_RM_MOUNT" ] || die "$E_IO" "could not read a mount point from: $HDD_RM_LINE"
+    return 0
+}
+
+hdd_remove_apply() {
+    local src body
+
+    # Unmount BEFORE touching fstab. "Device or resource busy" is the failure
+    # this command actually hits, and hitting it first means nothing has been
+    # changed when it does.
+    src="$(findmnt -nro SOURCE "$HDD_RM_MOUNT" 2>/dev/null | head -1 || true)"
+    if [ -n "$src" ]; then
+        info "unmounting $src from $HDD_RM_MOUNT"
+        umount "$HDD_RM_MOUNT" || die "$E_IO" "failed to unmount $HDD_RM_MOUNT (is something using it?)"
+    fi
+
+    backup_once "$FSTAB_FILE"
+    hdd_fstab_snapshot
+    body="$(hdd_block_body | grep -vxF -- "$HDD_RM_LINE" || true)"
+    hdd_block_set "$body"
+
+    # Removing an entry can no more be assumed safe than adding one, and the
+    # rollback copy is the same mechanism.
+    hdd_fstab_verify
+
+    info "hdd removed:"
+    info "  entry: $HDD_RM_LINE"
+    info "  mount: $HDD_RM_MOUNT (the directory is left in place)"
+    info "the partition, its filesystem and its data were not touched"
+    return 0
+}
+
+cmd_hdd_remove() {
+    local opt_part="" opt_mount="" opt_dryrun=0
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_hdd_remove; exit "$E_OK" ;;
+            -p|--partition)
+                [ $# -ge 2 ] || die "$E_ARGS" "--partition requires a value"
+                opt_part="$2"; shift 2 ;;
+            --partition=*) opt_part="${1#*=}"; shift ;;
+            -m|--mount)
+                [ $# -ge 2 ] || die "$E_ARGS" "--mount requires a value"
+                opt_mount="$2"; shift 2 ;;
+            --mount=*) opt_mount="${1#*=}"; shift ;;
+            -f|--force) FORCE=1; shift ;;
+            --dry-run) opt_dryrun=1; shift ;;
+            --) shift; [ $# -eq 0 ] || die "$E_ARGS" "unexpected argument: $1" ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) die "$E_ARGS" "unexpected argument: $1" ;;
+        esac
+    done
+
+    if [ -n "$opt_part" ] && [ -n "$opt_mount" ]; then
+        die "$E_ARGS" "--partition and --mount are alternatives; give exactly one"
+    fi
+    if [ -z "$opt_part" ] && [ -z "$opt_mount" ]; then
+        die "$E_ARGS" "one of --partition or --mount is required"
+    fi
+    if [ -n "$opt_mount" ]; then
+        opt_mount="$(normalise_mount "$opt_mount")" \
+            || die "$E_ARGS" "refusing to use / as the mount point"
+    fi
+
+    require_cmds blkid findmnt umount
+    require_sudo
+    elevate "${ORIG_ARGS[@]}"
+
+    hdd_remove_checks "$opt_part" "$opt_mount"
+    debug "resolved: entry='$HDD_RM_LINE' mount=$HDD_RM_MOUNT dry_run=$opt_dryrun"
+
+    # Before the prompt, not after: a dry run reports and stops, and must never
+    # ask a question about work it is not going to do.
+    if [ "$opt_dryrun" = "1" ]; then
+        info "dry run: would remove the entry for $HDD_RM_MOUNT"
+        info "  $HDD_RM_LINE"
+        info "nothing was changed"
+        exit "$E_OK"
+    fi
+
+    # Not `|| die "$E_OK"` - declining is not an error, and die would print
+    # it as one.
+    if ! confirm "Remove the fstab entry for $HDD_RM_MOUNT? The partition and its data are not touched."; then
+        info "cancelled; nothing was changed"
+        exit "$E_OK"
+    fi
+
+    hdd_remove_apply
+}
 
 # hdd_add_checks <part> -- every refusal `add` can make, in order. Silent on
 # success. Reads $HDD_MOUNT.
@@ -3015,6 +3150,25 @@ Adopts a partition that ALREADY has a filesystem: mounts it and records it in
 Refused if the partition is already mounted, already has an fstab entry, has no
 filesystem or one that is not ext4/xfs/vfat/ntfs, or if the mount point is
 already claimed. To prepare a raw disk instead, use 'hdd init'.
+EOF
+}
+
+help_hdd_remove() {
+    cat << 'EOF'
+system-setup hdd remove (-p <partition> | -m <mount>) [-f] [--dry-run]
+
+Removes a MOUNT CONFIGURATION: unmounts the partition and deletes its entry
+from /etc/fstab. It does not touch the partition, its filesystem, or any data
+on it, and it leaves the mount-point directory in place.
+
+  -p, --partition <part> the partition to release
+  -m, --mount <path>     or the mount point, for a disk that is no longer
+                         attached: a UUID cannot be read off a missing disk
+  -f, --force            skip the confirmation prompt
+      --dry-run          run every check and report, without prompting
+
+Exactly one of --partition and --mount is required. An entry this tool did not
+write is never removed. Removing the last entry removes the block with it.
 EOF
 }
 
