@@ -311,8 +311,12 @@ fresh_floop() {
     sudo rm -f "$FIMG"
     truncate -s 512M "$FIMG"
     FLOOP="$(sudo losetup -f --show -P "$FIMG")"
-    sudo sed -i '/# >>> system-setup \/dev\/loop/,/# <<< system-setup \/dev\/loop/d' /etc/fstab
+    # By mount point, never a block-wide delete: the managed block also holds
+    # this host's own entries. Then drop the block if that emptied it - an
+    # empty block shadows the next suite's, since block_extract stops at the
+    # first close marker it meets.
     sudo sed -i "\#$FMNT#d" /etc/fstab
+    sudo sed -i '/^# >>> system-setup >>>$/{N;/\n# <<< system-setup <<<$/d}' /etc/fstab
 }
 
 fdoc() { j "$1" "{\"hdd\":{\"device\":\"$FLOOP\",\"mount\":\"$FMNT\",\"type\":\"ext4\"}}"; }
@@ -338,7 +342,8 @@ fresh_floop
 run F2 0 "hdd      ok" file "$(fdoc f2)"
 if [ "$(sudo blkid -s TYPE -o value "${FLOOP}p1")" = ext4 ]; then ok; else bad "F2b: not provisioned"; fi
 if findmnt -n "$FMNT" >/dev/null; then ok; else bad "F2c: not mounted at $FMNT"; fi
-if sudo grep -qF "# >>> system-setup ${FLOOP}p1 >>>" /etc/fstab; then ok; else bad "F2d: fstab block not keyed on the partition"; fi
+FUUID="$(sudo blkid -s UUID -o value "${FLOOP}p1")"
+if sudo sed -n '/# >>> system-setup >>>/,/# <<< system-setup <<</p' /etc/fstab | grep -qE "^UUID=${FUUID}[[:space:]]"; then ok; else bad "F2d: entry not in the managed block"; fi
 
 echo "--- F3: a re-run through the document is idempotent ---"
 run F3 0 "hdd      ok" file "$(fdoc f3)"
@@ -367,11 +372,9 @@ if [ "$RC" = 0 ]; then ok; else bad "F7c: unattended run needed a tty :: $(tail 
 # teardown
 sudo umount "$FMNT" 2>/dev/null || true
 [ -z "$FLOOP" ] || sudo losetup -d "$FLOOP" 2>/dev/null || true
-sudo sed -i '/# >>> system-setup \/dev\/loop/,/# <<< system-setup \/dev\/loop/d' /etc/fstab
 sudo sed -i "\#$FMNT#d" /etc/fstab
+sudo sed -i '/^# >>> system-setup >>>$/{N;/\n# <<< system-setup <<<$/d}' /etc/fstab
 sudo rm -f "$FIMG"; sudo rmdir "$FMNT" 2>/dev/null || true
-sudo sed -i "\#$FMNT#d" /etc/fstab
-sudo sed -i '/# >>> system-setup \/dev\/loop/,/# <<< system-setup \/dev\/loop/d' /etc/fstab
 
 echo
 echo "passed: $PASS   failed: $FAIL"

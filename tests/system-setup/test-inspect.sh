@@ -66,15 +66,30 @@ echo
 echo "=== A1-A3: partition_managed ==="
 sudo sed -i "\\#$PART#d" /etc/fstab
 UUID="$(part_uuid "$PART")"
-# a block keyed on the PARTITION, the scheme this fix moves to
+# the single managed block, membership decided by UUID. Clear any existing one
+# first: appending a second block would shadow it, since block_extract stops at
+# the first close marker it meets.
+sudo sed -i "/# >>> system-setup /,/# <<< system-setup /d" /etc/fstab
 sudo tee -a /etc/fstab >/dev/null <<EOF
-# >>> system-setup $PART >>>
+# >>> system-setup >>>
 UUID=$UUID  $MNT  ext4  defaults,nofail  0  2
-# <<< system-setup $PART <<<
+# <<< system-setup <<<
 EOF
 if partition_managed "$PART"; then ok; else bad "A1: managed block not detected"; fi
 
-# same partition, in fstab but NOT in a block
+echo "--- the match is field-exact, not a substring search ---"
+# The same UUID as a LABEL= value, and in a comment. Either would fool a
+# grep -F over the block, and neither means the partition is managed.
+sudo sed -i "/# >>> system-setup /,/# <<< system-setup /d" /etc/fstab
+sudo tee -a /etc/fstab >/dev/null <<EOF
+# >>> system-setup >>>
+# UUID=$UUID was here once
+LABEL=UUID=$UUID  /tmp/ss-decoy  ext4  defaults  0  2
+# <<< system-setup <<<
+EOF
+if partition_managed "$PART"; then bad "A1b: a non-field UUID match counted as managed"; else ok; fi
+
+# same partition, in fstab but NOT in the block
 sudo sed -i "/# >>> system-setup /,/# <<< system-setup /d" /etc/fstab
 printf 'UUID=%s %s ext4 defaults 0 2\n' "$UUID" "$MNT" | sudo tee -a /etc/fstab >/dev/null
 if partition_managed "$PART"; then bad "A2: a hand-written entry was reported as managed"; else ok; fi

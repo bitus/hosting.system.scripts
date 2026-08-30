@@ -20,6 +20,13 @@ PASS=0; FAIL=0
 declare -a FAILURES=()
 LOOP=""
 
+# drop_empty_block -- remove the managed block if deleting entries emptied it.
+# An empty block is harmless to the script but shadows the next suite's, since
+# block_extract stops at the first close marker.
+drop_empty_block() {
+    sudo sed -i '/^# >>> system-setup >>>$/{N;/\n# <<< system-setup <<<$/d}' /etc/fstab
+}
+
 ok()  { PASS=$((PASS + 1)); }
 bad() { FAIL=$((FAIL + 1)); FAILURES+=("$1"); }
 
@@ -44,10 +51,14 @@ teardown() {
 }
 fresh_loop() {
     teardown
-    # Sentinel keys are device PATHS, and loop paths are recycled: without
-    # this, a block left by an earlier case makes the next case's brand new
-    # partition at the same path look like one we manage.
+    # The managed block outlives any one case, and losetup recycles paths, so
+    # a stale entry would make the next case's brand new partition look like
+    # one we manage. Clear by MOUNT POINT, never by deleting the block: on a
+    # real host it also holds entries this suite must not touch.
+    sudo sed -i "\#$MNT#d;\#$ALT#d" /etc/fstab
+    # plus any hand-written legacy block left by the migration cases
     sudo sed -i '/# >>> system-setup \/dev\/loop/,/# <<< system-setup \/dev\/loop/d' /etc/fstab
+    drop_empty_block
     sudo rm -f "$IMG"
     truncate -s 2G "$IMG"
     LOOP="$(sudo losetup -f --show -P "$IMG")"
@@ -57,8 +68,11 @@ debug_loop() { echo "  [loop: $LOOP]"; }
 
 cleanup_all() {
     teardown
+    # Never a block-wide delete: on a real host the managed block also holds
+    # entries this suite did not write and must not remove.
     sudo sed -i '/# >>> system-setup \/dev\/loop/,/# <<< system-setup \/dev\/loop/d' /etc/fstab
     sudo sed -i "\#$MNT#d;\#$ALT#d" /etc/fstab
+    drop_empty_block
     sudo rm -f "$IMG"
     sudo rmdir "$MNT" "$ALT" 2>/dev/null || true
 }
@@ -81,8 +95,10 @@ assert 43d "sudo grep -q 'nofail' /etc/fstab"
 assert 43e "findmnt -n '$MNT' >/dev/null"
 assert 43f "! sudo grep -qE '^${LOOP}[p]?1[[:space:]]' /etc/fstab"
 
-assert C2 "sudo grep -qF '# >>> system-setup ${LOOP}p1 >>>' /etc/fstab"
-assert C2b "! sudo grep -qF '# >>> system-setup ${LOOP} >>>' /etc/fstab"
+assert C2  "sudo grep -qxF '# >>> system-setup >>>' /etc/fstab"
+assert C2b "! sudo grep -q '# >>> system-setup /dev/loop' /etc/fstab"
+# the entry is INSIDE the block, and the UUID is its first field
+assert C2c "sudo sed -n '/# >>> system-setup >>>/,/# <<< system-setup <<</p' /etc/fstab | grep -qE '^UUID=${UUID}[[:space:]]'"
 
 echo
 echo "=== 44/C3: identical re-run is idempotent ==="
@@ -134,26 +150,27 @@ sudo mkfs.ext4 -F "${LOOP}p2" >/dev/null 2>&1
 U1="$(sudo blkid -s UUID -o value "${LOOP}p1")"
 U2="$(sudo blkid -s UUID -o value "${LOOP}p2")"
 
-block() {   # block <partition> <uuid> <mount>
-    sudo tee -a /etc/fstab >/dev/null <<EOF
-# >>> system-setup $1 >>>
-UUID=$2  $3  ext4  defaults,nofail  0  2
-# <<< system-setup $1 <<<
-EOF
+managed_block() {   # managed_block <entry-line>...
+    sudo sed -i '/# >>> system-setup >>>/,/# <<< system-setup <<</d' /etc/fstab
+    { echo "# >>> system-setup >>>"
+      printf '%s\n' "$@"
+      echo "# <<< system-setup <<<"
+    } | sudo tee -a /etc/fstab >/dev/null
 }
+E1="UUID=$U1  $MNT  ext4  defaults,nofail  0  2"
+E2="UUID=$U2  $ALT  ext4  defaults,nofail  0  2"
 
 echo "--- C7: one managed, one not -> still refused ---"
 # The case a looser check gets wrong: "any partition managed" is not
 # "all partitions managed", and treating them alike would reformat p2.
-block "${LOOP}p1" "$U1" "$MNT"
+managed_block "$E1"
 run C7 4 "refusing to touch" hdd init --device "$LOOP" --mount "$MNT" --type ext4
 
 echo "--- C6: both managed -> success, nothing changed ---"
-block "${LOOP}p2" "$U2" "$ALT"
+managed_block "$E1" "$E2"
 FB="$(sudo md5sum /etc/fstab | cut -d' ' -f1)"
 run C6 0 "every partition on $LOOP is managed" hdd init --device "$LOOP" --mount "$MNT" --type ext4
 assert C6b "[ \"\$(sudo md5sum /etc/fstab | cut -d' ' -f1)\" = '$FB' ]"
-sudo sed -i '/# >>> system-setup \/dev\/loop/,/# <<< system-setup \/dev\/loop/d' /etc/fstab
 
 echo
 echo "=== C8: --force is gone ==="
@@ -161,23 +178,48 @@ run C8  2 "unknown flag" hdd init --device "$LOOP" --mount "$MNT" --force
 run C8b 2 "unknown flag" hdd init --device "$LOOP" --mount "$MNT" -f
 
 echo
-echo "=== M: a pre-2026-08-30 device-keyed block is re-keyed, not refused ==="
+echo "=== M: an earlier release's block is folded in, not refused ==="
+legacy_block() {   # legacy_block <sentinel-id> <uuid> <mount>
+    sudo sed -i '/# >>> system-setup >>>/,/# <<< system-setup <<</d' /etc/fstab
+    sudo tee -a /etc/fstab >/dev/null <<EOF
+# >>> system-setup $1 >>>
+UUID=$2  $3  ext4  defaults,nofail  0  2
+# <<< system-setup $1 <<<
+EOF
+}
+
+echo "--- M1/M2: the pre-2026-08-30 device-keyed spelling ---"
 fresh_loop
 run M1 0 "hdd configured" hdd init --device "$LOOP" --mount "$MNT" --type ext4
-# rewrite our own block back into the old device-keyed spelling
-sudo sed -i "s|# >>> system-setup ${LOOP}p1 >>>|# >>> system-setup ${LOOP} >>>|" /etc/fstab
-sudo sed -i "s|# <<< system-setup ${LOOP}p1 <<<|# <<< system-setup ${LOOP} <<<|" /etc/fstab
-BODY="$(sudo sed -n "\|# >>> system-setup ${LOOP} >>>|,\|# <<< system-setup ${LOOP} <<<|p" /etc/fstab | sed '1d;$d')"
+UUID="$(sudo blkid -s UUID -o value "${LOOP}p1")"
+legacy_block "$LOOP" "$UUID" "$MNT"
 
-# ...and ask for a DIFFERENT mount point. Migration is a re-keying, not a
+# ...and ask for a DIFFERENT mount point. Folding is a re-keying, not a
 # reconfiguration: it must not silently move a live filesystem.
-run M2 0 "earlier release" hdd init --device "$LOOP" --mount "$ALT" --type ext4
-assert M2b "sudo grep -qF '# >>> system-setup ${LOOP}p1 >>>' /etc/fstab"
-assert M2c "! sudo grep -qF '# >>> system-setup ${LOOP} >>>' /etc/fstab"
-NEWBODY="$(sudo sed -n "\|# >>> system-setup ${LOOP}p1 >>>|,\|# <<< system-setup ${LOOP}p1 <<<|p" /etc/fstab | sed '1d;$d')"
-if [ "$NEWBODY" = "$BODY" ]; then ok; else bad "M2d: block body changed: '$NEWBODY' != '$BODY'"; fi
+run M2 0 "folding the fstab block for $LOOP" hdd init --device "$LOOP" --mount "$ALT" --type ext4
+assert M2b "sudo grep -qxF '# >>> system-setup >>>' /etc/fstab"
+assert M2c "! sudo grep -q '# >>> system-setup /dev/loop' /etc/fstab"
+# body carried verbatim: still $MNT, not the $ALT that was asked for
+assert M2d "sudo grep -qE '^UUID=${UUID}[[:space:]]+${MNT}[[:space:]]' /etc/fstab"
 assert M2e "! findmnt -n '$ALT' >/dev/null"
 run M3 0 "already configured" hdd init --device "$LOOP" --mount "$MNT" --type ext4
+
+echo "--- M4: the short-lived partition-keyed spelling is folded too ---"
+legacy_block "${LOOP}p1" "$UUID" "$MNT"
+run M4 0 "folding the fstab block for ${LOOP}p1" hdd init --device "$LOOP" --mount "$MNT" --type ext4
+assert M4b "sudo grep -qxF '# >>> system-setup >>>' /etc/fstab"
+assert M4c "! sudo grep -q '# >>> system-setup /dev/loop' /etc/fstab"
+
+echo "--- M5: a block for ANOTHER disk is left alone ---"
+# `init` was asked about one device and has no business rewriting the rest.
+sudo tee -a /etc/fstab >/dev/null <<EOF
+# >>> system-setup /dev/definitely-not-here >>>
+UUID=00000000-0000-0000-0000-00000000ffff  /tmp/ss-other  ext4  defaults,nofail  0  2
+# <<< system-setup /dev/definitely-not-here <<<
+EOF
+run M5 0 "already configured" hdd init --device "$LOOP" --mount "$MNT" --type ext4
+assert M5b "sudo grep -qF '# >>> system-setup /dev/definitely-not-here >>>' /etc/fstab"
+sudo sed -i '/# >>> system-setup \/dev\/definitely-not-here/,/# <<< system-setup \/dev\/definitely-not-here/d' /etc/fstab
 
 echo
 echo "=== 50/C9: a raw filesystem signature with no partition table is unsafe ==="
@@ -221,7 +263,6 @@ run 55 0 "mount:  /ss-bare" hdd init --device "$LOOP" --mount ss-bare --type ext
 assert 55b "findmnt -n /ss-bare >/dev/null"
 sudo umount /ss-bare 2>/dev/null || true
 sudo sed -i '\#/ss-bare#d' /etc/fstab
-sudo sed -i '/# >>> system-setup \/dev\/loop/,/# <<< system-setup \/dev\/loop/d' /etc/fstab
 sudo rmdir /ss-bare 2>/dev/null || true
 
 echo

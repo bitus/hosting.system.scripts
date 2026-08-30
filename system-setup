@@ -1121,9 +1121,53 @@ part_is_partition() {
 
 # partition_managed <part> -- true when fstab holds a block keyed on <part>.
 # "Ours to change."
+# Everything this tool owns in /etc/fstab lives in ONE unnamed block, the same
+# shape /etc/hosts and /etc/resolv.conf use. Membership is decided by UUID.
+#
+# The alternative - a sentinel per device or per partition - makes the block
+# key a device PATH, which is a second and weaker identity for a filesystem
+# that already has a good one two fields away. Paths are recycled: a disk
+# pulled and replaced enumerating at the same /dev/sdb would inherit the old
+# disk's claim, and `init` would adopt a stranger's partition as its own.
+FSTAB_BLOCK_ID=""
+
+# hdd_block_body -- the managed entries, sentinels stripped. Empty when there
+# is no block yet, which is the ordinary state of a host that has never run
+# `hdd`, not an error.
+hdd_block_body() {
+    [ -f "$FSTAB_FILE" ] || return 0
+    block_extract "$FSTAB_FILE" "$FSTAB_BLOCK_ID" | sed '1d;$d'
+}
+
+# hdd_block_set <body> -- replace the managed block. An empty body removes the
+# block outright rather than leaving a bare pair of sentinels behind, so a host
+# whose last managed partition is removed ends up with the fstab it started
+# with.
+hdd_block_set() {
+    local body="$1"
+    if [ -z "$body" ]; then
+        block_delete "$FSTAB_FILE" "$FSTAB_BLOCK_ID"
+        return 0
+    fi
+    block_upsert "$FSTAB_FILE" "$FSTAB_BLOCK_ID" "$(block_marker_open "$FSTAB_BLOCK_ID")
+$body
+$(block_marker_close "$FSTAB_BLOCK_ID")"
+}
+
+# partition_managed <part> -- true when the managed block holds an entry for
+# this partition's filesystem UUID.
+#
+# Field-exact on $1, never a substring search: a UUID can appear as some other
+# field, or in a comment, and "is this string somewhere in the block" is not
+# the question being asked.
 partition_managed() {
-    [ -f "$FSTAB_FILE" ] || return 1
-    grep -qF "$(block_marker_open "$1")" "$FSTAB_FILE"
+    local uuid
+    uuid="$(part_uuid "$1")"
+    [ -n "$uuid" ] || return 1
+    hdd_block_body | awk -v u="UUID=$uuid" '
+        $1 == u { found = 1; exit }
+        END { exit(found ? 0 : 1) }
+    '
 }
 
 # all_partitions_managed <device> -- true when EVERY partition on <device> has
@@ -1276,31 +1320,35 @@ hdd_fstab_rollback() {
     return 0
 }
 
-# hdd_fstab_write <part> <uuid>
-#
-# The block is keyed on the PARTITION, not the disk. A disk can hold several
-# partitions that this tool manages independently - `add` and `remove` both
-# depend on being able to name one of them - and a disk-keyed block cannot
-# express that.
+# hdd_fstab_write <part> <uuid> -- add or replace this partition's entry in
+# the managed block.
 hdd_fstab_write() {
-    local part="$1" uuid="$2" content tmp
+    local part="$1" uuid="$2" body line tmp
 
     backup_once "$FSTAB_FILE"
     hdd_fstab_snapshot
 
-    # Our own blocks first, so the legacy-line sweep below cannot eat them.
-    # Both keys: releases before 2026-08-30 keyed the block on the whole
-    # device, and re-keying it is the migration.
-    block_delete "$FSTAB_FILE" "$part"
-    block_delete "$FSTAB_FILE" "$HDD_DEVICE"
-
-    # Reconcile: drop any line that names this partition, or that claims our
-    # mount point. Device names are not stable across reboots - that
-    # instability is exactly why the replacement keys on UUID.
+    # Take our own entries out of the file BEFORE the sweep below, which drops
+    # anything claiming $HDD_MOUNT and would otherwise eat the sibling entries
+    # it is meant to preserve.
     #
-    # An exact match on $1, not a prefix: the old prefix test was written for
-    # a disk-keyed block and would match /dev/sdb1 while sweeping /dev/sdb,
-    # which now means eating a sibling partition's entry.
+    # Two keys are dropped from the body: this UUID, so re-running with a
+    # different --mount replaces the entry rather than adding a second one for
+    # one filesystem; and this mount point, so two filesystems cannot both
+    # claim it.
+    body="$(hdd_block_body | awk -v u="UUID=$uuid" -v m="$HDD_MOUNT" '
+        ($1 == u) || ($2 == m) { next }
+        { print }
+    ')"
+    block_delete "$FSTAB_FILE" "$FSTAB_BLOCK_ID"
+
+    # Reconcile the rest of the file: drop any line naming this partition by
+    # path, or claiming our mount point. Device names are not stable across
+    # reboots - that instability is exactly why the replacement keys on UUID.
+    #
+    # An exact match on $1, not a prefix: a prefix test is a whole-disk
+    # assumption written in string operations, and sweeping /dev/sdb would
+    # take /dev/sdb2's entry with it.
     tmp="$(mktemp "${FSTAB_FILE}.XXXXXX")"
     CLEANUP_TMPFILES+=("$tmp")
     awk -v part="$part" -v mnt="$HDD_MOUNT" '
@@ -1311,10 +1359,13 @@ hdd_fstab_write() {
     ' "$FSTAB_FILE" > "$tmp"
     cat "$tmp" > "$FSTAB_FILE"
 
-    content="$(block_marker_open "$part")
-UUID=$uuid  $HDD_MOUNT  ${FSTAB_TYPE[$HDD_TYPE]}  ${FSTAB_OPTS[$HDD_TYPE]}  0  ${FSTAB_PASS[$HDD_TYPE]}
-$(block_marker_close "$part")"
-    block_upsert "$FSTAB_FILE" "$part" "$content"
+    line="UUID=$uuid  $HDD_MOUNT  ${FSTAB_TYPE[$HDD_TYPE]}  ${FSTAB_OPTS[$HDD_TYPE]}  0  ${FSTAB_PASS[$HDD_TYPE]}"
+    if [ -n "$body" ]; then
+        hdd_block_set "$body
+$line"
+    else
+        hdd_block_set "$line"
+    fi
     return 0
 }
 
@@ -1334,37 +1385,56 @@ hdd_fstab_verify() {
     return 0
 }
 
-# hdd_migrate_device_block <device> -- re-key a pre-2026-08-30 block.
+# hdd_migrate_blocks <device> -- fold any per-device or per-partition block
+# for this disk into the single managed block. Returns 0 when it moved
+# something, 1 when there was nothing to move.
 #
-# A host provisioned by an earlier release carries a block keyed on the whole
-# disk. To `all_partitions_managed` that is indistinguishable from a disk
-# somebody else partitioned, so `init` would refuse a disk it created itself.
+# Two earlier spellings exist: releases before 2026-08-30 keyed the block on
+# the whole disk, and a short-lived revision of that fix keyed it on the
+# partition. Neither is recognised by partition_managed, so without this a
+# host would be refused a disk this tool provisioned itself.
 #
-# The fix is a re-keying, NOT a reconfiguration: the block body is carried
-# across verbatim, so an operator who passes a different --mount does not
-# silently move an existing filesystem. Changing where a managed partition
-# mounts is `hdd remove` followed by `hdd init`.
+# The bodies move VERBATIM. A migration is a re-keying, not a reconfiguration:
+# an operator running `init` with a different --mount must not thereby have a
+# live filesystem moved out from under them. Changing where a managed
+# partition mounts is `hdd remove` followed by `hdd init`.
 #
-# Narrow on purpose - only a single-partition disk, the one shape the old
-# code could produce. Returns non-zero and changes nothing otherwise.
-hdd_migrate_device_block() {
-    local dev="$1" part body
-    partition_managed "$dev" || return 1
-    [ "$(dev_state "$dev")" = "single" ] || return 1
-    part="$(part_name "$dev" 1)"
+# Scoped to one disk on purpose - `init` was asked about $device and has no
+# business rewriting entries for the others.
+hdd_migrate_blocks() {
+    local dev="$1" ids id p want body acc moved=0
 
-    # block_extract returns the markers too; the body is what lies between.
-    body="$(block_extract "$FSTAB_FILE" "$dev" | sed '1d;$d')"
-    [ -n "$body" ] || return 1
+    [ -f "$FSTAB_FILE" ] || return 1
+    ids="$(awk '/^# >>> system-setup \/dev\// { print $4 }' "$FSTAB_FILE")"
+    [ -n "$ids" ] || return 1
 
-    info "migrating the fstab block for $dev onto its partition, $part"
+    want="$dev"
+    while read -r p; do
+        [ -n "$p" ] || continue
+        want="$want
+/dev/$p"
+    done <<< "$(dev_partitions "$dev")"
+
+    acc="$(hdd_block_body)"
+    while read -r id; do
+        [ -n "$id" ] || continue
+        grep -qxF "$id" <<< "$want" || continue
+        body="$(block_extract "$FSTAB_FILE" "$id" | sed '1d;$d')"
+        [ -n "$body" ] || continue
+        info "folding the fstab block for $id into the managed block"
+        block_delete "$FSTAB_FILE" "$id"
+        if [ -n "$acc" ]; then
+            acc="$acc
+$body"
+        else
+            acc="$body"
+        fi
+        moved=1
+    done <<< "$ids"
+
+    [ "$moved" = "1" ] || return 1
     backup_once "$FSTAB_FILE"
-    hdd_fstab_snapshot
-    block_delete "$FSTAB_FILE" "$dev"
-    block_upsert "$FSTAB_FILE" "$part" "$(block_marker_open "$part")
-$body
-$(block_marker_close "$part")"
-    hdd_fstab_verify
+    hdd_block_set "$acc"
     return 0
 }
 
@@ -1510,6 +1580,14 @@ cmd_hdd_init() {
     state="$(dev_state "$HDD_DEVICE")"
     debug "device state: $state"
 
+    # Normalise any earlier-release block for this disk before deciding
+    # anything. It says the same thing in an older spelling, and every check
+    # below - and hdd_fstab_write's dedup - can only see the current one.
+    if hdd_migrate_blocks "$HDD_DEVICE"; then
+        hdd_fstab_snapshot
+        hdd_fstab_verify
+    fi
+
     # `init` provisions a RAW disk and nothing else. Every other shape is
     # either already ours - in which case there is nothing to do - or somebody
     # else's, in which case the answer is no. There is no override: reusing an
@@ -1522,10 +1600,6 @@ cmd_hdd_init() {
         *)
             if all_partitions_managed "$HDD_DEVICE"; then
                 info "hdd already configured: every partition on $HDD_DEVICE is managed by system-setup"
-                exit "$E_OK"
-            fi
-            if hdd_migrate_device_block "$HDD_DEVICE"; then
-                info "hdd already configured: $HDD_DEVICE was provisioned by an earlier release"
                 exit "$E_OK"
             fi
             info "$HDD_DEVICE carries partitions or data this command did not create:"
@@ -2775,6 +2849,10 @@ Prepares a RAW disk: one partition spanning it, a filesystem, a mount, and an
 Only a disk with no partitions and no filesystem is touched. A disk whose
 partitions this tool already manages reports success and changes nothing; any
 other disk is refused. To adopt a partition that already exists, use 'hdd add'.
+
+The fstab entry is recorded in a single '# >>> system-setup >>>' block, and a
+partition is recognised as managed by its filesystem UUID - not by its device
+name, which is not stable.
 EOF
 }
 

@@ -91,13 +91,15 @@ render() {
     )"
 }
 
-echo "--- B4: a partition-keyed block reports managed ---"
+echo "--- B4: an entry in the managed block reports managed ---"
 UUID="$(blkid -s UUID -o value "$LPART")"
 sed -i "\\#$LPART#d" /etc/fstab
+# clear any existing block first - a second one would shadow this
+sed -i '/# >>> system-setup /,/# <<< system-setup /d' /etc/fstab
 cat >> /etc/fstab <<EOF
-# >>> system-setup $LPART >>>
+# >>> system-setup >>>
 UUID=$UUID  /tmp/ss-list-mnt  ext4  defaults,nofail  0  2
-# <<< system-setup $LPART <<<
+# <<< system-setup <<<
 EOF
 render
 if [ "$(col "$LPART" 8)" = "managed" ]; then ok; else bad "B4: FSTAB was '$(col "$LPART" 8)', want managed"; fi
