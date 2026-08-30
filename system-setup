@@ -95,6 +95,9 @@ declare -A FSTAB_OPTS=(
 declare -A FSTAB_PASS=( [ext4]="2" [xfs]="2" [vfat]="0" [ntfs]="0" )
 
 VERBOSE=0
+# Set only by `hdd expand` and `hdd remove`, the two commands with a prompt.
+# `system-setup file` deliberately has no way to set it: a configuration
+# document must never be able to destroy data or answer a confirmation.
 FORCE=0
 declare -a ORIG_ARGS=()
 declare -a CLEANUP_TMPFILES=()
@@ -2800,7 +2803,6 @@ file_elevate() {
     local rc=0
     local -a argv=(file "$FILE_PATH")
     if [ "$VERBOSE" = "1" ]; then argv+=(--verbose); fi
-    if [ "$FORCE" = "1" ]; then argv+=(--force); fi
     debug "elevating: sudo -- $SELF $(join_sp "${argv[@]}")"
     sudo -- "$SELF" "${argv[@]}" || rc=$?
     exit "$rc"
@@ -3117,10 +3119,6 @@ cmd_file() {
         case "$1" in
             -h|--help) help_file; exit "$E_OK" ;;
             --dry-run) opt_dryrun=1; shift ;;
-            # Sets the same global the CLI sets. hdd is its only consumer.
-            # Deliberately a command-line flag and NOT a document field: a
-            # configuration file alone must never be able to destroy data.
-            -f|--force) FORCE=1; shift ;;
             --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
             # A bare - is the conventional "read from stdin" argument, not a
             # flag; it must be matched before the -* case swallows it.
@@ -3358,7 +3356,7 @@ Usage:
   system-setup docker [-n <cidr> [-s <bits>]] | -u
   system-setup ntp [-s <server>]... | -u
   system-setup tz <zone>
-  system-setup file <path|-> [--dry-run] [-f]
+  system-setup file <path|-> [--dry-run]
   system-setup setup
 
 Aliases:
@@ -3560,9 +3558,11 @@ tz -> hdd -> docker -> ntp -> network. A failing task does not stop the
 sequence; the exit code is that of the first failure.
 
       --dry-run          validate everything and print the plan, change nothing
-  -f, --force            permit destructive hdd operations (reformat, unmount).
-                         Deliberately a flag, not a document field: a config
-                         file on its own can never destroy data.
+
+No task reachable from a document is destructive or interactive: the hdd node
+means 'hdd init', which only ever provisions a raw disk. Growing, releasing and
+reformatting are 'hdd expand' and 'hdd remove', which take --force of their own
+and cannot be named from a file.
 EOF
 }
 

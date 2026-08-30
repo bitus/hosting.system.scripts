@@ -361,6 +361,17 @@ OUT="$(printf 'hdd:
 if [ "$RC" = 0 ] && grep -q 'hdd      ok' <<< "$OUT"; then ok; else bad "F6: rc=$RC :: $(tail -3 <<< "$OUT")"; fi
 if [ "$(sudo blkid -s TYPE -o value "${FLOOP}p1")" = ext4 ]; then ok; else bad "F6b: stdin document did not take effect"; fi
 
+echo '--- H1/H2/H3: the --force flag is gone from file ---'
+# It became inert in phase C, when hdd init lost --force and file_args_hdd
+# stopped appending it. An inert flag that is still accepted is worse than one
+# that is refused: it reads as "I asked for the destructive behaviour".
+run H1 2 "unknown flag" file --force "$(fdoc h1)"
+run H2 2 "unknown flag" file -f "$(fdoc h2)"
+# FORCE itself stays - `hdd expand` and `hdd remove` are its only setters now.
+if grep -qE '^FORCE=0$' "$SCRIPT"; then ok; else bad "H3: the FORCE global was removed; expand and remove still need it"; fi
+if [ "$(grep -cE '^\s+-f\|--force\) FORCE=1; shift ;;' "$SCRIPT")" = 2 ]; then ok; else bad "H3b: expected exactly two --force parsers (expand, remove), found $(grep -cE '^\s+-f\|--force\) FORCE=1; shift ;;' "$SCRIPT")"; fi
+if grep -q 'permit destructive hdd operations' "$SCRIPT"; then bad "H3c: help_file still advertises --force"; else ok; fi
+
 echo "--- F7: a document can never reach a confirmation prompt ---"
 if grep -q '^confirm() {' "$SCRIPT"; then ok; else bad "F7: confirm() helper was removed; it should stay"; fi
 # Prompts exist again, on `hdd remove` and `hdd expand`. Neither is reachable
