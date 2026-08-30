@@ -197,7 +197,14 @@ confirm() {
 # ---------------------------------------------------------------------------
 
 # One process-wide EXIT trap, never a RETURN trap: a `trap ... RETURN` set
-# inside a helper is not reliable across nested function calls in bash. The
+# inside a helper is not reliable across nested function calls in bash.
+#
+# It is a NET, not the primary mechanism, and it has one hole that cannot be
+# closed here: bash resets EXIT traps inside command substitutions, and
+# `cmd_file` runs every task as `out="$( ( "$cmd" ... ) 2>&1 )"`. Temp files a
+# task creates are therefore never swept by this trap on the `file` path. Each
+# helper below removes its own temp file the moment it is done with it; this
+# trap catches only what a die() left behind. The
 # explicit `return 0` matters too - without it the trap's own exit status can
 # silently override an exit code already set by die().
 cleanup_tmpfiles() {
@@ -1397,6 +1404,8 @@ hdd_fstab_rollback() {
     [ -n "$HDD_FSTAB_ROLLBACK" ] && [ -f "$HDD_FSTAB_ROLLBACK" ] || return 0
     cp -p "$HDD_FSTAB_ROLLBACK" "$FSTAB_FILE"
     warn "$FSTAB_FILE restored to its state from before this run"
+    rm -f "$HDD_FSTAB_ROLLBACK"
+    HDD_FSTAB_ROLLBACK=""
     return 0
 }
 
@@ -1438,6 +1447,7 @@ hdd_fstab_write() {
         { print }
     ' "$FSTAB_FILE" > "$tmp"
     cat "$tmp" > "$FSTAB_FILE"
+    rm -f "$tmp"
 
     line="UUID=$uuid  $HDD_MOUNT  ${FSTAB_TYPE[$HDD_TYPE]}  ${FSTAB_OPTS[$HDD_TYPE]}  0  ${FSTAB_PASS[$HDD_TYPE]}"
     if [ -n "$body" ]; then
@@ -1461,6 +1471,13 @@ hdd_fstab_verify() {
         hdd_fstab_rollback
         systemctl daemon-reload >/dev/null 2>&1 || true
         die "$E_IO" "'mount -a' failed; $FSTAB_FILE restored and no changes kept"
+    fi
+    # The new fstab is proven mountable, so the rollback copy has done its job.
+    # Removed here rather than left to the EXIT trap, which does not run on the
+    # `file` path - see the trap's comment.
+    if [ -n "$HDD_FSTAB_ROLLBACK" ]; then
+        rm -f "$HDD_FSTAB_ROLLBACK"
+        HDD_FSTAB_ROLLBACK=""
     fi
     return 0
 }
@@ -3353,7 +3370,7 @@ system-setup - basic configuration for freshly deployed Debian 12 VMs
 Usage:
   system-setup ip <ip[/mask]> -n <fqdn> [-m <mask>] [-g <gw>] [-d <dns>]... [--no-ipv6] [--no-restart]
   system-setup hdd <init|add|expand|remove|list> [...]
-  system-setup docker [-n <cidr> [-s <bits>]] | -u
+  system-setup docker [-n <cidr> [-s <bits>]] [-w <path>] | -u
   system-setup ntp [-s <server>]... | -u
   system-setup tz <zone>
   system-setup file <path|-> [--dry-run]

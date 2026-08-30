@@ -383,6 +383,18 @@ fresh_floop
 OUT="$(bash "$SCRIPT" file "$(fdoc f7)" < /dev/null 2>&1)"; RC=$?
 if [ "$RC" = 0 ]; then ok; else bad "F7c: unattended run needed a tty :: $(tail -3 <<< "$OUT")"; fi
 
+echo "--- F8: no temp files are left in /etc ---"
+# cmd_file runs each task as out="$( ( "$cmd" ) 2>&1 )", and bash resets EXIT
+# traps inside a command substitution - so the process-wide cleanup trap never
+# runs for a task's own temp files. Every helper that writes fstab must remove
+# its own. Before this was fixed, each `file` run with an hdd node left two
+# files behind in /etc.
+LEFT="$(sudo find /etc -maxdepth 1 -name 'fstab.*' ! -name 'fstab.bak' 2>/dev/null | wc -l)"
+if [ "$LEFT" = 0 ]; then ok; else
+    bad "F8: $LEFT temp file(s) left in /etc :: $(sudo find /etc -maxdepth 1 -name 'fstab.*' ! -name 'fstab.bak' | head -3 | tr '
+' ' ')"
+fi
+
 # teardown
 sudo umount "$FMNT" 2>/dev/null || true
 [ -z "$FLOOP" ] || sudo losetup -d "$FLOOP" 2>/dev/null || true
