@@ -21,7 +21,7 @@ run() {
     local out rc
     out="$(bash "$SCRIPT" "$@" 2>&1)"; rc=$?
     if [ "$rc" != "$want" ]; then bad "$id: [$*] rc=$rc want=$want :: $out"; return; fi
-    if [ -n "$pat" ] && ! grep -qE "$pat" <<< "$out"; then bad "$id: [$*] missing /$pat/ :: $out"; return; fi
+    if [ -n "$pat" ] && ! grep -qE -- "$pat" <<< "$out"; then bad "$id: [$*] missing /$pat/ :: $out"; return; fi
     ok
 }
 

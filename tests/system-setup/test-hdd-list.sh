@@ -39,7 +39,7 @@ run() {
     local out rc
     out="$(bash "$SCRIPT" "$@" 2>&1)"; rc=$?
     if [ "$rc" != "$want" ]; then bad "$id: [$*] rc=$rc want=$want :: $(tail -3 <<< "$out")"; return; fi
-    if [ -n "$pat" ] && ! grep -qE "$pat" <<< "$out"; then bad "$id: [$*] missing /$pat/ :: $(tail -3 <<< "$out")"; return; fi
+    if [ -n "$pat" ] && ! grep -qE -- "$pat" <<< "$out"; then bad "$id: [$*] missing /$pat/ :: $(tail -3 <<< "$out")"; return; fi
     ok
 }
 
@@ -152,8 +152,10 @@ else
 fi
 
 echo
-echo "=== the unbuilt subcommands announce themselves ==="
-run S1 1 "not implemented" hdd add
+echo "=== the subcommands are reachable through the router ==="
+# `add` is built (phase D), so it fails on its own argument check rather than
+# on the placeholder. A stub is load-bearing only until it is replaced.
+run S1 2 "--partition is required" hdd add
 run S2 1 "not implemented" hdd expand
 run S3 1 "not implemented" hdd remove
 

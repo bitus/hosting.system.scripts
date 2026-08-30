@@ -20,7 +20,7 @@ run() {
     local out rc
     out="$(bash "$SCRIPT" "$@" 2>&1)"; rc=$?
     if [ "$rc" != "$want" ]; then bad "$id: [$*] rc=$rc want=$want :: $(tail -3 <<< "$out")"; return; fi
-    if [ -n "$pat" ] && ! grep -qE "$pat" <<< "$out"; then bad "$id: [$*] missing /$pat/ :: $(tail -3 <<< "$out")"; return; fi
+    if [ -n "$pat" ] && ! grep -qE -- "$pat" <<< "$out"; then bad "$id: [$*] missing /$pat/ :: $(tail -3 <<< "$out")"; return; fi
     ok
 }
 assert()      { if eval "$2"; then ok; else bad "$1: assertion failed: $2"; fi; }

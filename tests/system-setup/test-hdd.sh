@@ -16,6 +16,10 @@ SCRIPT="${SCRIPT:-$REPO/system-setup}"
 IMG=/tmp/ss-hdd-test.img
 MNT=/tmp/ss-mnt
 ALT=/tmp/ss-alt
+# Restored wholesale on exit. Targeted cleanup is still done per case, because
+# the cases depend on it - this is the net underneath, so that a helper which
+# reaches into fstab with sed cannot cost the host a real entry.
+FSTAB_SAVE=/tmp/ss-hdd-fstab.save
 PASS=0; FAIL=0
 declare -a FAILURES=()
 LOOP=""
@@ -35,7 +39,7 @@ run() {
     local out rc
     out="$(bash "$SCRIPT" "$@" 2>&1)"; rc=$?
     if [ "$rc" != "$want" ]; then bad "$id: [$*] rc=$rc want=$want :: $(tail -3 <<< "$out")"; return; fi
-    if [ -n "$pat" ] && ! grep -qE "$pat" <<< "$out"; then bad "$id: [$*] missing /$pat/ :: $(tail -3 <<< "$out")"; return; fi
+    if [ -n "$pat" ] && ! grep -qE -- "$pat" <<< "$out"; then bad "$id: [$*] missing /$pat/ :: $(tail -3 <<< "$out")"; return; fi
     ok
 }
 assert() { if eval "$2"; then ok; else bad "$1: assertion failed: $2"; fi; }
@@ -68,6 +72,7 @@ debug_loop() { echo "  [loop: $LOOP]"; }
 
 cleanup_all() {
     teardown
+    if [ -f "$FSTAB_SAVE" ]; then sudo cp "$FSTAB_SAVE" /etc/fstab; sudo rm -f "$FSTAB_SAVE"; fi
     # Never a block-wide delete: on a real host the managed block also holds
     # entries this suite did not write and must not remove.
     sudo sed -i '/# >>> system-setup \/dev\/loop/,/# <<< system-setup \/dev\/loop/d' /etc/fstab
@@ -79,6 +84,7 @@ cleanup_all() {
 trap cleanup_all EXIT
 
 echo "### preparing"
+sudo cp /etc/fstab "$FSTAB_SAVE"
 sudo mkdir -p "$MNT" "$ALT"
 # start from a clean fstab with respect to our test paths
 sudo sed -i '/# >>> system-setup \/dev\/loop/,/# <<< system-setup \/dev\/loop/d' /etc/fstab
@@ -150,9 +156,17 @@ sudo mkfs.ext4 -F "${LOOP}p2" >/dev/null 2>&1
 U1="$(sudo blkid -s UUID -o value "${LOOP}p1")"
 U2="$(sudo blkid -s UUID -o value "${LOOP}p2")"
 
-managed_block() {   # managed_block <entry-line>...
+# managed_block <entry-line>... -- set the block to OUR entries plus whatever
+# else was already in it. Never a plain block-wide delete: on a real host the
+# block also holds that host's own entries, and deleting them costs it a mount
+# at the next boot.
+managed_block() {
+    local keep
+    keep="$(sudo sed -n '/# >>> system-setup >>>/,/# <<< system-setup <<</p' /etc/fstab \
+            | sed '1d;$d' | grep -vE "[[:space:]]($MNT|$ALT)[[:space:]]" || true)"
     sudo sed -i '/# >>> system-setup >>>/,/# <<< system-setup <<</d' /etc/fstab
     { echo "# >>> system-setup >>>"
+      [ -z "$keep" ] || printf '%s\n' "$keep"
       printf '%s\n' "$@"
       echo "# <<< system-setup <<<"
     } | sudo tee -a /etc/fstab >/dev/null
@@ -179,8 +193,11 @@ run C8b 2 "unknown flag" hdd init --device "$LOOP" --mount "$MNT" -f
 
 echo
 echo "=== M: an earlier release's block is folded in, not refused ==="
-legacy_block() {   # legacy_block <sentinel-id> <uuid> <mount>
-    sudo sed -i '/# >>> system-setup >>>/,/# <<< system-setup <<</d' /etc/fstab
+# legacy_block <sentinel-id> <uuid> <mount> -- put OUR entry back into an
+# earlier release's spelling, leaving the managed block's other entries alone.
+legacy_block() {
+    sudo sed -i "\#$MNT#d;\#$ALT#d" /etc/fstab
+    drop_empty_block
     sudo tee -a /etc/fstab >/dev/null <<EOF
 # >>> system-setup $1 >>>
 UUID=$2  $3  ext4  defaults,nofail  0  2

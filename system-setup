@@ -1119,8 +1119,52 @@ part_is_partition() {
     [ "$(lsblk -dnro TYPE "$1" 2>/dev/null | head -1)" = "part" ]
 }
 
-# partition_managed <part> -- true when fstab holds a block keyed on <part>.
-# "Ours to change."
+# normalise_mount <path> -- absolute, no duplicate or trailing slashes.
+# A bare name becomes /name.
+#
+# Returns non-zero for "/" instead of dying, because it is called through $( ):
+# a `die` inside a command substitution exits only the subshell, and the caller
+# would carry on with an empty mount point and no error.
+normalise_mount() {
+    local m="$1"
+    case "$m" in
+        /*) ;;
+        *) m="/$m" ;;
+    esac
+    while [[ "$m" == *//* ]]; do m="${m//\/\//\/}"; done
+    [ "$m" = "/" ] || m="${m%/}"
+    [ "$m" != "/" ] || return 1
+    printf '%s' "$m"
+}
+
+# hdd_type_of_fstype <blkid-type> -- our --type name for a filesystem blkid
+# found on a partition; non-zero when it is not one we support.
+#
+# Not an identity map: blkid reports `ntfs`, the fstab type is `ntfs3`, and the
+# key both tables are indexed by is `ntfs`.
+hdd_type_of_fstype() {
+    local t
+    for t in ext4 xfs vfat ntfs; do
+        if [ "$1" = "$t" ] || [ "$1" = "${FSTAB_TYPE[$t]}" ]; then
+            printf '%s' "$t"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# mount_in_fstab <mount> -- true when any fstab line already claims this mount
+# point, ours or anyone's.
+mount_in_fstab() {
+    [ -f "$FSTAB_FILE" ] || return 1
+    awk -v m="$1" '
+        /^[[:space:]]*#/ { next }
+        /^[[:space:]]*$/ { next }
+        $2 == m { found = 1; exit }
+        END { exit(found ? 0 : 1) }
+    ' "$FSTAB_FILE"
+}
+
 # Everything this tool owns in /etc/fstab lives in ONE unnamed block, the same
 # shape /etc/hosts and /etc/resolv.conf use. Membership is decided by UUID.
 #
@@ -1522,9 +1566,117 @@ cmd_hdd() {
     esac
 }
 
-cmd_hdd_add()    { not_implemented "hdd add" "D"; }
 cmd_hdd_expand() { not_implemented "hdd expand" "F"; }
 cmd_hdd_remove() { not_implemented "hdd remove" "E"; }
+
+# hdd_add_checks <part> -- every refusal `add` can make, in order. Silent on
+# success. Reads $HDD_MOUNT.
+#
+# Kept apart from hdd_add_apply so that --dry-run runs exactly this and stops.
+# A dry run and a real run cannot then disagree about whether the operation was
+# possible, which is the only property that makes a dry run worth having.
+hdd_add_checks() {
+    local part="$1" fstype mnt
+
+    dev_exists "$part" || die "$E_NOTFOUND" "block device '$part' not found"
+    part_is_partition "$part" \
+        || die "$E_ARGS" "$part is a whole disk; 'hdd add' adopts a partition, and 'hdd init' prepares a disk"
+
+    fstype="$(part_fstype "$part")"
+    [ -n "$fstype" ] \
+        || die "$E_ARGS" "$part has no filesystem; 'hdd add' adopts one that exists"
+    hdd_type_of_fstype "$fstype" >/dev/null \
+        || die "$E_ARGS" "$part is formatted as '$fstype', not one of: ext4 xfs vfat ntfs"
+
+    if partition_managed "$part"; then
+        die "$E_EXISTS" "$part is already recorded in $FSTAB_FILE by system-setup"
+    fi
+    if partition_in_fstab "$part"; then
+        die "$E_EXISTS" "$part already has an entry in $FSTAB_FILE that system-setup did not write"
+    fi
+
+    mnt="$(mount_point_of "$part")"
+    [ -z "$mnt" ] || die "$E_EXISTS" "$part is already mounted at $mnt"
+
+    # The mount point, from both directions. hdd_fstab_write drops any entry
+    # claiming $HDD_MOUNT - which is right for `init` re-running on one disk,
+    # and would silently evict somebody else's partition here.
+    if mount_in_fstab "$HDD_MOUNT"; then
+        die "$E_EXISTS" "$HDD_MOUNT is already claimed by an entry in $FSTAB_FILE"
+    fi
+    if findmnt -n "$HDD_MOUNT" >/dev/null 2>&1; then
+        die "$E_EXISTS" "$HDD_MOUNT is already a mount point"
+    fi
+
+    [ -n "$(part_uuid "$part")" ] || die "$E_IO" "could not read a UUID from $part"
+    return 0
+}
+
+hdd_add_apply() {
+    local part="$1" uuid mnt
+
+    uuid="$(part_uuid "$part")"
+    if [ ! -d "$HDD_MOUNT" ]; then
+        mkdir -p "$HDD_MOUNT" || die "$E_IO" "failed to create $HDD_MOUNT"
+    fi
+
+    hdd_fstab_write "$part" "$uuid"
+    hdd_fstab_verify
+
+    mnt="$(mount_point_of "$part")"
+    [ "$mnt" = "$HDD_MOUNT" ] || die "$E_IO" "$part did not end up mounted at $HDD_MOUNT"
+
+    info "hdd added:"
+    info "  device: $part"
+    info "  uuid:   $uuid"
+    info "  type:   ${FSTAB_TYPE[$HDD_TYPE]}"
+    info "  mount:  $HDD_MOUNT"
+    return 0
+}
+
+cmd_hdd_add() {
+    local opt_part="" opt_mount="" opt_dryrun=0
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_hdd_add; exit "$E_OK" ;;
+            -p|--partition)
+                [ $# -ge 2 ] || die "$E_ARGS" "--partition requires a value"
+                opt_part="$2"; shift 2 ;;
+            --partition=*) opt_part="${1#*=}"; shift ;;
+            -m|--mount)
+                [ $# -ge 2 ] || die "$E_ARGS" "--mount requires a value"
+                opt_mount="$2"; shift 2 ;;
+            --mount=*) opt_mount="${1#*=}"; shift ;;
+            --dry-run) opt_dryrun=1; shift ;;
+            --) shift; [ $# -eq 0 ] || die "$E_ARGS" "unexpected argument: $1" ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) die "$E_ARGS" "unexpected argument: $1" ;;
+        esac
+    done
+
+    [ -n "$opt_part" ]  || die "$E_ARGS" "--partition is required"
+    [ -n "$opt_mount" ] || die "$E_ARGS" "--mount is required"
+    opt_mount="$(normalise_mount "$opt_mount")" \
+        || die "$E_ARGS" "refusing to use / as the mount point"
+
+    require_cmds blkid findmnt mount
+    require_sudo
+    elevate "${ORIG_ARGS[@]}"
+
+    HDD_MOUNT="$opt_mount"
+    hdd_add_checks "$opt_part"
+    HDD_TYPE="$(hdd_type_of_fstype "$(part_fstype "$opt_part")")"
+    debug "resolved: partition=$opt_part mount=$HDD_MOUNT type=$HDD_TYPE dry_run=$opt_dryrun"
+
+    if [ "$opt_dryrun" = "1" ]; then
+        info "dry run: $opt_part would be added at $HDD_MOUNT as ${FSTAB_TYPE[$HDD_TYPE]}"
+        info "nothing was changed"
+        exit "$E_OK"
+    fi
+
+    hdd_add_apply "$opt_part"
+}
 
 cmd_hdd_init() {
     local opt_device="$DEFAULT_DEVICE" opt_mount="$DEFAULT_MOUNT" opt_type="$DEFAULT_FSTYPE"
@@ -1553,15 +1705,8 @@ cmd_hdd_init() {
     [ -n "${MKFS_CMD[$opt_type]:-}" ] \
         || die "$E_ARGS" "invalid --type: '$opt_type' (expected one of: ext4 xfs vfat ntfs)"
 
-    # Normalise the mount point to an absolute path: prepend /, collapse
-    # duplicate slashes, drop any trailing slash.
-    case "$opt_mount" in
-        /*) ;;
-        *) opt_mount="/$opt_mount" ;;
-    esac
-    while [[ "$opt_mount" == *//* ]]; do opt_mount="${opt_mount//\/\//\/}"; done
-    [ "$opt_mount" = "/" ] || opt_mount="${opt_mount%/}"
-    [ "$opt_mount" != "/" ] || die "$E_ARGS" "refusing to use / as the mount point"
+    opt_mount="$(normalise_mount "$opt_mount")" \
+        || die "$E_ARGS" "refusing to use / as the mount point"
 
     HDD_DEVICE="$opt_device"
     HDD_MOUNT="$opt_mount"
@@ -2853,6 +2998,23 @@ other disk is refused. To adopt a partition that already exists, use 'hdd add'.
 The fstab entry is recorded in a single '# >>> system-setup >>>' block, and a
 partition is recognised as managed by its filesystem UUID - not by its device
 name, which is not stable.
+EOF
+}
+
+help_hdd_add() {
+    cat << 'EOF'
+system-setup hdd add -p <partition> -m <mount> [--dry-run]
+
+Adopts a partition that ALREADY has a filesystem: mounts it and records it in
+/etc/fstab by UUID. It never partitions, formats, or writes to the filesystem.
+
+  -p, --partition <part> required; a partition, not a whole disk
+  -m, --mount <path>     required; a bare name is taken as /<name>
+      --dry-run          run every check and report, changing nothing
+
+Refused if the partition is already mounted, already has an fstab entry, has no
+filesystem or one that is not ext4/xfs/vfat/ntfs, or if the mount point is
+already claimed. To prepare a raw disk instead, use 'hdd init'.
 EOF
 }
 

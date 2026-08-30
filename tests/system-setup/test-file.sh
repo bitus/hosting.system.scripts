@@ -30,14 +30,14 @@ run() {
     local out rc
     out="$(bash "$SCRIPT" "$@" 2>&1)"; rc=$?
     if [ "$rc" != "$want" ]; then bad "$id: rc=$rc want=$want :: $(tail -4 <<< "$out")"; return; fi
-    if [ -n "$pat" ] && ! grep -qE "$pat" <<< "$out"; then bad "$id: missing /$pat/ :: $(tail -4 <<< "$out")"; return; fi
+    if [ -n "$pat" ] && ! grep -qE -- "$pat" <<< "$out"; then bad "$id: missing /$pat/ :: $(tail -4 <<< "$out")"; return; fi
     ok
 }
 nomatch() {
     local id="$1" pat="$2"; shift 2
     local out
     out="$(bash "$SCRIPT" "$@" 2>&1)"
-    if grep -qE "$pat" <<< "$out"; then bad "$id: output unexpectedly matched /$pat/"; else ok; fi
+    if grep -qE -- "$pat" <<< "$out"; then bad "$id: output unexpectedly matched /$pat/"; else ok; fi
 }
 
 trap 'rm -rf "$TMP"' EXIT
