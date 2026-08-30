@@ -53,12 +53,21 @@ if [ "$(block_count '>>> system-setup docker >>>')" = 1 ]; then ok; else bad "C1
 if grep -qF "export DOCKER_HOME=\"$WS\"" "$BASHRC"; then ok; else bad "C1b: DOCKER_HOME not exported as $WS"; fi
 
 echo
-echo "=== 33: pre-existing workspace keeps its ownership and mode ==="
-sudo chmod 700 "$WS"; sudo chown nobody: "$WS"
+echo "=== 33: a writable pre-existing workspace keeps its ownership and mode ==="
+# The 2026-08-30 fix NARROWED this rule. It used to be "an existing workspace is
+# left entirely alone", which meant a workspace the user could not write stayed
+# unusable. Now: writable -> touch nothing; not writable -> repair the
+# DIRECTORY only. test-docker-workspace.sh covers the repair side and the
+# non-recursive guarantee; this case covers the leave-alone side.
+sudo chmod 751 "$WS"; sudo chown "${SUDO_USER:-$USER}": "$WS"
+sudo touch "$WS/foreign"; sudo chown nobody: "$WS/foreign"
 BEFORE="$(stat -c '%U:%G %a' "$WS")"
 run 33 0 "" docker
 AFTER="$(stat -c '%U:%G %a' "$WS")"
-if [ "$BEFORE" = "$AFTER" ]; then ok; else bad "33: workspace changed $BEFORE -> $AFTER"; fi
+if [ "$BEFORE" = "$AFTER" ]; then ok; else bad "33: a writable workspace changed $BEFORE -> $AFTER"; fi
+# and nothing inside it was touched either
+if [ "$(stat -c '%U' "$WS/foreign")" = nobody ]; then ok; else bad "33b: a file inside the workspace was chowned"; fi
+sudo rm -f "$WS/foreign"
 sudo chown "$USER:" "$WS"; sudo chmod 755 "$WS"
 
 echo

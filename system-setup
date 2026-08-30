@@ -2144,7 +2144,10 @@ docker_resolve_user() {
         || die "$E_PRECHECK" "cannot resolve the home directory of user '$DOCKER_USER'"
     [ -d "$DOCKER_USER_HOME" ] \
         || die "$E_PRECHECK" "home directory '$DOCKER_USER_HOME' of user '$DOCKER_USER' does not exist"
-    DOCKER_WORKSPACE="$DOCKER_USER_HOME/docker"
+    # A --workspace given on the command line wins; this is only the default,
+    # and it cannot be computed before the sudo re-exec because it depends on
+    # the ORIGINAL user's home.
+    [ -n "${DOCKER_WORKSPACE:-}" ] || DOCKER_WORKSPACE="$DOCKER_USER_HOME/docker"
     DOCKER_BASHRC="$DOCKER_USER_HOME/.bashrc"
     debug "invoking user: $DOCKER_USER (home: $DOCKER_USER_HOME)"
     return 0
@@ -2187,15 +2190,42 @@ docker_pool_write() {
 }
 
 # The workspace folder is created only when absent. An existing folder is left
-# ENTIRELY alone - no chown, no chmod, no recursion. It holds Compose projects
-# and bind-mounted data, so a recursive chown on a re-run could rewrite the
-# ownership of live container data.
+# An existing workspace is left alone when the user can already write to it.
+# When they cannot, only the DIRECTORY's ownership is repaired - never its
+# contents. It holds Compose projects and bind-mounted data, so a recursive
+# chown would rewrite the ownership of live container data.
 docker_workspace() {
+    if [ -e "$DOCKER_WORKSPACE" ] && [ ! -d "$DOCKER_WORKSPACE" ]; then
+        die "$E_ARGS" "$DOCKER_WORKSPACE exists and is not a directory"
+    fi
+
     if [ -d "$DOCKER_WORKSPACE" ]; then
-        debug "workspace exists; leaving ownership and mode untouched"
-        info "workspace folder already present: $DOCKER_WORKSPACE"
+        # Ask the USER whether they can write, rather than inferring it from
+        # mode bits and ownership. That inference gets ACLs, supplementary
+        # groups and setgid directories wrong, and this is the one question
+        # that matters.
+        if sudo -u "$DOCKER_USER" test -w "$DOCKER_WORKSPACE"; then
+            debug "workspace exists and is writable by $DOCKER_USER; touching nothing"
+            info "workspace folder already present: $DOCKER_WORKSPACE"
+            return 0
+        fi
+
+        # NON-RECURSIVE, and deliberately so. DO NOT ADD -R.
+        #
+        # The workspace holds Compose projects and bind-mounted container
+        # data. A recursive chown would rewrite the ownership of live data
+        # that containers are running against. Fixing the directory's own
+        # ownership grants exactly the access that is missing and leaves every
+        # file beneath it alone.
+        info "workspace folder $DOCKER_WORKSPACE is not writable by $DOCKER_USER; fixing the directory itself"
+        chown "$DOCKER_USER:" "$DOCKER_WORKSPACE" \
+            || die "$E_IO" "failed to set ownership on $DOCKER_WORKSPACE"
+        sudo -u "$DOCKER_USER" test -w "$DOCKER_WORKSPACE" \
+            || die "$E_IO" "$DOCKER_WORKSPACE is still not writable by $DOCKER_USER"
+        info "  ownership of the directory changed; nothing inside it was touched"
         return 0
     fi
+
     mkdir -p "$DOCKER_WORKSPACE" || die "$E_IO" "failed to create $DOCKER_WORKSPACE"
     chown "$DOCKER_USER:" "$DOCKER_WORKSPACE" || die "$E_IO" "failed to set ownership on $DOCKER_WORKSPACE"
     chmod 755 "$DOCKER_WORKSPACE"
@@ -2410,7 +2440,7 @@ docker_do_uninstall() {
 }
 
 cmd_docker() {
-    local opt_network="" opt_size="" opt_uninstall=0
+    local opt_network="" opt_size="" opt_workspace="" opt_uninstall=0
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -2423,6 +2453,10 @@ cmd_docker() {
                 [ $# -ge 2 ] || die "$E_ARGS" "--size requires a value"
                 opt_size="$2"; shift 2 ;;
             --size=*) opt_size="${1#*=}"; shift ;;
+            -w|--workspace)
+                [ $# -ge 2 ] || die "$E_ARGS" "--workspace requires a value"
+                opt_workspace="$2"; shift 2 ;;
+            --workspace=*) opt_workspace="${1#*=}"; shift ;;
             -u|--uninstall) opt_uninstall=1; shift ;;
             --) shift; [ $# -eq 0 ] || die "$E_ARGS" "unexpected argument: $1" ;;
             -*) die "$E_ARGS" "unknown flag: $1" ;;
@@ -2434,6 +2468,20 @@ cmd_docker() {
         || die "$E_ARGS" "--size requires --network"
     [ "$opt_uninstall" -eq 0 ] || [ -z "$opt_network" ] \
         || die "$E_ARGS" "--uninstall cannot be combined with --network"
+    [ "$opt_uninstall" -eq 0 ] || [ -z "$opt_workspace" ] \
+        || die "$E_ARGS" "--uninstall cannot be combined with --workspace"
+
+    if [ -n "$opt_workspace" ]; then
+        # Absolute only, and normalised the same way mount points are. A
+        # relative path would resolve against root's cwd after the sudo
+        # re-exec, which is never what the operator meant.
+        case "$opt_workspace" in
+            /*) ;;
+            *) die "$E_ARGS" "invalid --workspace: '$opt_workspace' (must be an absolute path)" ;;
+        esac
+        opt_workspace="$(normalise_mount "$opt_workspace")" \
+            || die "$E_ARGS" "refusing to use / as the workspace"
+    fi
 
     if [ -n "$opt_network" ]; then
         cidr_valid "$opt_network" \
@@ -2446,8 +2494,9 @@ cmd_docker() {
 
     DOCKER_NETWORK="$opt_network"
     DOCKER_SIZE="$opt_size"
+    DOCKER_WORKSPACE="$opt_workspace"
     DOCKER_UNINSTALL="$opt_uninstall"
-    debug "resolved: network=${DOCKER_NETWORK:-none} size=${DOCKER_SIZE:-n/a} uninstall=$DOCKER_UNINSTALL"
+    debug "resolved: network=${DOCKER_NETWORK:-none} size=${DOCKER_SIZE:-n/a} workspace=${DOCKER_WORKSPACE:-default} uninstall=$DOCKER_UNINSTALL"
 
     require_cmds jq
     require_sudo
@@ -2465,7 +2514,10 @@ cmd_docker() {
     local installed=0 pool_ok=0 ws_ok=0 home_ok=0
     if docker_installed; then installed=1; fi
     if [ -z "$DOCKER_NETWORK" ]; then pool_ok=1; elif docker_pool_matches; then pool_ok=1; fi
-    if [ -d "$DOCKER_WORKSPACE" ]; then ws_ok=1; fi
+    # Writable, not merely present: --workspace can now name a directory that
+    # exists but belongs to someone else, and "already configured" must not be
+    # reported for a workspace the operator cannot write to.
+    if [ -d "$DOCKER_WORKSPACE" ] && sudo -u "$DOCKER_USER" test -w "$DOCKER_WORKSPACE"; then ws_ok=1; fi
     if docker_home_present; then home_ok=1; fi
     debug "state: installed=$installed pool_ok=$pool_ok workspace=$ws_ok docker_home=$home_ok"
 
@@ -2888,10 +2940,11 @@ json_validate() {
     fi
 
     if json_has_node docker; then
-        json_fields docker enabled network size
+        json_fields docker enabled network size workspace
         json_expect docker enabled boolean
         json_expect docker network string
         json_expect docker size number
+        json_expect docker workspace string
         local dn ds
         dn="$(jf '.docker.network // empty')"
         ds="$(jf '.docker.size // empty')"
@@ -2907,6 +2960,18 @@ json_validate() {
         fi
         if [ "$(jf '.docker.enabled')" = "false" ] && [ -n "$dn" ]; then
             file_err "docker.network cannot be combined with docker.enabled: false"
+        fi
+        local dw
+        dw="$(jf '.docker.workspace // empty')"
+        if [ -n "$dw" ]; then
+            case "$dw" in
+                /) file_err "invalid docker.workspace: '/' " ;;
+                /*) ;;
+                *) file_err "invalid docker.workspace: '$dw' (must be an absolute path)" ;;
+            esac
+            if [ "$(jf '.docker.enabled')" = "false" ]; then
+                file_err "docker.workspace cannot be combined with docker.enabled: false"
+            fi
         fi
     fi
 
@@ -2995,7 +3060,7 @@ file_args_hdd() {
 }
 
 file_args_docker() {
-    local net size
+    local net size ws
     FILE_ARGS=()
     if [ "$(jf '.docker.enabled')" = "false" ]; then
         FILE_ARGS=(--uninstall)
@@ -3003,8 +3068,10 @@ file_args_docker() {
     fi
     net="$(jf '.docker.network // empty')"
     size="$(jf '.docker.size // empty')"
-    [ -z "$net" ] || FILE_ARGS+=(--network "$net")
+    ws="$(jf '.docker.workspace // empty')"
+    [ -z "$net" ]  || FILE_ARGS+=(--network "$net")
     [ -z "$size" ] || FILE_ARGS+=(--size "$size")
+    [ -z "$ws" ]   || FILE_ARGS+=(--workspace "$ws")
 }
 
 file_args_ntp() {
@@ -3436,7 +3503,7 @@ EOF
 
 help_docker() {
     cat << 'EOF'
-system-setup docker [-n <cidr> [-s <bits>]] | -u
+system-setup docker [-n <cidr> [-s <bits>]] [-w <path>] | -u
 
 Installs Docker by the official Debian procedure, creates the workspace
 folder, and exports DOCKER_HOME in ~/.bashrc. The shell shortcuts themselves
@@ -3445,11 +3512,17 @@ are installed by 'system-setup setup' and activate once DOCKER_HOME is set.
   -n, --network <cidr>   address pool that user-defined networks are carved
                          from (default-address-pools), e.g. 10.100.0.0/16
   -s, --size <bits>      prefix length of each network from that pool; default 24
+  -w, --workspace <path> where DOCKER_HOME points; absolute, default ~/docker
   -u, --uninstall        remove Docker and the DOCKER_HOME export
+
+An existing workspace is left alone when you can already write to it. If you
+cannot, only the DIRECTORY's ownership is repaired - never its contents, which
+may be bind-mounted into running containers. Changing --workspace between runs
+repoints DOCKER_HOME and leaves the old directory on disk.
 
 Applying a pool change restarts dockerd, which stops running containers.
 This command never deletes data. --uninstall leaves /var/lib/docker,
-/var/lib/containerd and $HOME/docker in place; removing them is yours to do.
+/var/lib/containerd and the workspace in place; removing them is yours to do.
 EOF
 }
 
