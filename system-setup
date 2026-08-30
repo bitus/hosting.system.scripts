@@ -65,7 +65,20 @@ declare -A DEP_PACKAGE=(
     [mkfs.xfs]="xfsprogs"
     [mkfs.vfat]="dosfstools"
     [mkfs.ntfs]="ntfs-3g"
+    [growpart]="cloud-guest-utils"
+    [partx]="util-linux"
+    [resize2fs]="e2fsprogs"
+    [xfs_growfs]="xfsprogs"
+    [fatresize]="fatresize"
+    [ntfsresize]="ntfs-3g"
 )
+
+# The tool that grows each filesystem, keyed the same way as the mkfs tables.
+declare -A RESIZE_CMD=( [ext4]="resize2fs" [xfs]="xfs_growfs" [vfat]="fatresize" [ntfs]="ntfsresize" )
+
+# Whether the filesystem must be MOUNTED to be grown. ext4 grows online and
+# xfs_growfs refuses anything else; vfat and ntfs are the other way round.
+declare -A RESIZE_MOUNTED=( [ext4]="yes" [xfs]="yes" [vfat]="no" [ntfs]="no" )
 
 # Filesystem table, keyed by the --type value, so cmd_hdd has one flow.
 # MKFS_FORCE for ntfs is "-F -f": -F forces, -f is fast-format (skip the
@@ -189,6 +202,15 @@ cleanup_tmpfiles() {
     for f in ${CLEANUP_TMPFILES[@]+"${CLEANUP_TMPFILES[@]}"}; do
         rm -f "$f"
     done
+    # `expand` may have mounted the operator's filesystem somewhere temporary to
+    # grow it. Unmounting here rather than only on the success path is the
+    # point: a die() inside the resize must not leave it mounted at a path
+    # nobody asked for and nobody will think to look at.
+    if [ -n "${HDD_EX_TMPMNT:-}" ]; then
+        umount "$HDD_EX_TMPMNT" 2>/dev/null || true
+        rmdir "$HDD_EX_TMPMNT" 2>/dev/null || true
+        HDD_EX_TMPMNT=""
+    fi
     return 0
 }
 trap cleanup_tmpfiles EXIT
@@ -1262,6 +1284,11 @@ partition_in_fstab() {
     ' "$FSTAB_FILE"
 }
 
+# part_size_bytes <part> -- the partition's size in bytes
+part_size_bytes() {
+    lsblk -bdnro SIZE "$1" 2>/dev/null | head -1
+}
+
 # growable_of <part> -- bytes the partition could grow by; empty and non-zero
 # when it cannot, or when growpart is unavailable.
 #
@@ -1572,7 +1599,206 @@ cmd_hdd() {
     esac
 }
 
-cmd_hdd_expand() { not_implemented "hdd expand" "F"; }
+# Set by hdd_expand_plan, read by the confirm step and hdd_expand_apply.
+# One decision, three consumers - so --dry-run and a real run cannot disagree
+# about what would happen.
+HDD_EX_PART=""      # the partition
+HDD_EX_DEV=""       # its disk
+HDD_EX_NUM=""       # its index on that disk
+HDD_EX_BYTES=""     # growable space immediately after it
+HDD_EX_TYPE=""      # our --type name for its filesystem
+HDD_EX_MOUNT=""     # where it is mounted now, empty if it is not
+HDD_EX_NEEDS=""     # none | mount | unmount: the mount-state change required
+HDD_EX_TMPMNT=""    # a temporary mount, while one exists
+
+hdd_expand_plan() {
+    local part="$1" fstype
+
+    HDD_EX_PART="$part"
+    dev_exists "$part" || die "$E_NOTFOUND" "block device '$part' not found"
+    part_is_partition "$part" \
+        || die "$E_ARGS" "$part is a whole disk; 'hdd expand' grows a partition"
+
+    HDD_EX_DEV="$(part_device "$part")" || die "$E_IO" "could not find the disk holding $part"
+    HDD_EX_NUM="$(part_number "$part")" || die "$E_IO" "could not find the partition number of $part"
+
+    fstype="$(part_fstype "$part")"
+    [ -n "$fstype" ] || die "$E_ARGS" "$part has no filesystem to grow"
+    HDD_EX_TYPE="$(hdd_type_of_fstype "$fstype")" \
+        || die "$E_ARGS" "$part is formatted as '$fstype', not one of: ext4 xfs vfat ntfs"
+
+    # Both prechecks before any measurement: "growpart is missing" (exit 1) and
+    # "there is nothing to grow into" (exit 2) are different answers, and the
+    # operator needs to be told which one they got.
+    require_cmds growpart partx "${RESIZE_CMD[$HDD_EX_TYPE]}"
+
+    HDD_EX_BYTES="$(growable_of "$part")" || HDD_EX_BYTES=""
+    [ -n "$HDD_EX_BYTES" ] \
+        || die "$E_ARGS" "$part has no free space immediately after it; growpart can only extend into the space that follows a partition"
+
+    HDD_EX_MOUNT="$(mount_point_of "$part")"
+    if [ "${RESIZE_MOUNTED[$HDD_EX_TYPE]}" = "yes" ]; then
+        if [ -n "$HDD_EX_MOUNT" ]; then HDD_EX_NEEDS="none"; else HDD_EX_NEEDS="mount"; fi
+    else
+        if [ -n "$HDD_EX_MOUNT" ]; then HDD_EX_NEEDS="unmount"; else HDD_EX_NEEDS="none"; fi
+    fi
+    return 0
+}
+
+# hdd_expand_report -- the plan in words, shared by --dry-run and the real run
+# so that the two describe the same operation in the same terms.
+hdd_expand_report() {
+    info "  partition: $HDD_EX_PART (${HDD_EX_TYPE}, disk $HDD_EX_DEV, number $HDD_EX_NUM)"
+    info "  growable:  $(human_bytes "$HDD_EX_BYTES")"
+    case "$HDD_EX_NEEDS" in
+        none)    info "  mounted:   ${HDD_EX_MOUNT:-no} - no change of mount state needed" ;;
+        mount)   info "  mounted:   no - it must be mounted temporarily to grow $HDD_EX_TYPE" ;;
+        unmount) info "  mounted:   $HDD_EX_MOUNT - it must be unmounted to grow $HDD_EX_TYPE, then remounted there" ;;
+    esac
+    return 0
+}
+
+# hdd_resize_fs <mountpoint> -- grow the filesystem to fill the partition.
+#
+# xfs_growfs takes a MOUNT POINT; every other tool takes the device. Getting
+# that backwards fails with an error that does not say so.
+hdd_resize_fs() {
+    local mnt="$1" part="$HDD_EX_PART"
+    case "$HDD_EX_TYPE" in
+        ext4) resize2fs "$part" >/dev/null 2>&1 || die "$E_IO" "resize2fs failed on $part" ;;
+        xfs)  xfs_growfs "$mnt" >/dev/null 2>&1 || die "$E_IO" "xfs_growfs failed on $mnt" ;;
+        vfat)
+            # fatresize computes `-s max` in WHOLE-DISK coordinates rather
+            # than the partition's, and lands past the end of the device;
+            # passing the exact partition size trips an assertion inside
+            # libparted and aborts with SIGABRT. Verified against fatresize
+            # 1.1.0: one MiB short of the partition is the largest value that
+            # works, and that MiB is not worth chasing.
+            local target
+            target="$(( $(part_size_bytes "$part") - 1048576 ))"
+            [ "$target" -gt 0 ] || die "$E_IO" "$part is too small to resize"
+            fatresize -f -s "$target" "$part" >/dev/null 2>&1 \
+                || die "$E_IO" "fatresize failed on $part"
+            ;;
+        ntfs)
+            # Verified against ntfs-3g on Debian 13: GROWING needs no stdin and
+            # asks nothing - the "are you sure" prompt belongs to the shrink
+            # path. --force is kept because it is what carries a volume flagged
+            # dirty, and because it costs nothing here.
+            #
+            # Deliberately NOT `printf 'y' | ntfsresize`: piping into a program
+            # that never reads is how the 2026-08-26 --purge work produced a
+            # SIGPIPE that pipefail reported as the command failing.
+            ntfsresize --force "$part" >/dev/null 2>&1 \
+                || die "$E_IO" "ntfsresize failed on $part (a volume flagged dirty may need ntfsfix or chkdsk first)"
+            ;;
+    esac
+    return 0
+}
+
+hdd_expand_apply() {
+    local part="$HDD_EX_PART" before after mnt
+
+    before="$(part_size_bytes "$part")"
+    info "growing $part into $(human_bytes "$HDD_EX_BYTES")"
+    growpart "$HDD_EX_DEV" "$HDD_EX_NUM" >/dev/null 2>&1 \
+        || die "$E_IO" "growpart failed on $HDD_EX_DEV $HDD_EX_NUM"
+    partx -u "$HDD_EX_DEV" >/dev/null 2>&1 || true
+    udevadm settle >/dev/null 2>&1 || true
+
+    case "$HDD_EX_NEEDS" in
+        none)
+            hdd_resize_fs "$HDD_EX_MOUNT"
+            ;;
+        mount)
+            # Mounted rather than resized offline on purpose: resize2fs refuses
+            # an unchecked unmounted filesystem with "Please run 'e2fsck -f'
+            # first", and running a data-modifying fsck on the operator's
+            # behalf is not this command's job.
+            HDD_EX_TMPMNT="$(mktemp -d)"
+            mount "$part" "$HDD_EX_TMPMNT" || die "$E_IO" "failed to mount $part to grow it"
+            hdd_resize_fs "$HDD_EX_TMPMNT"
+            umount "$HDD_EX_TMPMNT" || die "$E_IO" "failed to unmount $HDD_EX_TMPMNT after growing"
+            rmdir "$HDD_EX_TMPMNT" 2>/dev/null || true
+            HDD_EX_TMPMNT=""
+            ;;
+        unmount)
+            umount "$HDD_EX_MOUNT" || die "$E_IO" "failed to unmount $HDD_EX_MOUNT (is something using it?)"
+            hdd_resize_fs ""
+            mount "$part" "$HDD_EX_MOUNT" || die "$E_IO" "grew $part but failed to remount it at $HDD_EX_MOUNT"
+            ;;
+    esac
+
+    after="$(part_size_bytes "$part")"
+    info "hdd expanded:"
+    info "  partition: $part"
+    info "  size:      $(human_bytes "$before") -> $(human_bytes "$after")"
+    mnt="$(mount_point_of "$part")"
+    info "  mounted:   ${mnt:-no}"
+    return 0
+}
+
+cmd_hdd_expand() {
+    local opt_part="" opt_dryrun=0
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_hdd_expand; exit "$E_OK" ;;
+            -p|--partition)
+                [ $# -ge 2 ] || die "$E_ARGS" "--partition requires a value"
+                opt_part="$2"; shift 2 ;;
+            --partition=*) opt_part="${1#*=}"; shift ;;
+            -f|--force) FORCE=1; shift ;;
+            --dry-run) opt_dryrun=1; shift ;;
+            --) shift; [ $# -eq 0 ] || die "$E_ARGS" "unexpected argument: $1" ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) die "$E_ARGS" "unexpected argument: $1" ;;
+        esac
+    done
+
+    [ -n "$opt_part" ] || die "$E_ARGS" "--partition is required"
+
+    require_cmds blkid findmnt mount
+    require_sudo
+    elevate "${ORIG_ARGS[@]}"
+
+    hdd_expand_plan "$opt_part"
+    debug "plan: type=$HDD_EX_TYPE bytes=$HDD_EX_BYTES mount='${HDD_EX_MOUNT:-}' needs=$HDD_EX_NEEDS"
+
+    if [ "$opt_dryrun" = "1" ]; then
+        info "dry run: $opt_part can be expanded"
+        hdd_expand_report
+        info "nothing was changed"
+        exit "$E_OK"
+    fi
+
+    info "expanding $opt_part:"
+    hdd_expand_report
+
+    # Confirmation is required exactly when the mount state has to change - and
+    # the two directions are not equally recoverable, so they are not gated the
+    # same way.
+    case "$HDD_EX_NEEDS" in
+        none) ;;
+        mount)
+            # Mounting a filesystem the operator has deliberately left offline
+            # is a side effect they may not want at all. An explicit flag, not
+            # a yes/no: this one cannot be answered into existence at a prompt.
+            [ "$FORCE" = "1" ] || die "$E_EXISTS" \
+                "$opt_part is not mounted, and growing $HDD_EX_TYPE requires it to be; re-run with --force to mount it temporarily"
+            ;;
+        unmount)
+            # Unmount and remount at the same place: the end state matches the
+            # start state, so a prompt is proportionate.
+            if ! confirm "Unmount $HDD_EX_MOUNT, grow the filesystem, and remount it there?"; then
+                info "cancelled; nothing was changed"
+                exit "$E_OK"
+            fi
+            ;;
+    esac
+
+    hdd_expand_apply
+}
 
 # Set by hdd_remove_checks, read by hdd_remove_apply. Globals rather than a
 # return value because a function called through $( ) runs in a subshell and
@@ -3150,6 +3376,25 @@ Adopts a partition that ALREADY has a filesystem: mounts it and records it in
 Refused if the partition is already mounted, already has an fstab entry, has no
 filesystem or one that is not ext4/xfs/vfat/ntfs, or if the mount point is
 already claimed. To prepare a raw disk instead, use 'hdd init'.
+EOF
+}
+
+help_hdd_expand() {
+    cat << 'EOF'
+system-setup hdd expand -p <partition> [-f] [--dry-run]
+
+Grows a partition into the free space that FOLLOWS it, then grows its
+filesystem to match. A partition with another partition after it cannot grow,
+however much space the disk has elsewhere.
+
+  -p, --partition <part> the partition to grow
+  -f, --force            permit a change of mount state without asking
+      --dry-run          report what would happen, changing nothing
+
+Filesystems disagree about being resized while mounted: ext4 and xfs must be
+mounted, vfat and ntfs must not. Confirmation - or --force - is required
+exactly when the mount state has to change; when the partition is already in
+the state its filesystem needs, expand proceeds without asking.
 EOF
 }
 

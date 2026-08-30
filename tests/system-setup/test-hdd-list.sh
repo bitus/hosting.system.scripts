@@ -156,7 +156,7 @@ echo "=== the subcommands are reachable through the router ==="
 # `add` is built (phase D), so it fails on its own argument check rather than
 # on the placeholder. A stub is load-bearing only until it is replaced.
 run S1 2 "--partition is required" hdd add
-run S2 1 "not implemented" hdd expand
+run S2 2 "--partition is required" hdd expand
 run S3 2 "one of --partition or --mount is required" hdd remove
 
 echo
