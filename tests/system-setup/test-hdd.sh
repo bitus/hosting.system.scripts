@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Host tests for `system-setup hdd` (plan phase 8, test cases 43-57).
+# Host tests for `system-setup hdd init` (plan phase 8, test cases 43-57).
 #
 # Runs entirely against LOOP DEVICES backed by files in /tmp - no real disk is
 # touched, and the whole classification matrix (blank / single / multi-partition
@@ -68,7 +68,7 @@ sudo sed -i "\#$MNT#d;\#$ALT#d" /etc/fstab
 echo
 echo "=== 43: blank device -> partition, format, mount, UUID in fstab ==="
 fresh_loop
-run 43 0 "hdd configured" hdd --device "$LOOP" --mount "$MNT" --type ext4
+run 43 0 "hdd configured" hdd init --device "$LOOP" --mount "$MNT" --type ext4
 UUID="$(sudo blkid -s UUID -o value "${LOOP}p1" 2>/dev/null || sudo blkid -s UUID -o value "${LOOP}1" 2>/dev/null)"
 assert 43b "[ -n '$UUID' ]"
 assert 43c "sudo grep -q 'UUID=$UUID' /etc/fstab"
@@ -78,15 +78,15 @@ assert 43f "! sudo grep -qE '^${LOOP}[p]?1[[:space:]]' /etc/fstab"
 
 echo
 echo "=== 44: identical re-run is idempotent ==="
-run 44 0 "already configured" hdd --device "$LOOP" --mount "$MNT" --type ext4
+run 44 0 "already configured" hdd init --device "$LOOP" --mount "$MNT" --type ext4
 assert 44b "[ \"\$(fstab_lines 'UUID=$UUID')\" = 1 ]"
 
 echo
 echo "=== 47/48: different filesystem without --force is refused ==="
-run 47 4 "not 'xfs'" hdd --device "$LOOP" --mount "$MNT" --type xfs
+run 47 4 "not 'xfs'" hdd init --device "$LOOP" --mount "$MNT" --type xfs
 assert 47b "[ \"\$(sudo blkid -s TYPE -o value ${LOOP}p1)\" = ext4 ]"
 echo "--- with --force it reformats ---"
-run 48 0 "hdd configured" hdd --device "$LOOP" --mount "$MNT" --type xfs --force
+run 48 0 "hdd configured" hdd init --device "$LOOP" --mount "$MNT" --type xfs --force
 assert 48b "[ \"\$(sudo blkid -s TYPE -o value ${LOOP}p1)\" = xfs ]"
 UUID="$(sudo blkid -s UUID -o value "${LOOP}p1")"
 assert 48c "sudo grep -q 'UUID=$UUID' /etc/fstab"
@@ -95,10 +95,10 @@ echo
 echo "=== 45/46: correct fs mounted at the wrong place ==="
 sudo umount "$MNT" 2>/dev/null || true
 sudo mount "${LOOP}p1" "$ALT"
-run 45 4 "mounted at $ALT" hdd --device "$LOOP" --mount "$MNT" --type xfs
+run 45 4 "mounted at $ALT" hdd init --device "$LOOP" --mount "$MNT" --type xfs
 assert 45b "[ \"\$(findmnt -nro TARGET -S ${LOOP}p1)\" = '$ALT' ]"
 echo "--- with --force it moves ---"
-run 46 0 "hdd configured" hdd --device "$LOOP" --mount "$MNT" --type xfs --force
+run 46 0 "hdd configured" hdd init --device "$LOOP" --mount "$MNT" --type xfs --force
 assert 46b "[ \"\$(findmnt -nro TARGET -S ${LOOP}p1)\" = '$MNT' ]"
 
 echo
@@ -106,28 +106,28 @@ echo "=== 49: more than one partition is unsafe; --force overrides ==="
 fresh_loop
 printf 'label: gpt\nstart=2048, size=200M, type=linux\nstart=,  type=linux\n' | sudo sfdisk "$LOOP" >/dev/null 2>&1
 sudo udevadm settle
-run 49 4 "refusing to touch" hdd --device "$LOOP" --mount "$MNT"
+run 49 4 "refusing to touch" hdd init --device "$LOOP" --mount "$MNT"
 echo "--- --force proceeds without prompting: it means \"I mean it\" ---"
 # --force both permits the destructive action and skips the confirmation, per
 # git-utils confirm(). There is no second gate by design: the flag is explicit
 # and is not expressible from the JSON file, so it can only come from a human.
-run 49b 0 "hdd configured" hdd --device "$LOOP" --mount "$MNT" --force
+run 49b 0 "hdd configured" hdd init --device "$LOOP" --mount "$MNT" --force
 
 echo
 echo "=== 50: a raw filesystem signature with no partition table is unsafe ==="
 fresh_loop
 sudo mkfs.ext4 -F "$LOOP" >/dev/null 2>&1
-run 50 4 "refusing to touch" hdd --device "$LOOP" --mount "$MNT"
+run 50 4 "refusing to touch" hdd init --device "$LOOP" --mount "$MNT"
 
 echo
 echo "=== 52: missing device ==="
-run 52 5 "not found" hdd --device /dev/definitely-not-here --mount "$MNT"
+run 52 5 "not found" hdd init --device /dev/definitely-not-here --mount "$MNT"
 
 echo
 echo "=== 53: a legacy device-path fstab line is replaced, not duplicated ==="
 fresh_loop
 sudo sh -c "printf '%s %s ext4 defaults 0 0\n' '${LOOP}p1' '$MNT' >> /etc/fstab"
-run 53 0 "hdd configured" hdd --device "$LOOP" --mount "$MNT" --type ext4
+run 53 0 "hdd configured" hdd init --device "$LOOP" --mount "$MNT" --type ext4
 assert 53b "! sudo grep -qE '^${LOOP}p1[[:space:]]' /etc/fstab"
 UUID="$(sudo blkid -s UUID -o value "${LOOP}p1")"
 assert 53c "[ \"\$(fstab_lines '$MNT')\" = 1 ]"
@@ -142,7 +142,7 @@ BEFORE="$(sudo md5sum /etc/fstab | cut -d' ' -f1)"
 # a bogus entry that mount -a will reject
 sudo sh -c "printf 'UUID=00000000-dead-dead-dead-000000000000 /tmp/ss-nope ext4 defaults 0 2\n' >> /etc/fstab"
 BROKEN="$(sudo md5sum /etc/fstab | cut -d' ' -f1)"
-run 54 3 "restored" hdd --device "$LOOP" --mount "$MNT" --type ext4
+run 54 3 "restored" hdd init --device "$LOOP" --mount "$MNT" --type ext4
 AFTER="$(sudo md5sum /etc/fstab | cut -d' ' -f1)"
 if [ "$AFTER" = "$BROKEN" ]; then ok; else bad "54b: fstab is neither the pre-run state nor unchanged ($AFTER)"; fi
 sudo sed -i '/ss-nope/d' /etc/fstab
@@ -151,7 +151,7 @@ assert 54c "[ \"\$(sudo md5sum /etc/fstab | cut -d' ' -f1)\" = '$BEFORE' ]"
 echo
 echo "=== 55: a bare mount name is normalised to an absolute path ==="
 fresh_loop
-run 55 0 "mount:  /ss-bare" hdd --device "$LOOP" --mount ss-bare --type ext4
+run 55 0 "mount:  /ss-bare" hdd init --device "$LOOP" --mount ss-bare --type ext4
 assert 55b "findmnt -n /ss-bare >/dev/null"
 sudo umount /ss-bare 2>/dev/null || true
 sudo sed -i '\#/ss-bare#d' /etc/fstab
@@ -160,8 +160,8 @@ sudo rmdir /ss-bare 2>/dev/null || true
 
 echo
 echo "=== 56/57: argument and dependency errors ==="
-run 56 2 "invalid --type" hdd --device "$LOOP" --type btrfs
-run 57 2 "refusing to use /" hdd --device "$LOOP" --mount /
+run 56 2 "invalid --type" hdd init --device "$LOOP" --type btrfs
+run 57 2 "refusing to use /" hdd init --device "$LOOP" --mount /
 
 echo
 echo "passed: $PASS   failed: $FAIL"

@@ -182,9 +182,9 @@ r n1 2 'takes no positional arguments'         ntp 10.10.10.254
 r n2 2 'cannot be combined'                    ntp -u -s 10.10.10.254
 r n3 2 'invalid NTP server'                    ntp -s 'bad_name.local'
 r n4 2 'unknown flag'                          ntp --nope
-r t1 2 'invalid --type'                        hdd --type btrfs
-r t2 2 'unexpected argument'                   hdd extra
-r t3 2 'unknown flag'                          hdd --nope
+r t1 2 'invalid --type'                        hdd init --type btrfs
+r t2 2 'unexpected argument'                   hdd init extra
+r t3 2 'unknown flag'                          hdd init --nope
 
 echo "== 76-80: router =="
 # Bare invocation now depends on whether stdin is a TTY, so the mode must be

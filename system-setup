@@ -97,6 +97,28 @@ else
 fi
 readonly SELF
 
+# Every disk tool this script drives - sfdisk, blkid, findmnt, the mkfs.*
+# family, and the sfdisk that growpart shells out to - lives in /usr/sbin,
+# which is NOT on a non-root PATH on Debian.
+#
+# require_cmds was already taught to look there, but that only fixes the
+# PRE-CHECK: the actual invocations resolve through PATH at run time. Under
+# sudo the gap is masked by secure_path; it reappears whenever the script is
+# sourced, or run by a root process with a stripped PATH, and the failure is
+# unhelpful - "command not found" for blkid, and for growpart the second-hand
+# "Did not have sfdisk or sgdisk in PATH".
+# INHERITED_PATH is captured first and is what cmd_setup consults. It must
+# decide whether ~/.bashrc needs a PATH entry by looking at the PATH the
+# operator will actually have - not at the one augmented just below, which
+# would always contain sbin and so would always answer "nothing to add".
+readonly INHERITED_PATH="$PATH"
+
+case ":$PATH:" in
+    *:/usr/sbin:*) ;;
+    *) PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin" ;;
+esac
+export PATH
+
 # ---------------------------------------------------------------------------
 # 3. Output helpers
 # ---------------------------------------------------------------------------
@@ -1035,6 +1057,149 @@ dev_state() {
     return 0
 }
 
+# human_bytes <n> -- 1536 -> 1.5K. Empty input prints a dash, so callers can
+# pass an unset value straight through to a table cell.
+human_bytes() {
+    [ -n "${1:-}" ] || { printf -- '-'; return 0; }
+    awk -v b="$1" 'BEGIN {
+        split("B K M G T P", u, " ")
+        i = 1
+        while (b >= 1024 && i < 6) { b /= 1024; i++ }
+        if (i == 1) printf "%d%s", b, u[i]
+        else        printf "%.1f%s", b, u[i]
+    }'
+}
+
+# fstab_state <part> -- managed | yes | no
+#
+# The three-way answer is the point: "managed" is ours to change, "yes" is
+# someone else's entry that must be refused, and "no" is absent. Collapsing
+# the first two would make `remove` delete entries it did not write.
+fstab_state() {
+    if partition_managed "$1"; then printf 'managed'
+    elif partition_in_fstab "$1"; then printf 'yes'
+    else printf 'no'
+    fi
+}
+
+# --- inspection layer ------------------------------------------------------
+#
+# Read-only predicates shared by every hdd subcommand. None of these write,
+# mount, or prompt.
+
+# dev_disks -- every whole disk, one per line. Loop devices are TYPE=loop and
+# optical drives TYPE=rom, so filtering on "disk" excludes both.
+dev_disks() {
+    lsblk -dnro NAME,TYPE 2>/dev/null | awk '$2 == "disk" { print "/dev/" $1 }'
+}
+
+# part_device <part> -- the whole disk a partition belongs to.
+# Read from the kernel rather than by trimming the name: /dev/sdb1 -> /dev/sdb
+# but /dev/nvme0n1p1 -> /dev/nvme0n1 and /dev/loop0p1 -> /dev/loop0, and no
+# string rule covers all three.
+part_device() {
+    local pk
+    pk="$(lsblk -nro PKNAME "$1" 2>/dev/null | head -1)"
+    [ -n "$pk" ] || return 1
+    printf '/dev/%s' "$pk"
+}
+
+# part_number <part> -- its index within the partition table
+part_number() {
+    local n
+    n="$(basename "$1")"
+    [ -f "/sys/class/block/$n/partition" ] || return 1
+    cat "/sys/class/block/$n/partition"
+}
+
+# part_is_partition <part> -- true for a partition, false for a whole disk
+part_is_partition() {
+    [ "$(lsblk -dnro TYPE "$1" 2>/dev/null | head -1)" = "part" ]
+}
+
+# partition_managed <part> -- true when fstab holds a block keyed on <part>.
+# "Ours to change."
+partition_managed() {
+    [ -f "$FSTAB_FILE" ] || return 1
+    grep -qF "$(block_marker_open "$1")" "$FSTAB_FILE"
+}
+
+# partition_in_fstab <part> -- true when <part> appears in fstab AT ALL.
+#
+# Deliberately distinct from partition_managed: `remove` and `list` must tell
+# "someone else's entry" from "no entry", and those need opposite treatment.
+#
+# Matches the device path, UUID= and PARTUUID= forms. An operator's own entry
+# is almost always UUID=, so matching only the device path would report "not in
+# fstab" for exactly the entries this tool must refuse to touch.
+partition_in_fstab() {
+    local part="$1" uuid puuid
+    [ -f "$FSTAB_FILE" ] || return 1
+    uuid="$(part_uuid "$part")"
+    puuid="$(blkid -s PARTUUID -o value "$part" 2>/dev/null || true)"
+    awk -v p="$part" -v u="$uuid" -v pu="$puuid" '
+        /^[[:space:]]*#/ { next }
+        /^[[:space:]]*$/ { next }
+        {
+            if ($1 == p) { found = 1; exit }
+            if (u  != "" && $1 == "UUID=" u)      { found = 1; exit }
+            if (pu != "" && $1 == "PARTUUID=" pu) { found = 1; exit }
+        }
+        END { exit(found ? 0 : 1) }
+    ' "$FSTAB_FILE"
+}
+
+# growable_of <part> -- bytes the partition could grow by; empty and non-zero
+# when it cannot, or when growpart is unavailable.
+#
+# Parses growpart's OUTPUT, never its exit code. Verified on Debian 13:
+#
+#   growable      CHANGE:   partition=1 ... old: size=409600 new: size=1046495   exit 0
+#   not growable  NOCHANGE: partition 1 is size 1046495. it cannot be grown      exit 1
+#
+# NOCHANGE exits 1, which is indistinguishable from a real failure by status
+# alone - keying on the exit code would report "no free space" and "growpart is
+# broken" identically. Callers decide what a missing growpart means: `list`
+# leaves the column blank, `expand` pre-checks it as a hard dependency.
+growable_of() {
+    local part="$1" dev num out sectors secsz
+    command -v growpart >/dev/null 2>&1 || return 1
+    dev="$(part_device "$part")" || return 1
+    num="$(part_number "$part")" || return 1
+
+    out="$(growpart --dry-run "$dev" "$num" 2>&1 || true)"
+    case "$out" in
+        CHANGE:*) ;;
+        *) return 1 ;;
+    esac
+
+    sectors="$(awk '
+        /^CHANGE:/ {
+            for (i = 1; i <= NF; i++) {
+                if ($i == "old:") { split($(i + 1), a, "="); o = a[2] }
+                if ($i == "new:") { split($(i + 1), b, "="); n = b[2] }
+            }
+            if (o != "" && n != "") { print n - o }
+            exit
+        }' <<< "$out")"
+    [ -n "$sectors" ] || return 1
+    [ "$sectors" -gt 0 ] || return 1
+
+    secsz="$(cat "/sys/class/block/$(basename "$dev")/queue/logical_block_size" 2>/dev/null || true)"
+    [ -n "$secsz" ] || secsz=512
+    printf '%s' "$(( sectors * secsz ))"
+}
+
+# part_free_space <part> -- filesystem free bytes; empty when not mounted.
+# An unmounted filesystem's free space needs per-filesystem tooling and is
+# deliberately not attempted.
+part_free_space() {
+    local mnt
+    mnt="$(mount_point_of "$1")"
+    [ -n "$mnt" ] || return 1
+    df -B1 --output=avail "$mnt" 2>/dev/null | tail -1 | tr -d ' '
+}
+
 hdd_describe() {
     local dev="$1" p
     lsblk -o NAME,SIZE,FSTYPE,MOUNTPOINT "$dev" 2>/dev/null || true
@@ -1149,12 +1314,100 @@ hdd_already_configured() {
     return 0
 }
 
+cmd_hdd_list() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_hdd_list; exit "$E_OK" ;;
+            --) shift; [ $# -eq 0 ] || die "$E_ARGS" "unexpected argument: $1" ;;
+            *) die "$E_ARGS" "unexpected argument: $1" ;;
+        esac
+    done
+
+    require_cmds lsblk blkid
+    require_sudo
+    # Elevating a read-only command looks heavy-handed, but the block devices
+    # are root:disk - blkid cannot read them as an ordinary user, and every
+    # column but DEVICE and SIZE would come back blank.
+    elevate "${ORIG_ARGS[@]}"
+
+    local -a rows=()
+    rows+=("DEVICE	PARTITION	FS	MOUNT	SIZE	GROWABLE	FREE	FSTAB")
+
+    local dev part parts fs mnt size grow free state
+    for dev in $(dev_disks); do
+        parts="$(dev_partitions "$dev")"
+        if [ -z "$parts" ]; then
+            size="$(human_bytes "$(lsblk -bdno SIZE "$dev" 2>/dev/null || true)")"
+            rows+=("$dev	-	-	-	$size	-	-	-")
+            continue
+        fi
+        for part in $parts; do
+            part="/dev/$part"
+            fs="$(part_fstype "$part")"
+            mnt="$(mount_point_of "$part")"
+            size="$(human_bytes "$(lsblk -bdno SIZE "$part" 2>/dev/null || true)")"
+            grow="$(human_bytes "$(growable_of "$part" || true)")"
+            free="$(human_bytes "$(part_free_space "$part" || true)")"
+            state="$(fstab_state "$part")"
+            rows+=("$dev	$part	${fs:--}	${mnt:--}	$size	$grow	$free	$state")
+        done
+    done
+
+    # Column widths are computed from the data. A fixed layout wraps on the
+    # first host with a long mount path, and mawk (Debian's default awk) has
+    # neither true 2-D arrays nor sprintf("%-*s"), so both are done by hand.
+    printf '%b
+' "${rows[@]}" | awk -F'	' '
+        { for (i = 1; i <= NF; i++) { if (length($i) > w[i]) w[i] = length($i)
+                                      cell[NR "," i] = $i }
+          nr = NR; nf = NF }
+        END {
+            for (r = 1; r <= nr; r++) {
+                line = ""
+                for (i = 1; i <= nf; i++) {
+                    v = cell[r "," i]
+                    line = line v
+                    if (i < nf) { pad = w[i] - length(v) + 2; while (pad-- > 0) line = line " " }
+                }
+                print line
+            }
+        }'
+
+    if ! command -v growpart >/dev/null 2>&1; then
+        info ""
+        info "note: GROWABLE is blank because growpart is not installed (sudo apt install cloud-guest-utils -y)"
+    fi
+    return 0
+}
+
+# hdd is a command group, in the shape git-utils uses for `repo`.
 cmd_hdd() {
+    local sub="${1:-}"
+    case "$sub" in
+        -h|--help) help_hdd; exit "$E_OK" ;;
+        init)   shift; cmd_hdd_init   ${1+"$@"} ;;
+        list)   shift; cmd_hdd_list   ${1+"$@"} ;;
+        add)    shift; cmd_hdd_add    ${1+"$@"} ;;
+        expand) shift; cmd_hdd_expand ${1+"$@"} ;;
+        remove) shift; cmd_hdd_remove ${1+"$@"} ;;
+        "")     help_hdd >&2; exit "$E_ARGS" ;;
+        *)      printf 'error: unknown hdd subcommand: %s
+' "$sub" >&2
+                help_hdd >&2
+                exit "$E_ARGS" ;;
+    esac
+}
+
+cmd_hdd_add()    { not_implemented "hdd add" "D"; }
+cmd_hdd_expand() { not_implemented "hdd expand" "F"; }
+cmd_hdd_remove() { not_implemented "hdd remove" "E"; }
+
+cmd_hdd_init() {
     local opt_device="$DEFAULT_DEVICE" opt_mount="$DEFAULT_MOUNT" opt_type="$DEFAULT_FSTYPE"
 
     while [ $# -gt 0 ]; do
         case "$1" in
-            -h|--help) help_hdd; exit "$E_OK" ;;
+            -h|--help) help_hdd_init; exit "$E_OK" ;;
             -d|--device)
                 [ $# -ge 2 ] || die "$E_ARGS" "--device requires a value"
                 opt_device="$2"; shift 2 ;;
@@ -2253,17 +2506,21 @@ cmd_file() {
     local first_rc=0 cmd rc out label
 
     for node in "${present[@]}"; do
+        # `label` is what the --dry-run plan line prints, and it is not always
+        # the node name: the network node runs `ip`, and the hdd node means
+        # `hdd init` specifically - the other hdd subcommands have no document
+        # representation.
         case "$node" in
-            network) cmd=cmd_ip; file_args_network ;;
-            tz)      cmd=cmd_tz; file_args_tz ;;
-            hdd)     cmd=cmd_hdd; file_args_hdd ;;
-            docker)  cmd=cmd_docker; file_args_docker ;;
-            ntp)     cmd=cmd_ntp; file_args_ntp ;;
+            network) cmd=cmd_ip;       label="ip";       file_args_network ;;
+            tz)      cmd=cmd_tz;       label="tz";       file_args_tz ;;
+            hdd)     cmd=cmd_hdd_init; label="hdd init"; file_args_hdd ;;
+            docker)  cmd=cmd_docker;   label="docker";   file_args_docker ;;
+            ntp)     cmd=cmd_ntp;      label="ntp";      file_args_ntp ;;
         esac
 
         if [ "$FILE_DRYRUN" -eq 1 ]; then
             info ""
-            info "[$node] would run: system-setup ${node/network/ip} $(join_sp ${FILE_ARGS[@]+"${FILE_ARGS[@]}"})"
+            info "[$node] would run: system-setup $label $(join_sp ${FILE_ARGS[@]+"${FILE_ARGS[@]}"})"
             results+=("$node|0|dry-run")
             continue
         fi
@@ -2385,7 +2642,9 @@ cmd_setup() {
     fi
 
     local bashrc="$HOME/.bashrc" path_needed=1
-    case ":$PATH:" in
+    # INHERITED_PATH, not PATH: see where it is captured. Asking the augmented
+    # PATH would always find sbin and never write the block.
+    case ":$INHERITED_PATH:" in
         *":$sbin:"*) path_needed=0 ;;
     esac
 
@@ -2422,7 +2681,7 @@ system-setup - basic configuration for freshly deployed Debian 12 VMs
 
 Usage:
   system-setup ip <ip[/mask]> -n <fqdn> [-m <mask>] [-g <gw>] [-d <dns>]... [--no-ipv6] [--no-restart]
-  system-setup hdd [-d <device>] [-m <mount>] [-t <ext4|xfs|vfat|ntfs>] [-f]
+  system-setup hdd <init|add|expand|remove|list> [...]
   system-setup docker [-n <cidr> [-s <bits>]] | -u
   system-setup ntp [-s <server>]... | -u
   system-setup tz <zone>
@@ -2464,18 +2723,49 @@ EOF
 
 help_hdd() {
     cat << 'EOF'
-system-setup hdd [-d <device>] [-m <mount>] [-t <ext4|xfs|vfat|ntfs>] [-f]
+system-setup hdd <subcommand>
 
-Partitions, formats and mounts a second disk, recording it in /etc/fstab by UUID.
+  init    prepare a raw disk: partition, format, mount, record in fstab
+  add     adopt an existing partition: mount it and record it in fstab
+  expand  grow a partition into free space, then grow its filesystem
+  remove  drop a managed mount: unmount and delete its fstab entry
+  list    show every disk, partition, mount and fstab state
+
+Run 'system-setup hdd <subcommand> -h' for the details of one.
+EOF
+}
+
+help_hdd_init() {
+    cat << 'EOF'
+system-setup hdd init [-d <device>] [-m <mount>] [-t <ext4|xfs|vfat|ntfs>]
+
+Prepares a RAW disk: one partition spanning it, a filesystem, a mount, and an
+/etc/fstab entry recorded by UUID.
 
   -d, --device <dev>     default /dev/sdb
   -m, --mount <path>     default /data; a bare name is taken as /<name>
   -t, --type <fs>        ext4 | xfs | vfat | ntfs; default ext4
-  -f, --force            permit destructive changes (reformat, unmount), and
-                         skip the confirmation prompt
 
-Without --force, a disk that is already formatted differently or mounted
-elsewhere is reported and left untouched.
+Only a disk with no partitions and no filesystem is touched. A disk whose
+partitions this tool already manages reports success and changes nothing; any
+other disk is refused. To adopt a partition that already exists, use 'hdd add'.
+EOF
+}
+
+help_hdd_list() {
+    cat << 'EOF'
+system-setup hdd list
+
+Shows every disk on the host, one row per partition.
+
+  GROWABLE  free space immediately after the partition, which is what
+            'hdd expand' can claim. Blank when growpart is not installed.
+  FREE      free space inside the filesystem. Blank when not mounted.
+  FSTAB     managed  the entry is in one of this tool's sentinel blocks
+            yes      in fstab, but written by someone else
+            no       not in fstab
+
+Loop devices are omitted. The root disk is included.
 EOF
 }
 
