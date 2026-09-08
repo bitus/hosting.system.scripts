@@ -2261,6 +2261,140 @@ folder_resolve() { realpath -m -- "${1:-$PWD}"; }
 # The bridge between the two address spaces. `repo` commands stopped taking
 # paths in fix 50-04, so this is what a caller standing in a checkout pipes
 # into them.
+# FR_* -- set by both callers of fr_run, for the same reason FU_DRY is a
+# global: the fan-out helper calls every folder-level worker with one argument.
+FR_PULL=0
+FR_DRY=0
+FR_PULL_TIMEOUT="$PULL_TIMEOUT_DEFAULT"
+
+# fr_run <loc> -- rebuild and restart one compose project. Prints ONE status
+# object; returns its code. Never exits.
+fr_run() {
+    local loc="$1"
+
+    if [ ! -d "$loc" ]; then
+        status_obj "$E_NOTFOUND" "Failed" "Folder does not exist"
+        return "$E_NOTFOUND"
+    fi
+
+    # Order matters: "is this a compose project" is a filesystem test, so a
+    # folder that is not one never asks whether docker is even installed.
+    if ! images_is_compose_project "$loc"; then
+        # Skipped rather than Failed: at the repo level this is "nothing to
+        # deploy here", not a fault, and the two levels must agree on that or
+        # repo redeploy's skip rule would contradict its own locations.
+        status_obj "$E_NOCOMPOSE" "Skipped" "Not a docker compose project"
+        return "$E_NOCOMPOSE"
+    fi
+    if ! compose_available; then
+        status_obj "$E_PRECHECK" "Failed" "docker compose is not available"
+        return "$E_PRECHECK"
+    fi
+    if ! docker_daemon_ok; then
+        status_obj "$E_PRECHECK" "Failed" "the docker daemon is not reachable"
+        return "$E_PRECHECK"
+    fi
+
+    # 0 running, 1 stopped, 2 could not tell -- and the third must not be
+    # reported as the second, or an unreachable daemon would look like a
+    # deliberately stopped stack.
+    local cr=0
+    compose_running "$loc" || cr=$?
+    case "$cr" in
+        0) ;;
+        1)  status_obj "$E_NOTRUNNING" "Skipped" "No container is running"
+            return "$E_NOTRUNNING" ;;
+        *)  status_obj "$E_PRECHECK" "Failed" "cannot determine whether the project is running"
+            return "$E_PRECHECK" ;;
+    esac
+
+    if [ "$FR_DRY" -eq 1 ]; then
+        status_obj 0 "Ok" "Would redeploy"
+        return 0
+    fi
+
+    # Only the pull is bounded. build and up -d are deliberately unbounded: a
+    # build has no meaningful upper bound and killing one midway is worse than
+    # waiting for it.
+    if [ "$FR_PULL" -eq 1 ]; then
+        local prc=0
+        deadline_set "$FR_PULL_TIMEOUT"
+        ( cd "$loc" && run_bounded docker compose pull --ignore-pull-failures >&2 ) || prc=$?
+        deadline_clear
+        if [ "$prc" -eq "$TIMEOUT_EXIT" ]; then
+            status_obj "$E_IMAGE" "Failed" "image pull timed out after ${FR_PULL_TIMEOUT}s"
+            return "$E_IMAGE"
+        fi
+        if [ "$prc" -ne 0 ]; then
+            status_obj "$E_CMDOUTPUT" "Failed" "docker compose pull failed"
+            return "$E_CMDOUTPUT"
+        fi
+    fi
+
+    # stdout belongs to the document, so compose's own output goes to stderr.
+    if ! ( cd "$loc" && docker compose build >&2 ); then
+        status_obj "$E_CMDOUTPUT" "Failed" "docker compose build failed"
+        return "$E_CMDOUTPUT"
+    fi
+    if ! ( cd "$loc" && docker compose up -d >&2 ); then
+        status_obj "$E_CMDOUTPUT" "Failed" "docker compose up -d failed"
+        return "$E_CMDOUTPUT"
+    fi
+
+    status_obj 0 "Ok" "Redeployed"
+    return 0
+}
+
+# cmd_folder_redeploy -- rebuild and restart one compose project.
+cmd_folder_redeploy() {
+    local args=()
+    FR_PULL=0
+    FR_DRY=0
+    FR_PULL_TIMEOUT="$PULL_TIMEOUT_DEFAULT"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_folder_redeploy; exit 0 ;;
+            -i|--pull-images) FR_PULL=1; shift ;;
+            --dry-run) FR_DRY=1; shift ;;
+            -t|--pull-timeout)
+                [ $# -ge 2 ] || die "$E_ARGS" "--pull-timeout requires a value"
+                FR_PULL_TIMEOUT="$2"; shift 2 ;;
+            --pull-timeout=*) FR_PULL_TIMEOUT="${1#*=}"; shift ;;
+            --output-format)
+                [ $# -ge 2 ] || die "$E_ARGS" "--output-format requires a value"
+                output_format_set "$2"; shift 2 ;;
+            --output-format=*) output_format_set "${1#*=}"; shift ;;
+            --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    [ "${#args[@]}" -le 1 ] || die "$E_ARGS" "unexpected argument: ${args[1]}"
+    redeploy_check_flags
+
+    precheck_common
+
+    local loc st rc=0
+    loc="$(folder_resolve "${args[0]:-}")"
+    st="$(fr_run "$loc")" || rc=$?
+    render_output "$(jq -nc --argjson s "$st" '{status: $s}')"
+    exit "$rc"
+}
+
+# redeploy_check_flags -- shared flag validation for both redeploy commands.
+redeploy_check_flags() {
+    case "$FR_PULL_TIMEOUT" in
+        ""|*[!0-9]*) die "$E_ARGS" "--pull-timeout must be a whole number of seconds" ;;
+    esac
+    [ "$FR_PULL_TIMEOUT" -gt 0 ] || die "$E_ARGS" "--pull-timeout must be greater than zero"
+    # Nothing is pulled in a dry run, so asking for both is asking for
+    # something that cannot happen.
+    if [ "$FR_PULL" -eq 1 ] && [ "$FR_DRY" -eq 1 ]; then
+        die "$E_ARGS" "--pull-images cannot be combined with --dry-run"
+    fi
+}
+
+
 # FU_DRY -- set by both callers of fu_run. A global rather than a parameter
 # so the fan-out helper can call every folder-level worker the same way.
 FU_DRY=0
@@ -2768,15 +2902,19 @@ Usage:
 
   git-utils repo add <org/name[/branch]> [-n <key>]
   git-utils repo clone <repo> [<folder_name>]
-  git-utils repo update [<repo_or_path>] [-a]
-  git-utils repo delete [<repo_or_path>] [-f]
+  git-utils repo update <repo> [--dry-run]
+  git-utils repo delete <repo> [-f] [--with-folders]
+  git-utils repo folders (<repo> | -a)
   git-utils repo list
   git-utils repo keys
-  git-utils repo info [<repo_or_path>]
+  git-utils repo info <repo>
   git-utils repo validate <repo> [--fix]
 
+  git-utils folder repo [<path>]
+  git-utils folder update [<path>] [--dry-run]
+  git-utils folder redeploy [<path>] [-i] [-t <s>] [--dry-run]
   git-utils folder status [<path>]
-  git-utils folder validate [<path>]
+  git-utils folder validate [<path>] [-c <check>]
   git-utils folder adopt [<path>] [-n <id>]
 
   git-utils validate [--fix]
@@ -2787,15 +2925,16 @@ bridges the two:
 
   git-utils repo info "$(git-utils folder repo)"
 
-repo info, repo validate, folder status, folder validate and validate
-accept --output-format json|text|yaml|plain (default plain).
+Every command that emits a document accepts
+--output-format json|text|yaml|plain (default plain).
 
 `plain` is line-oriented output for pipes. Where a command defines no line
 form it is identical to `text`.
 
 Aliases:
-  git-utils repos ...   same as 'git-utils repo ...'
-  git-utils update ...  same as 'git-utils repo update ...'
+  git-utils repos ...              same as 'git-utils repo ...'
+  git-utils update ...             same as 'git-utils folder update ...'
+  git-utils folder repository ...  same as 'git-utils folder repo ...'
 
 There is no 'folders' alias; the folder group is spelled out in full.
 
@@ -2851,7 +2990,6 @@ Checks one repo record. Prints the record with a 'checks' object added:
   fields     every field the schema requires is present
   keys       the deploy key pair exists on disk    (private repos)
   ssh        ~/.ssh/config holds its sentinel block (private, non-foreign)
-  folder repo       which repo owns a folder
   locations  folder validate run against each recorded location
   health     the overall verdict
 
@@ -2919,6 +3057,35 @@ checkout of an already-tracked repo appends a location.
 
 Exits: 5 no such folder, 6 not a git repo, 8 conflicts with an existing
 record, 10 unusable origin or detached HEAD, 3 deploy keys not found.
+EOF
+}
+
+help_folder_redeploy() {
+    cat << 'EOF'
+git-utils folder redeploy [<path>] [-i|--pull-images] [-t|--pull-timeout <s>]
+                          [--dry-run] [--output-format json|text|yaml|plain]
+
+Rebuilds and restarts one docker compose project. With no argument the
+current folder is used.
+
+  1. the folder exists                                          (5)
+  2. it is a compose project                                    (14)
+  3. docker and its daemon are available                        (1)
+  4. compose has at least one running container                 (16)
+  5. docker compose [pull] && build && up -d
+
+A STOPPED stack is never started: redeploy refreshes what is already
+running, and bringing something up is your decision, not this command's.
+
+-i pulls images first, with --ignore-pull-failures. Only the pull is
+bounded by --pull-timeout (default 300); build and up -d are unbounded,
+because a build has no meaningful upper bound and killing one midway is
+worse than waiting. A pull killed by the timeout exits 18, not 10.
+
+-i and --dry-run cannot be combined: nothing is pulled in a dry run.
+
+Compose profiles are not handled -- up -d uses the default profile set, so
+profile services that are running may be left untouched.
 EOF
 }
 
@@ -3159,6 +3326,7 @@ main() {
                     help_main
                     exit 0
                     ;;
+                redeploy) shift; cmd_folder_redeploy "$@" ;;
                 update) shift; cmd_folder_update "$@" ;;
                 repo|repository) shift; cmd_folder_repo "$@" ;;
                 status) shift; cmd_folder_status "$@" ;;
