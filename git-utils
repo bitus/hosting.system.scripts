@@ -124,6 +124,7 @@ fold'
 # consumer of PLAIN_ID_PATH splits on the FIRST space.
 readonly PLAIN_ID='.id'
 readonly PLAIN_ID_PATH='.[] | "\(.id) \(.path)"'
+readonly PLAIN_PATH_STATUS='.locations[] | "\(.path) - \(.status.status)" + (if (.status.description // "") == "" then "" else " - \(.status.description)" end)'
 
 readonly OUTPUT_FORMAT_DEFAULT="plain"
 OUTPUT_FORMAT="$OUTPUT_FORMAT_DEFAULT"
@@ -2077,77 +2078,141 @@ cmd_repo_clone() {
     info "cloned into $out"
 }
 
+# FANOUT_DOC / FANOUT_ACTED -- outputs of fanout_run, which cannot return
+# both a document and a code through stdout without the caller re-parsing.
+FANOUT_DOC='[]'
+FANOUT_ACTED=''
+
+# fanout_run <worker_fn> <skip_codes_csv> <loc>... -- run the worker on
+# every location, never aborting, and aggregate.
+#
+# Sets FANOUT_DOC to the locations array and FANOUT_ACTED to the first
+# location the worker actually acted on (empty if none). Returns the
+# aggregate code.
+#
+# repo update and repo redeploy differ only in the worker and in which codes
+# count as 'nothing to do' -- 22 for one, 14 and 16 for the other. Sharing
+# this is what keeps their exit tables from drifting apart.
+fanout_run() {
+    local fn="$1" skips="$2"
+    shift 2
+    local loc st rc failed=0 first_skip=0
+    FANOUT_DOC='[]'
+    FANOUT_ACTED=""
+
+    for loc in "$@"; do
+        rc=0
+        st="$("$fn" "$loc")" || rc=$?
+        FANOUT_DOC="$(jq -c --arg p "$loc" --argjson s "$st" \
+            '. + [{path: $p, status: $s}]' <<< "$FANOUT_DOC")"
+
+        if [ "$rc" -eq 0 ]; then
+            [ -n "$FANOUT_ACTED" ] || FANOUT_ACTED="$loc"
+        elif [[ ",$skips," == *",$rc,"* ]]; then
+            [ "$first_skip" -eq 0 ] && first_skip="$rc"
+        else
+            failed=1
+        fi
+    done
+
+    # Order matters: a failure anywhere outranks any amount of success, and
+    # 'everything was skipped' outranks 0 so a run in which nothing happened
+    # never reports as though something did.
+    if [ "$failed" -eq 1 ]; then
+        return "$E_IO"
+    elif [ -n "$FANOUT_ACTED" ]; then
+        return 0
+    elif [ "$first_skip" -ne 0 ]; then
+        return "$first_skip"
+    fi
+    return 0
+}
+
+# ru_emit <top_status_json> <locations_json> -- the fan-out document.
+#
+# Always both keys, even when the run stopped before reaching any location:
+# a caller that parses `.locations` should never have to special-case its
+# absence.
+ru_emit() {
+    render_output "$(jq -nc --argjson s "$1" --argjson l "$2" \
+        '{status: $s, locations: $l}')" "$PLAIN_PATH_STATUS"
+}
+
+# cmd_repo_update -- folder update across every location of one record.
 cmd_repo_update() {
-    local all=0
     local args=()
+    FU_DRY=0
     while [ $# -gt 0 ]; do
         case "$1" in
             -h|--help) help_repo_update; exit 0 ;;
-            -a|--all) all=1; shift ;;
+            --dry-run) FU_DRY=1; shift ;;
+            --output-format)
+                [ $# -ge 2 ] || die "$E_ARGS" "--output-format requires a value"
+                output_format_set "$2"; shift 2 ;;
+            --output-format=*) output_format_set "${1#*=}"; shift ;;
             --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
             -*) die "$E_ARGS" "unknown flag: $1" ;;
             *) args+=("$1"); shift ;;
         esac
     done
     [ "${#args[@]}" -le 1 ] || die "$E_ARGS" "unexpected argument: ${args[1]}"
-    local target="${args[0]:-}"
 
     precheck_common
     precheck_store
 
-    resolve_repo_target "$target"
+    resolve_repo_target "${args[0]:-}"
     repos_resolve
 
-    local -a targets=()
-    if [ "$TARGET_KIND" = "path" ] && [ "$all" -ne 1 ]; then
-        targets=("$TARGET_VALUE")
-        local loc
-        for loc in "${REC_LOCATIONS[@]}"; do
-            [ "$loc" = "$TARGET_VALUE" ] || warn "not updating other tracked location: $loc"
-        done
-    else
-        targets=("${REC_LOCATIONS[@]}")
+    # The record's own checks come from rv_run rather than a private copy, so
+    # they cannot drift from what `repo validate` reports. Only fields, keys
+    # and ssh are consulted: the location checks are fu_run's business, and a
+    # dead location is something to REPORT per location, not a reason to
+    # refuse the whole run.
+    local rvout bad
+    rvout="$(rv_run "$REC_KEY")" || true
+    bad="$(jq -c '[.checks.fields, .checks.keys, .checks.ssh]
+                  | map(select(.status == "Failed")) | .[0] // empty' <<< "$rvout")"
+    if [ -n "$bad" ]; then
+        ru_emit "$bad" '[]'
+        exit "$(jq -r '.code' <<< "$bad")"
     fi
 
-    local -a failed=() succeeded=()
-    local loc
-    for loc in "${targets[@]}"; do
-        if [ ! -d "$loc" ] || [ ! -d "$loc/.git" ]; then
-            warn "skipping missing or non-git location: $loc"
-            continue
-        fi
-        if ( cd "$loc" && git fetch origin && git reset --hard "origin/$REC_BRANCH" && git clean -fd ); then
-            succeeded+=("$loc")
-        else
-            failed+=("$loc")
-        fi
-    done
-
-    # Image collection happens once per invocation, regardless of --all:
-    #   TARGET_KIND=path         -> only that exact path, and only if it succeeded
-    #   TARGET_KIND=key|fullname -> first location in REC_LOCATIONS order that succeeded
-    local collect_loc="" l
-    if [ "$TARGET_KIND" = "path" ]; then
-        for l in "${succeeded[@]}"; do
-            [ "$l" = "$TARGET_VALUE" ] && collect_loc="$TARGET_VALUE"
-        done
-    else
-        for loc in "${REC_LOCATIONS[@]}"; do
-            for l in "${succeeded[@]}"; do
-                [ "$l" = "$loc" ] && collect_loc="$loc"
-            done
-            [ -n "$collect_loc" ] && break
-        done
+    if [ "${#REC_LOCATIONS[@]}" -eq 0 ]; then
+        ru_emit "$(status_obj "$E_NOTFOUND" "Failed" "Repository has no locations")" '[]'
+        exit "$E_NOTFOUND"
     fi
-    [ -z "$collect_loc" ] || images_update_record "$REC_KEY" "$collect_loc"
 
-    if [ "${#failed[@]}" -gt 0 ]; then
-        warn "update failed for:"
-        for loc in "${failed[@]}"; do
-            warn "  $loc"
-        done
-        exit "$E_IO"
+    local rc=0
+    fanout_run fu_run "$E_NOUPDATE" "${REC_LOCATIONS[@]}" || rc=$?
+
+    # Best-effort, once per invocation, and never under --dry-run: nothing
+    # changed on disk there, so re-reading images would only risk a write.
+    # Inherited from fix 50-01 -- this is repo update's only store write, it
+    # warns rather than failing, and there is deliberately no early
+    # store-writability preflight, so an unwritable store surfaces after the
+    # git work rather than instead of it.
+    if [ -n "$FANOUT_ACTED" ] && [ "$FU_DRY" -eq 0 ]; then
+        images_update_record "$REC_KEY" "$FANOUT_ACTED"
     fi
+
+    local n_ok n_fail top
+    n_ok="$(jq -r '[.[] | select(.status.status == "Ok")] | length' <<< "$FANOUT_DOC")"
+    n_fail="$(jq -r '[.[] | select(.status.status == "Failed")] | length' <<< "$FANOUT_DOC")"
+    case "$rc" in
+        0)
+            if [ "$FU_DRY" -eq 1 ]; then
+                top="$(status_obj 0 "Ok" "$n_ok location(s) would be updated")"
+            else
+                top="$(status_obj 0 "Ok" "Updated $n_ok location(s)")"
+            fi ;;
+        "$E_NOUPDATE")
+            top="$(status_obj "$E_NOUPDATE" "Skipped" "Every location is already up to date")" ;;
+        *)
+            top="$(status_obj "$rc" "Failed" "$n_fail location(s) failed")" ;;
+    esac
+
+    ru_emit "$top" "$FANOUT_DOC"
+    exit "$rc"
 }
 
 cmd_repo_info() {
@@ -2196,23 +2261,90 @@ folder_resolve() { realpath -m -- "${1:-$PWD}"; }
 # The bridge between the two address spaces. `repo` commands stopped taking
 # paths in fix 50-04, so this is what a caller standing in a checkout pipes
 # into them.
-# fu_status <status_json> <exit_code> -- emit the document and leave.
-#
-# Every exit from cmd_folder_update goes through here, so the command always
-# produces a document -- a caller parsing stdout gets one whether the update
-# happened, was unnecessary, or failed.
-fu_status() {
-    render_output "$(jq -nc --argjson s "$1" '{status: $s}')"
-    exit "$2"
+# FU_DRY -- set by both callers of fu_run. A global rather than a parameter
+# so the fan-out helper can call every folder-level worker the same way.
+FU_DRY=0
+
+# fu_run <loc> -- update one checkout. Prints ONE status object; returns its
+# code. Never exits, so `repo update` can call it per location the way
+# rv_run calls fv_run.
+fu_run() {
+    local loc="$1" fvout rc
+
+    # A folder we cannot vouch for is not one to run `reset --hard` in. The
+    # first failed check's own status object becomes this one, so the reason
+    # travels with the code.
+    fvout="$(fv_run "$loc")" || true
+    rc="$(fv_exit_code "$fvout")"
+    if [ "$rc" -ne 0 ]; then
+        jq -c '[.location, .worktree, .tracking, .origin]
+               | map(select(.status == "Failed")) | .[0]' <<< "$fvout"
+        return "$rc"
+    fi
+
+    local branch
+    if ! branch="$(adopt_current_branch "$loc")" || [ -z "$branch" ]; then
+        status_obj "$E_CMDOUTPUT" "Failed" "Cannot determine the current branch"
+        return "$E_CMDOUTPUT"
+    fi
+
+    # git writes progress to stderr and `reset`/`clean` write to stdout;
+    # stdout belongs to the document, so their chatter is sent to stderr.
+    if ! git -C "$loc" fetch origin >&2; then
+        status_obj "$E_CMDOUTPUT" "Failed" "git fetch failed"
+        return "$E_CMDOUTPUT"
+    fi
+
+    # Plumbing, not `git status | grep behind`: status output is localised,
+    # and on a DIVERGED branch it says "have diverged" with no "behind" in
+    # it -- so the one case reset --hard exists to repair would report
+    # nothing to do. rev-list counts what the remote has and we do not, which
+    # is non-zero for behind and diverged alike.
+    local behind
+    if ! behind="$(git -C "$loc" rev-list --count "HEAD..origin/$branch" 2>/dev/null)"; then
+        status_obj "$E_CMDOUTPUT" "Failed" "cannot compare against origin/$branch"
+        return "$E_CMDOUTPUT"
+    fi
+    case "$behind" in
+        ""|*[!0-9]*)
+            status_obj "$E_CMDOUTPUT" "Failed" "unexpected rev-list output: '$behind'"
+            return "$E_CMDOUTPUT" ;;
+    esac
+
+    if [ "$behind" -eq 0 ]; then
+        # 22 is a success in the everyday sense -- nothing was wrong, there
+        # was simply nothing to do -- so the status passes. It is distinct
+        # from 0 so a cron job can tell 'deployed' from 'no change' without
+        # parsing anything, and so the fan-out can count it as a skip.
+        status_obj "$E_NOUPDATE" "Skipped" "Already up to date"
+        return "$E_NOUPDATE"
+    fi
+
+    if [ "$FU_DRY" -eq 1 ]; then
+        status_obj 0 "Ok" "$behind commit(s) available"
+        return 0
+    fi
+
+    if ! git -C "$loc" reset --hard "origin/$branch" >&2; then
+        status_obj "$E_CMDOUTPUT" "Failed" "git reset --hard failed"
+        return "$E_CMDOUTPUT"
+    fi
+    if ! git -C "$loc" clean -fd >&2; then
+        status_obj "$E_CMDOUTPUT" "Failed" "git clean failed"
+        return "$E_CMDOUTPUT"
+    fi
+    status_obj 0 "Ok" "Updated $behind commit(s)"
+    return 0
 }
 
 # cmd_folder_update -- bring one checkout up to date, if it is behind.
 cmd_folder_update() {
-    local args=() dry=0
+    local args=()
+    FU_DRY=0
     while [ $# -gt 0 ]; do
         case "$1" in
             -h|--help) help_folder_update; exit 0 ;;
-            --dry-run) dry=1; shift ;;
+            --dry-run) FU_DRY=1; shift ;;
             --output-format)
                 [ $# -ge 2 ] || die "$E_ARGS" "--output-format requires a value"
                 output_format_set "$2"; shift 2 ;;
@@ -2227,62 +2359,11 @@ cmd_folder_update() {
     precheck_common
     precheck_store
 
-    local loc fvout rc
+    local loc st rc=0
     loc="$(folder_resolve "${args[0]:-}")"
-
-    # A folder we cannot vouch for is not one to run `reset --hard` in. The
-    # first failed check's own status object becomes this command's, so the
-    # reason travels with the code.
-    fvout="$(fv_run "$loc")" || true
-    rc="$(fv_exit_code "$fvout")"
-    if [ "$rc" -ne 0 ]; then
-        fu_status "$(jq -c '[.location, .worktree, .tracking, .origin]
-                             | map(select(.status == "Failed")) | .[0]' <<< "$fvout")" "$rc"
-    fi
-
-    local branch
-    if ! branch="$(adopt_current_branch "$loc")" || [ -z "$branch" ]; then
-        fu_status "$(status_obj "$E_CMDOUTPUT" "Failed" "Cannot determine the current branch")" "$E_CMDOUTPUT"
-    fi
-
-    # git writes progress to stderr and `reset`/`clean` write to stdout;
-    # stdout belongs to the document, so their chatter is sent to stderr.
-    if ! git -C "$loc" fetch origin >&2; then
-        fu_status "$(status_obj "$E_CMDOUTPUT" "Failed" "git fetch failed")" "$E_CMDOUTPUT"
-    fi
-
-    # Plumbing, not `git status | grep behind`: status output is localised,
-    # and on a DIVERGED branch it says "have diverged" with no "behind" in
-    # it -- so the one case reset --hard exists to repair would report
-    # nothing to do. rev-list counts what the remote has and we do not, which
-    # is non-zero for behind and diverged alike.
-    local behind
-    if ! behind="$(git -C "$loc" rev-list --count "HEAD..origin/$branch" 2>/dev/null)"; then
-        fu_status "$(status_obj "$E_CMDOUTPUT" "Failed" "cannot compare against origin/$branch")" "$E_CMDOUTPUT"
-    fi
-    case "$behind" in
-        ""|*[!0-9]*) fu_status "$(status_obj "$E_CMDOUTPUT" "Failed" "unexpected rev-list output: '$behind'")" "$E_CMDOUTPUT" ;;
-    esac
-
-    if [ "$behind" -eq 0 ]; then
-        # 22 is a success in the everyday sense -- nothing was wrong, there
-        # was simply nothing to do -- so the status passes. It is distinct
-        # from 0 so a cron job can tell 'deployed' from 'no change' without
-        # parsing anything.
-        fu_status "$(status_obj "$E_NOUPDATE" "Skipped" "Already up to date")" "$E_NOUPDATE"
-    fi
-
-    if [ "$dry" -eq 1 ]; then
-        fu_status "$(status_obj 0 "Ok" "$behind commit(s) available")" 0
-    fi
-
-    if ! git -C "$loc" reset --hard "origin/$branch" >&2; then
-        fu_status "$(status_obj "$E_CMDOUTPUT" "Failed" "git reset --hard failed")" "$E_CMDOUTPUT"
-    fi
-    if ! git -C "$loc" clean -fd >&2; then
-        fu_status "$(status_obj "$E_CMDOUTPUT" "Failed" "git clean failed")" "$E_CMDOUTPUT"
-    fi
-    fu_status "$(status_obj 0 "Ok" "Updated $behind commit(s)")" 0
+    st="$(fu_run "$loc")" || rc=$?
+    render_output "$(jq -nc --argjson s "$st" '{status: $s}')"
+    exit "$rc"
 }
 
 cmd_folder_repo() {
@@ -2962,11 +3043,26 @@ EOF
 
 help_repo_update() {
     cat << 'EOF'
-git-utils repo update [<repo_key_or_full_name_or_path>] [-a|--all]
+git-utils repo update <repo_key_or_full_name> [--dry-run]
+                      [--output-format json|text|yaml|plain]
 
-Fetches and hard-resets a tracked repo to its remote branch. With no
-argument, the current folder is used. With a path and without --all,
-only that location is updated; --all updates every tracked location.
+Runs folder update on every location of one record. A path is not accepted;
+to update a single checkout use:
+
+  git-utils folder update <path>
+
+Every location is processed even after one fails, so one broken checkout does
+not hide the state of the others.
+
+  0   at least one location updated, none failed
+  22  every location was already up to date
+  3   at least one location failed
+  5   the record has no locations
+      otherwise the failing check's code from repo validate
+
+Images are collected once per run, from the first location that actually
+updated, and never under --dry-run. That write is best-effort: it warns on
+failure and does not change the exit code.
 EOF
 }
 

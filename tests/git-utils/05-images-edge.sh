@@ -44,7 +44,13 @@ run 0 "add imz3 -> 0" repo add testorg3/testrepo3/main -n imz3
 run 0 "clone imz3 -> 0" repo clone imz3 "$WORK/f3"
 echo 'lock2:v2' >> "$WORK/seed3/.images"
 push_seed 3
-( exec 9>"$HOME/.repositories.json.lock"; flock 9; sleep 12 ) &
+# The holder must outlast the command's whole LOCK_WAIT, not just most of
+# it. With a 12s hold this raced: repo update now runs the record's
+# validation checks before reaching the images step, so it started its 10s
+# wait later and the holder released first -- the lock was then ACQUIRED and
+# no warning appeared. Holding until killed removes the timing dependency
+# without adding the hold time to the suite's runtime.
+( exec 9>"$HOME/.repositories.json.lock"; flock 9; sleep 120 ) &
 LOCKPID=$!
 sleep 1
 START=$(date +%s)
@@ -52,6 +58,7 @@ run 0 "update imz3 while lock held elsewhere -> still 0" repo update imz3
 ELAPSED=$(( $(date +%s) - START ))
 check "waited roughly LOCK_WAIT (~10s), got ${ELAPSED}s" "$( [ "$ELAPSED" -ge 9 ] && echo 1 || echo 0 )"
 check "warned about lock" "$( echo "$LAST_ERR" | grep -qi 'could not acquire lock to update images' && echo 1 || echo 0 )"
+kill "$LOCKPID" 2>/dev/null || true
 wait "$LOCKPID" 2>/dev/null || true
 
 echo "=== 28: record deleted between clone's location-add and the images write ==="

@@ -154,15 +154,22 @@ run 0 "add im13 -> 0" repo add testorg13/testrepo13/main -n im13
 run 0 "clone1 im13 -> 0" repo clone im13 "$WORK/e13a"
 run 0 "clone2 im13 -> 0" repo clone im13 "$WORK/e13b"
 rm -rf "$WORK/e13a"
-run 0 "update im13 by key (first missing, falls to second)" repo update im13
+# Fix 50-04 changed what a missing location means. It used to be a warning
+# and the run continued; folder update now reports it as a failed location,
+# so the run exits 3. The point of THIS test is unchanged -- image
+# collection still falls through to the location that did update -- and the
+# assertion below is what proves it.
+run 3 "update im13 (first missing) -> 3, but the run continues" repo update im13
 check "collected from e13b despite e13a missing" "$( [ "$(images_of im13)" = '["entry:v1"]' ] && echo 1 || echo 0 )"
 
 make_repo 14 im14
 echo 'entry:v1' > "$WORK/seed14/.images"
 push_seed 14
 run 0 "add im14 -> 0" repo add testorg14/testrepo14/main -n im14
-run 0 "update im14, zero locations -> 0, no-op" repo update im14
-run 0 "update im14 again -> 0, still no-op" repo update im14
+# A repo with no locations was a silent no-op; it is now 5, because a
+# fan-out with nothing to fan out to is a caller error rather than a success.
+run 5 "update im14, zero locations -> 5" repo update im14
+run 5 "update im14 again -> 5" repo update im14
 check "images14 stays [] from repo add" "$( [ "$(images_of im14)" = '[]' ] && echo 1 || echo 0 )"
 
 echo "=== 26: unchanged second update performs no store write ==="
@@ -171,10 +178,15 @@ echo 'stable:v1' > "$WORK/seed15/.images"
 push_seed 15
 run 0 "add im15 -> 0" repo add testorg15/testrepo15/main -n im15
 run 0 "clone im15 -> 0" repo clone im15 "$WORK/d15"
-run 0 "update im15 (1st) -> 0" repo update im15
+# repo clone already left this checkout current, so there is nothing to
+# fetch and the answer is 22. The property under test -- that a run which
+# changes nothing writes nothing -- is the mtime assertion below, and it
+# holds all the more strongly now: no update means the images step never
+# runs at all.
+run 22 "update im15 (1st) -> 22, nothing to fetch" repo update im15
 MTIME1="$(stat -c '%Y' "$(store)")"
 sleep 1
-run 0 "update im15 (2nd, no source changes) -> 0" repo update im15
+run 22 "update im15 (2nd, no source changes) -> 22" repo update im15
 MTIME2="$(stat -c '%Y' "$(store)")"
 check "store untouched on unchanged update ($MTIME1 == $MTIME2)" "$( [ "$MTIME1" = "$MTIME2" ] && echo 1 || echo 0 )"
 
@@ -186,8 +198,18 @@ run 0 "add im16 -> 0" repo add testorg16/testrepo16/main -n im16
 run 0 "clone im16 -> 0" repo clone im16 "$WORK/d16"
 store_patch 'del(.repositories.im16.images)'
 check "images key removed (simulating legacy record)" "$( [ "$(has_images_key im16)" = "false" ] && echo 1 || echo 0 )"
-run 0 "update im16 -> 0, no error" repo update im16
-check "images16 populated" "$( [ "$(has_images_key im16)" = "true" ] && echo 1 || echo 0 )"
+# This is the behaviour change with the most bite. repo update now runs the
+# record's fields/keys/ssh checks first, so a record missing `images` is
+# REPORTED (90) instead of being silently repaired as a side effect of an
+# unrelated command. The repair still exists -- it just has to be asked for.
+run 90 "legacy record stops repo update -> 90" repo update im16
+check "images key still absent -- nothing was silently fixed" \
+    "$( [ "$(has_images_key im16)" = "false" ] && echo 1 || echo 0 )"
+
+# the documented cure, and it must also populate images
+run 0 "repo validate --fix repairs it -> 0" repo validate im16 --fix
+check "images16 populated by --fix" "$( [ "$(has_images_key im16)" = "true" ] && echo 1 || echo 0 )"
 check "images16 = [legacy:v1]" "$( [ "$(images_of im16)" = '["legacy:v1"]' ] && echo 1 || echo 0 )"
+run 22 "and repo update works again afterwards -> 22" repo update im16
 
 gu_total
