@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
 # Fix 50-02 Phase 7: `folder validate`. Spec cases 19-22.
+#
+# Updated by fix 50-04 phase 3, which changed this command's contract twice
+# over: a fourth check (`worktree`) was added, and the exit code became the
+# first failed check's own code rather than a bare 1. Every assertion below
+# keeps its original intent; only the expected code and check count moved.
 set -u
 . "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
@@ -25,11 +30,12 @@ cd_() { echo "$LAST_OUT" | jq -r ".$1.code"; }
 echo "=== 19: healthy tracked folder -> all Ok, exit 0 ==="
 fv 0 "healthy folder -> 0" "$WORK/healthy"
 check "location Ok" "$( [ "$(st location)" = "Ok" ] && echo 1 || echo 0 )"
+check "worktree Ok" "$( [ "$(st worktree)" = "Ok" ] && echo 1 || echo 0 )"
 check "tracking Ok" "$( [ "$(st tracking)" = "Ok" ] && echo 1 || echo 0 )"
 check "origin Ok" "$( [ "$(st origin)" = "Ok" ] && echo 1 || echo 0 )"
 run 0 "default output form -> 0" folder validate "$WORK/healthy"
-check "folds to three bare Ok lines" \
-    "$( [ "$(echo "$LAST_OUT" | grep -c ': Ok$')" = "3" ] && echo 1 || echo 0 )"
+check "folds to four bare Ok lines" \
+    "$( [ "$(echo "$LAST_OUT" | grep -c ': Ok$')" = "4" ] && echo 1 || echo 0 )"
 
 out="$(cd "$WORK/healthy" && bash "$GU" folder validate </dev/null 2>"$WORK/err.log")"; code=$?
 check "no argument uses cwd -> 0" "$( [ "$code" -eq 0 ] && echo 1 || echo 0 )"
@@ -38,10 +44,11 @@ echo "=== 20: folder deleted from disk ==="
 mk_adopted gone "https://github.com/myorg/gone.repo"
 run 0 "adopt gone.repo -> 0" folder adopt "$WORK/gone"
 rm -rf "$WORK/gone"
-fv 1 "deleted folder -> 1" "$WORK/gone"
+fv 5 "deleted folder -> 5" "$WORK/gone"
 check "location Failed" "$( [ "$(st location)" = "Failed" ] && echo 1 || echo 0 )"
 check "location code 5" "$( [ "$(cd_ location)" = "5" ] && echo 1 || echo 0 )"
 check "tracking still Ok (the record still lists it)" "$( [ "$(st tracking)" = "Ok" ] && echo 1 || echo 0 )"
+check "worktree Skipped (no folder to look in)" "$( [ "$(st worktree)" = "Skipped" ] && echo 1 || echo 0 )"
 check "20: origin Skipped, not Failed" "$( [ "$(st origin)" = "Skipped" ] && echo 1 || echo 0 )"
 check "skip reason given" \
     "$( echo "$LAST_OUT" | jq -e '.origin.description | test("does not exist")' >/dev/null && echo 1 || echo 0 )"
@@ -50,7 +57,7 @@ echo "=== 21: remote URL changed behind git-utils' back ==="
 mk_adopted moved "https://github.com/myorg/moved.repo"
 run 0 "adopt moved.repo -> 0" folder adopt "$WORK/moved"
 ( cd "$WORK/moved" && git remote set-url origin "https://github.com/otherorg/moved.repo" )
-fv 1 "changed remote -> 1" "$WORK/moved"
+fv 8 "changed remote -> 8" "$WORK/moved"
 check "location Ok" "$( [ "$(st location)" = "Ok" ] && echo 1 || echo 0 )"
 check "tracking Ok" "$( [ "$(st tracking)" = "Ok" ] && echo 1 || echo 0 )"
 check "21: origin Failed" "$( [ "$(st origin)" = "Failed" ] && echo 1 || echo 0 )"
@@ -62,7 +69,7 @@ echo "=== 22: checked-out branch differs from the record ==="
 mk_adopted branched "https://github.com/myorg/branched.repo"
 run 0 "adopt branched.repo -> 0" folder adopt "$WORK/branched"
 ( cd "$WORK/branched" && git checkout -q -b somewhere.else )
-fv 1 "branch drift -> 1" "$WORK/branched"
+fv 8 "branch drift -> 8" "$WORK/branched"
 check "22: origin Failed" "$( [ "$(st origin)" = "Failed" ] && echo 1 || echo 0 )"
 check "22: origin code 8" "$( [ "$(cd_ origin)" = "8" ] && echo 1 || echo 0 )"
 check "reason names both branches" \
@@ -73,33 +80,38 @@ fv 0 "back on the recorded branch -> 0" "$WORK/branched"
 echo "=== untracked folder ==="
 mkdir -p "$WORK/untracked"
 ( cd "$WORK/untracked" && git init -q && git remote add origin "https://github.com/x/y" )
-fv 1 "untracked git repo -> 1" "$WORK/untracked"
+fv 5 "untracked git repo -> 5" "$WORK/untracked"
 check "location Ok" "$( [ "$(st location)" = "Ok" ] && echo 1 || echo 0 )"
 check "tracking Failed" "$( [ "$(st tracking)" = "Failed" ] && echo 1 || echo 0 )"
 check "tracking code 5" "$( [ "$(cd_ tracking)" = "5" ] && echo 1 || echo 0 )"
+check "worktree Ok (a real git repo, just unknown to us)" "$( [ "$(st worktree)" = "Ok" ] && echo 1 || echo 0 )"
 check "origin Skipped (nothing to compare against)" "$( [ "$(st origin)" = "Skipped" ] && echo 1 || echo 0 )"
 
 echo "=== nonexistent and untracked at once ==="
-fv 1 "missing + untracked -> 1" "$WORK/never-existed"
+fv 5 "missing + untracked -> 5" "$WORK/never-existed"
 check "location Failed" "$( [ "$(st location)" = "Failed" ] && echo 1 || echo 0 )"
 check "tracking Failed" "$( [ "$(st tracking)" = "Failed" ] && echo 1 || echo 0 )"
 check "origin Skipped" "$( [ "$(st origin)" = "Skipped" ] && echo 1 || echo 0 )"
 
 echo "=== a tracked location that stopped being a git repo must NOT pass ==="
+# Unchanged in intent, moved in mechanism. Before fix 50-04 `origin` had to
+# report this itself, because nothing else would; `worktree` reports it now,
+# so origin Skips rather than counting the same fault a second time.
 mk_adopted derotted "https://github.com/myorg/derotted.repo"
 run 0 "adopt derotted.repo -> 0" folder adopt "$WORK/derotted"
 rm -rf "$WORK/derotted/.git"
-fv 1 "tracked folder, .git removed -> 1" "$WORK/derotted"
+fv 6 "tracked folder, .git removed -> 6" "$WORK/derotted"
 check "location Ok (the folder is still there)" "$( [ "$(st location)" = "Ok" ] && echo 1 || echo 0 )"
 check "tracking Ok" "$( [ "$(st tracking)" = "Ok" ] && echo 1 || echo 0 )"
-check "origin Failed, not Skipped" "$( [ "$(st origin)" = "Failed" ] && echo 1 || echo 0 )"
-check "origin code 6 (not a git repo)" "$( [ "$(cd_ origin)" = "6" ] && echo 1 || echo 0 )"
+check "worktree Failed" "$( [ "$(st worktree)" = "Failed" ] && echo 1 || echo 0 )"
+check "worktree code 6 (not a git work tree)" "$( [ "$(cd_ worktree)" = "6" ] && echo 1 || echo 0 )"
+check "origin Skipped, since worktree already explains it" "$( [ "$(st origin)" = "Skipped" ] && echo 1 || echo 0 )"
 
 echo "=== tracked repo whose origin remote was removed ==="
 mk_adopted noremote "https://github.com/myorg/noremote.repo"
 run 0 "adopt noremote.repo -> 0" folder adopt "$WORK/noremote"
 ( cd "$WORK/noremote" && git remote remove origin )
-fv 1 "origin remote removed -> 1" "$WORK/noremote"
+fv 8 "origin remote removed -> 8" "$WORK/noremote"
 check "origin Failed" "$( [ "$(st origin)" = "Failed" ] && echo 1 || echo 0 )"
 check "reason says there is no origin remote" \
     "$( echo "$LAST_OUT" | jq -e '.origin.description | test("no .origin. remote")' >/dev/null && echo 1 || echo 0 )"
@@ -113,7 +125,7 @@ check "reason blames the record" \
 
 echo "=== output shape and plumbing ==="
 fv 0 "json keys" "$WORK/branched"
-check "exactly three checks reported" "$( [ "$(echo "$LAST_OUT" | jq -r 'keys_unsorted | join(",")')" = "location,tracking,origin" ] && echo 1 || echo 0 )"
+check "exactly four checks, in check order" "$( [ "$(echo "$LAST_OUT" | jq -r 'keys_unsorted | join(",")')" = "location,worktree,tracking,origin" ] && echo 1 || echo 0 )"
 run 0 "--output-format yaml -> 0" folder validate "$WORK/branched" --output-format yaml
 YML="$LAST_OUT"
 run 0 "--output-format text -> 0" folder validate "$WORK/branched" --output-format text

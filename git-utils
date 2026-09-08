@@ -977,13 +977,36 @@ image_id_local() { run_bounded docker image inspect "$1" --format '{{.Id}}'; }
 # container_image_id <container> -- the id of the image it is actually running
 container_image_id() { run_bounded docker container inspect "$1" --format '{{.Image}}'; }
 
+# image_ref_repo <ref> -- the repository part, with any tag or digest removed.
+#
+# The tag is only stripped when the colon is in the LAST path segment: a
+# registry port ("localhost:5000/foo") also contains one, and stripping that
+# would leave "localhost".
+image_ref_repo() {
+    local ref="${1%@*}" last
+    last="${ref##*/}"
+    case "$last" in
+        *:*) printf '%s' "${ref%:*}" ;;
+        *)   printf '%s' "$ref" ;;
+    esac
+}
+
 # image_repo_digest <ref> -- the pulled index digest, bare (no name@ prefix).
-# Empty output means the image is present but was never pulled from a
-# registry, which is not an error.
+#
+# Selects the RepoDigests entry belonging to THIS reference's repository
+# rather than taking .[0]. An image pulled from a mirror carries several:
+# public.ecr.aws/docker/library/alpine:3.20 comes back with both
+# "alpine@sha256:..." and "public.ecr.aws/docker/library/alpine@sha256:...",
+# and .[0] is whichever docker listed first -- not necessarily the one whose
+# registry we are about to compare against.
+#
+# Empty output means no repo digest for this reference: the image was built
+# locally, or was only ever tagged. That is not an error.
 image_repo_digest() {
-    local out
+    local out repo
     out="$(run_bounded docker image inspect "$1" --format '{{json .RepoDigests}}')" || return 1
-    printf '%s' "$out" | jq -r '.[0] // empty' | sed 's/^[^@]*@//'
+    repo="$(image_ref_repo "$1")"
+    printf '%s' "$out"         | jq -r --arg repo "$repo" '[.[] | select(startswith($repo + "@"))] | .[0] // empty'         | sed 's/^[^@]*@//'
 }
 
 # image_remote_digest <ref> -- the registry's current index digest.
@@ -992,11 +1015,34 @@ image_repo_digest() {
 # manifest digest and never equals what a pull records locally, so comparing
 # the two reports "update available" forever on any multi-arch image.
 #
-# The output is JSON-quoted and carries no trailing newline.
+# The plain output, NOT --format. This is a knowing exception to this
+# script's rule against parsing human-readable output, and the reason is
+# measured rather than assumed: ANY --format makes buildx resolve the whole
+# manifest tree -- one registry request per platform, sixteen for alpine --
+# while the default output needs only the index. Under registry rate limiting
+# the --format forms fail on a child manifest while the plain form still
+# answers. `repo status -i` walks every image of every repo, so a 16x request
+# amplification is disqualifying.
+#
+# The exception is narrower than it looks: `Digest:` is an untranslated field
+# label, unlike `git status`, whose text is localised and whose phrasing
+# changes with the state being described. The shape check below turns a
+# future format change into a loud failure rather than a wrong digest.
+#
+# A failed fetch prints nothing, and the tempting alternative (`imagetools
+# inspect --raw | sha256sum`) hashes whatever came back -- error text, or no
+# bytes at all -- into a well-formed digest that can never match. Returning 1
+# keeps "could not ask" distinct from "asked, and it differs".
 image_remote_digest() {
-    local out
-    out="$(run_bounded docker buildx imagetools inspect "$1" --format '{{json .Manifest.Digest}}')" || return 1
-    printf '%s' "$out" | tr -d '"'
+    local out digest
+    out="$(run_bounded docker buildx imagetools inspect "$1")" || return 1
+    digest="$(printf '%s
+' "$out" | awk '/^Digest:/ {print $2; exit}')"
+    case "$digest" in
+        sha256:*) [ "${#digest}" -eq 71 ] || return 1 ;;
+        *) return 1 ;;
+    esac
+    printf '%s' "$digest"
 }
 
 # ---------------------------------------------------------------------------
@@ -1187,6 +1233,120 @@ adopt_block_exists() {
 # 15. Validation layer -- fv_* / rv_* / db_validate
 # ---------------------------------------------------------------------------
 
+# The four folder checks. Each prints one status object and nothing else, so
+# `folder validate --check-type <name>` is a call to one of them and batch mode
+# is a call to all four. Keeping them separate is what makes single-check mode
+# honest: the Skip rules live inside the checks, not in the assembler, so
+# asking for one check gives the same verdict it would have given in a batch.
+
+# fv_location <loc>
+fv_location() {
+    if [ -d "$1" ]; then
+        status_obj 0 "Ok"
+    else
+        status_obj "$E_NOTFOUND" "Failed" "Folder does not exist"
+    fi
+}
+
+# fv_worktree <loc> -- is this a git work tree?
+#
+# folder_is_git tests `-e .git`, not `-d`: in a linked worktree or a submodule
+# `.git` is a FILE pointing at the real git directory. The older `-d` tests in
+# repo update/delete are the backlog item this check retires.
+fv_worktree() {
+    local loc="$1"
+    if [ ! -d "$loc" ]; then
+        status_obj 0 "Skipped" "Folder does not exist"
+    elif folder_is_git "$loc"; then
+        status_obj 0 "Ok"
+    else
+        status_obj "$E_GITFOLDER" "Failed" "Folder is not a git work tree"
+    fi
+}
+
+# fv_tracking <loc> -- does any record claim this folder?
+#
+# Deliberately NOT skipped when the folder is missing: a record listing a path
+# that no longer exists is exactly the interesting case, and `validate --fix`
+# is what prunes it.
+fv_tracking() {
+    local id
+    id="$(repos_find_by_location "$1" || true)"
+    if [ -n "$id" ]; then
+        status_obj 0 "Ok"
+    else
+        status_obj "$E_NOTFOUND" "Failed" "Folder is not tracked"
+    fi
+}
+
+# fv_origin <loc> -- do the folder's remote and branch match its record?
+#
+# Skipped whenever an earlier check already explains the problem, so one fault
+# is never counted twice. Until fix 50-04 this check had to Fail for "exists
+# but is not a git repo", because nothing else reported it; `worktree` reports
+# it now, so this skips that case too.
+fv_origin() {
+    local loc="$1" id
+    id="$(repos_find_by_location "$loc" || true)"
+
+    if [ ! -d "$loc" ]; then
+        status_obj 0 "Skipped" "Folder does not exist"
+        return 0
+    fi
+    if ! folder_is_git "$loc"; then
+        status_obj 0 "Skipped" "Folder is not a git work tree"
+        return 0
+    fi
+    if [ -z "$id" ]; then
+        status_obj 0 "Skipped" "Folder is not tracked"
+        return 0
+    fi
+
+    local url branch e_origin e_branch
+    url="$(adopt_read_origin "$loc" || true)"
+    branch="$(adopt_current_branch "$loc" || true)"
+    e_origin="$(repos_get_field "$id" origin)"
+    e_branch="$(repos_get_field "$id" branch)"
+
+    if [ -z "$url" ]; then
+        status_obj "$E_MISMATCH" "Failed" "Repo has no 'origin' remote"
+    elif [ -z "$e_origin" ]; then
+        # a record defect, not a folder defect -- repo validate's `fields`
+        # check is what reports it, and --fix is what repairs it
+        status_obj 0 "Skipped" "Record has no origin to compare"
+    elif [ "$url" != "$e_origin" ]; then
+        status_obj "$E_MISMATCH" "Failed" "Origin does not match the record"
+    elif [ -z "$branch" ]; then
+        status_obj "$E_MISMATCH" "Failed" "Cannot determine the current branch"
+    elif [ "$branch" != "$e_branch" ]; then
+        status_obj "$E_MISMATCH" "Failed" "Branch '$branch' does not match the record's '$e_branch'"
+    else
+        status_obj 0 "Ok"
+    fi
+}
+
+# FV_CHECKS -- the check order, which is also the order the exit code is
+# resolved in. An array, not a string: IFS has no space in this script.
+declare -ra FV_CHECKS=(location worktree tracking origin)
+
+# fv_checks_list -- the check names as one space-separated line.
+#
+# "${FV_CHECKS[*]}" alone would join them with a NEWLINE: [*] joins on the
+# first character of IFS, and this script sets IFS to newline-tab. The two
+# error messages below were arriving as four lines each before this existed.
+fv_checks_list() { local IFS=' '; printf '%s' "${FV_CHECKS[*]}"; }
+
+# fv_check <name> <loc> -- run exactly one check
+fv_check() {
+    case "$1" in
+        location) fv_location "$2" ;;
+        worktree) fv_worktree "$2" ;;
+        tracking) fv_tracking "$2" ;;
+        origin)   fv_origin   "$2" ;;
+        *) die "$E_ARGS" "invalid --check-type: '$1' (expected $(fv_checks_list))" ;;
+    esac
+}
+
 # fv_run <abs_path> -- prints the folder-validate JSON; returns 1 when any
 # check Failed, 0 otherwise.
 #
@@ -1195,64 +1355,28 @@ adopt_block_exists() {
 # and re-entering the script would repeat every pre-check and re-read the store
 # for each one.
 fv_run() {
-    local loc="$1"
-    local s_location s_tracking s_origin id rc=0
-
-    if [ -d "$loc" ]; then
-        s_location="$(status_obj 0 "Ok")"
-    else
-        s_location="$(status_obj "$E_NOTFOUND" "Failed" "Folder does not exist")"
-    fi
-
-    id="$(repos_find_by_location "$loc" || true)"
-    if [ -n "$id" ]; then
-        s_tracking="$(status_obj 0 "Ok")"
-    else
-        s_tracking="$(status_obj "$E_NOTFOUND" "Failed" "Folder is not tracked")"
-    fi
-
-    # `origin` is Skipped whenever an earlier check already explains the
-    # problem, so one fault is not counted twice. It is NOT skipped for a
-    # tracked folder that exists but is not a git repo: nothing else reports
-    # that, and skipping it would let a rotted location pass as healthy.
-    if [ ! -d "$loc" ]; then
-        s_origin="$(status_obj 0 "Skipped" "Folder does not exist")"
-    elif [ -z "$id" ]; then
-        s_origin="$(status_obj 0 "Skipped" "Folder is not tracked")"
-    elif ! folder_is_git "$loc"; then
-        s_origin="$(status_obj "$E_GITFOLDER" "Failed" "Folder is not a git repo")"
-    else
-        local url branch e_origin e_branch
-        url="$(adopt_read_origin "$loc" || true)"
-        branch="$(adopt_current_branch "$loc" || true)"
-        e_origin="$(repos_get_field "$id" origin)"
-        e_branch="$(repos_get_field "$id" branch)"
-
-        if [ -z "$url" ]; then
-            s_origin="$(status_obj "$E_MISMATCH" "Failed" "Repo has no 'origin' remote")"
-        elif [ -z "$e_origin" ]; then
-            # a record defect, not a folder defect -- repo validate's `fields`
-            # check is what reports it, and --fix is what repairs it
-            s_origin="$(status_obj 0 "Skipped" "Record has no origin to compare")"
-        elif [ "$url" != "$e_origin" ]; then
-            s_origin="$(status_obj "$E_MISMATCH" "Failed" "Origin does not match the record")"
-        elif [ -z "$branch" ]; then
-            s_origin="$(status_obj "$E_MISMATCH" "Failed" "Cannot determine the current branch")"
-        elif [ "$branch" != "$e_branch" ]; then
-            s_origin="$(status_obj "$E_MISMATCH" "Failed" "Branch '$branch' does not match the record's '$e_branch'")"
-        else
-            s_origin="$(status_obj 0 "Ok")"
-        fi
-    fi
-
-    jq -nc --argjson l "$s_location" --argjson t "$s_tracking" --argjson o "$s_origin" \
-        '{location: $l, tracking: $t, origin: $o}'
-
-    local s
-    for s in "$s_location" "$s_tracking" "$s_origin"; do
-        if status_failed "$s"; then rc=1; fi
+    local loc="$1" name out rc=0
+    local doc="{}"
+    for name in "${FV_CHECKS[@]}"; do
+        out="$(fv_check "$name" "$loc")"
+        doc="$(jq -c --arg k "$name" --argjson v "$out" '. + {($k): $v}' <<< "$doc")"
+        if status_failed "$out"; then rc=1; fi
     done
+    printf '%s
+' "$doc"
     return "$rc"
+}
+
+# fv_exit_code <fv_run json> -- the first failed check's own code, in
+# FV_CHECKS order, or 0 when nothing failed.
+#
+# `folder validate` reports the code of the fault rather than a bare 1, so a
+# caller can tell "no such folder" (5) from "not a git work tree" (6) without
+# parsing the document.
+fv_exit_code() {
+    jq -r '[.location, .worktree, .tracking, .origin]
+           | map(select(.status == "Failed"))
+           | if length == 0 then 0 else .[0].code end' <<< "$1"
 }
 
 # RV_REQUIRED_FIELDS -- every record must carry these. private_key/public_key
@@ -2109,11 +2233,25 @@ cmd_repo_validate() {
     exit "$rc"
 }
 
+# fv_check_type_set <value> -- validate and assign, for the flag loop
+fv_check_type_set() {
+    local c
+    for c in "${FV_CHECKS[@]}"; do
+        if [ "$1" = "$c" ]; then CHECK_TYPE="$1"; return 0; fi
+    done
+    die "$E_ARGS" "invalid --check-type: '$1' (expected $(fv_checks_list))"
+}
+
 cmd_folder_validate() {
     local args=()
+    local CHECK_TYPE=""
     while [ $# -gt 0 ]; do
         case "$1" in
             -h|--help) help_folder_validate; exit 0 ;;
+            -c|--check-type)
+                [ $# -ge 2 ] || die "$E_ARGS" "--check-type requires a value"
+                fv_check_type_set "$2"; shift 2 ;;
+            --check-type=*) fv_check_type_set "${1#*=}"; shift ;;
             --output-format)
                 [ $# -ge 2 ] || die "$E_ARGS" "--output-format requires a value"
                 output_format_set "$2"; shift 2 ;;
@@ -2128,9 +2266,18 @@ cmd_folder_validate() {
     precheck_common
     precheck_store
 
-    local loc out rc=0
+    local loc out rc
     loc="$(folder_resolve "${args[0]:-}")"
-    out="$(fv_run "$loc")" || rc=1
+
+    if [ -n "$CHECK_TYPE" ]; then
+        # single mode: one bare status object, and its own code as the exit
+        out="$(fv_check "$CHECK_TYPE" "$loc")"
+        rc="$(jq -r 'if .status == "Failed" then .code else 0 end' <<< "$out")"
+    else
+        out="$(fv_run "$loc")" || true
+        rc="$(fv_exit_code "$out")"
+    fi
+
     render_output "$out"
     exit "$rc"
 }
@@ -2402,20 +2549,27 @@ EOF
 
 help_folder_validate() {
     cat << 'EOF'
-git-utils folder validate [<path>] [--output-format json|text|yaml|plain]
+git-utils folder validate [<path>] [-c|--check-type <check>]
+                          [--output-format json|text|yaml|plain]
 
 Checks one cloned folder against the store. With no argument the current
 folder is used. There is no --fix; nothing is repaired or written.
 
-  location  the folder exists
-  tracking  the folder is in some record's locations
-  origin    the folder's origin remote and current branch match the record
+  location  the folder exists                                    (5)
+  worktree  the folder is a git work tree                        (6)
+  tracking  the folder is in some record's locations             (5)
+  origin    its origin remote and branch match the record        (8)
+
+With --check-type only that one check runs and the output is a single
+status object rather than four.
 
 A check reads 'Skipped' when an earlier one already explains the problem,
-so a single fault is not reported twice.
+so a single fault is not reported twice. That holds in single mode too:
+--check-type origin on a folder that does not exist is Skipped, not a
+manufactured failure.
 
-Exits 0 when every check passes, 1 otherwise. The per-check codes appear
-in the output, not in the exit code.
+Exits with the first failed check's own code, in the order above, or 0
+when every check passes.
 EOF
 }
 

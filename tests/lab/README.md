@@ -31,14 +31,26 @@ identities.
 
 ```bash
 tests/lab/push.sh                                   # copy scripts + suites
-tests/lab/ssh.sh 'cd ~/ss && bash tests/run-all.sh' # full regression
+tests/lab/ssh.sh 'cd ~/ss && bash tests/run-all.sh' # system-setup regression
 tests/lab/ssh.sh 'cd ~/ss && bash tests/test-hdd-expand.sh'
+
+tests/lab/ssh.sh 'cd ~/ss/tests/git-utils && bash run-all.sh'   # git-utils regression
 ```
 
 `push.sh` copies `system-setup`, `git-utils`, `setup` and `command-shortcuts`
 to `~/$SS_LAB_DIR/`, and every `tests/system-setup/` suite to
 `~/$SS_LAB_DIR/tests/`. The suites are flat there, so `run-all.sh` looks for
 `tests/test-*.sh` on the VM while they live in `tests/system-setup/` here.
+
+The `tests/git-utils/` suites are the exception: they keep their
+subdirectory, because `lib.sh` resolves the script under test as
+`$HERE/../../git-utils` and the layout has to match the repo's for that to
+land on the pushed script.
+
+The git-utils suites need this VM rather than WSL for one reason: `01-core`
+and `17-exec-bit` call `git-utils setup`, which runs `sudo`. `sudo` keys its
+cached credential to a tty by default, and a non-interactive `wsl.exe` call
+has none — so those two suites can only be run somewhere sudo is passwordless.
 
 ## Why these are in the repo
 

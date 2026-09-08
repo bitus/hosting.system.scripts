@@ -61,7 +61,7 @@ if [ -f "$WORK/wt/.git" ]; then
     check "worktree recognised as a git repo" \
         "$( echo "$LAST_OUT" | grep -q 'Not Tracked' && echo 1 || echo 0 )"
 else
-    echo "SKIP worktree fixture unavailable"
+    skip "worktree is recognised as a git repo" "worktree fixture unavailable"
 fi
 
 echo "=== output format plumbing ==="
