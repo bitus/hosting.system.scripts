@@ -3307,6 +3307,7 @@ Usage:
   git-utils repo clone <repo> [<folder_name>]
   git-utils repo update <repo> [--dry-run]
   git-utils repo redeploy <repo> [-i] [-t <s>] [--dry-run]
+  git-utils repo status (<repo> | -a) [-i] [-t <s>]
   git-utils repo delete <repo> [-f] [--with-folders]
   git-utils repo folders (<repo> | -a)
   git-utils repo list
