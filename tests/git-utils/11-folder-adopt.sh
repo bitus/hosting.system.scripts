@@ -202,7 +202,10 @@ check "record created for cwd.repo" "$( rec_exists cwd.repo && echo 1 || echo 0 
 
 echo "=== adopted repo is visible to the rest of the tool ==="
 run 0 "folder status on an adopted folder -> 0" folder status "$WORK/privwork"
-check "reports Ok" "$( echo "$LAST_OUT" | grep -qx 'status: Ok' && echo 1 || echo 0 )"
+# -x no longer matches: fix 50-04 gave the healthy status a description, so
+# the folded line reads "status: Ok - Not a docker compose project". The
+# claim here is only that an adopted folder is visible and healthy.
+check "reports Ok" "$( echo "$LAST_OUT" | grep -q '^status: Ok' && echo 1 || echo 0 )"
 run 0 "repo list includes adopted repos -> 0" repo list
 check "list shows the adopted private repo" "$( echo "$LAST_OUT" | grep -q 'sites.mysite.com' && echo 1 || echo 0 )"
 

@@ -2138,6 +2138,79 @@ ru_emit() {
         '{status: $s, locations: $l}')" "$PLAIN_PATH_STATUS"
 }
 
+# cmd_repo_redeploy -- folder redeploy across every location of one record.
+#
+# Deliberately does NOT run the record's fields/keys/ssh checks the way repo
+# update does. Redeploy touches containers, not git and not key material, so a
+# record defect is not a reason to refuse -- and a repo whose record needs
+# repairing should still be able to restart its containers.
+cmd_repo_redeploy() {
+    local args=()
+    FR_PULL=0
+    FR_DRY=0
+    FR_PULL_TIMEOUT="$PULL_TIMEOUT_DEFAULT"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_repo_redeploy; exit 0 ;;
+            -i|--pull-images) FR_PULL=1; shift ;;
+            --dry-run) FR_DRY=1; shift ;;
+            -t|--pull-timeout)
+                [ $# -ge 2 ] || die "$E_ARGS" "--pull-timeout requires a value"
+                FR_PULL_TIMEOUT="$2"; shift 2 ;;
+            --pull-timeout=*) FR_PULL_TIMEOUT="${1#*=}"; shift ;;
+            --output-format)
+                [ $# -ge 2 ] || die "$E_ARGS" "--output-format requires a value"
+                output_format_set "$2"; shift 2 ;;
+            --output-format=*) output_format_set "${1#*=}"; shift ;;
+            --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    [ "${#args[@]}" -le 1 ] || die "$E_ARGS" "unexpected argument: ${args[1]}"
+    redeploy_check_flags
+
+    precheck_common
+    precheck_store
+
+    resolve_repo_target "${args[0]:-}"
+    repos_resolve
+
+    if [ "${#REC_LOCATIONS[@]}" -eq 0 ]; then
+        ru_emit "$(status_obj "$E_NOTFOUND" "Failed" "Repository has no locations")" '[]'
+        exit "$E_NOTFOUND"
+    fi
+
+    # --pull-timeout bounds each folder's pull, not a budget shared across
+    # them, so one location's behaviour never depends on how long the previous
+    # one took. fr_run sets the deadline per call.
+    local rc=0
+    fanout_run fr_run "$E_NOCOMPOSE,$E_NOTRUNNING" "${REC_LOCATIONS[@]}" || rc=$?
+
+    local n_ok n_fail top
+    n_ok="$(jq -r '[.[] | select(.status.status == "Ok")] | length' <<< "$FANOUT_DOC")"
+    n_fail="$(jq -r '[.[] | select(.status.status == "Failed")] | length' <<< "$FANOUT_DOC")"
+    case "$rc" in
+        0)
+            if [ "$FR_DRY" -eq 1 ]; then
+                top="$(status_obj 0 "Ok" "$n_ok location(s) would be redeployed")"
+            else
+                top="$(status_obj 0 "Ok" "Redeployed $n_ok location(s)")"
+            fi ;;
+        "$E_NOCOMPOSE"|"$E_NOTRUNNING")
+            # Every location was skipped. Reporting 0 here would say a repo
+            # with nothing deployable had just been deployed; the first skip's
+            # own code says WHY nothing happened.
+            top="$(status_obj "$rc" "Skipped" "$(jq -r '.[0].status.description' <<< "$FANOUT_DOC")")" ;;
+        *)
+            top="$(status_obj "$rc" "Failed" "$n_fail location(s) failed")" ;;
+    esac
+
+    ru_emit "$top" "$FANOUT_DOC"
+    exit "$rc"
+}
+
+
 # cmd_repo_update -- folder update across every location of one record.
 cmd_repo_update() {
     local args=()
@@ -2381,12 +2454,17 @@ cmd_folder_redeploy() {
     exit "$rc"
 }
 
+# timeout_validate <value> <flag_name> -- a whole number of seconds, > 0.
+timeout_validate() {
+    case "$1" in
+        ""|*[!0-9]*) die "$E_ARGS" "$2 must be a whole number of seconds" ;;
+    esac
+    [ "$1" -gt 0 ] || die "$E_ARGS" "$2 must be greater than zero"
+}
+
 # redeploy_check_flags -- shared flag validation for both redeploy commands.
 redeploy_check_flags() {
-    case "$FR_PULL_TIMEOUT" in
-        ""|*[!0-9]*) die "$E_ARGS" "--pull-timeout must be a whole number of seconds" ;;
-    esac
-    [ "$FR_PULL_TIMEOUT" -gt 0 ] || die "$E_ARGS" "--pull-timeout must be greater than zero"
+    timeout_validate "$FR_PULL_TIMEOUT" "--pull-timeout"
     # Nothing is pulled in a dry run, so asking for both is asking for
     # something that cannot happen.
     if [ "$FR_PULL" -eq 1 ] && [ "$FR_DRY" -eq 1 ]; then
@@ -2537,11 +2615,178 @@ cmd_folder_repo() {
     render_output "$(jq -nc --arg id "$id" '{id: $id}')" "$PLAIN_ID"
 }
 
+# fs_update_available <loc> <branch> -- prints true/false; returns 1 if it
+# could not be determined.
+#
+# ls-remote, not fetch: a reporting command must not mutate .git. The
+# trade-off is that this compares the remote branch head against local HEAD
+# and so answers "different", not "behind/ahead/diverged" -- which is enough
+# here. folder update does the fetch and gets the exact answer.
+fs_update_available() {
+    local loc="$1" branch="$2" remote rhead lhead
+    remote="$(run_bounded git -C "$loc" ls-remote origin "refs/heads/$branch" 2>/dev/null)" || return 1
+    [ -n "$remote" ] || return 1
+    rhead="${remote%%$'\t'*}"
+    lhead="$(git -C "$loc" rev-parse HEAD 2>/dev/null)" || return 1
+    [ -n "$lhead" ] || return 1
+    if [ "$rhead" = "$lhead" ]; then printf 'false'; else printf 'true'; fi
+}
+
+# fs_images <loc> -- the live compose images as a JSON array.
+#
+# Enumerated from the compose CONFIG rather than from running containers, so
+# a declared-but-stopped service still appears; ps only supplies the
+# service-to-container mapping. That is also why `built` is trustworthy here
+# and is not offered by repo status: only the config knows about `build:`.
+#
+# The two ids compared are IMAGE IDS on both sides -- .Id against a
+# container's .Image -- never a repo digest. See the docker layer.
+fs_images() {
+    local loc="$1" cfg ps_json out='[]'
+    cfg="$(images_compose_config_json "$loc" 2>/dev/null)" || { printf '[]'; return 1; }
+    ps_json="$(compose_ps_json "$loc" 2>/dev/null)" || ps_json='[]'
+
+    local svc built ref cid local_id running_id st
+    while IFS=$'\t' read -r svc built ref; do
+        [ -n "$svc" ] || continue
+
+        # A build-only service has no image in the config; compose names the
+        # built image <project>-<service>, and ps is where that name shows up.
+        if [ -z "$ref" ]; then
+            ref="$(jq -r --arg s "$svc" 'map(select(.Service == $s)) | .[0].Image // ""' <<< "$ps_json")"
+        fi
+        cid="$(jq -r --arg s "$svc" \
+            'map(select(.Service == $s and .State == "running")) | .[0].ID // ""' <<< "$ps_json")"
+
+        local_id=""
+        running_id=""
+        if [ -n "$ref" ]; then
+            local_id="$(image_id_local "$ref" 2>/dev/null)" || local_id=""
+            if [ -n "$local_id" ]; then
+                st="$(status_obj 0 "Ok")"
+            else
+                st="$(status_obj "$E_IMAGE" "Failed" "Image '$ref' is not present locally")"
+            fi
+        else
+            st="$(status_obj 0 "Skipped" "Service '$svc' has no image yet")"
+        fi
+        [ -z "$cid" ] || running_id="$(container_image_id "$cid" 2>/dev/null)" || running_id=""
+
+        out="$(jq -c --arg id "$ref" --arg name "$(image_ref_repo "${ref:-}")" \
+            --argjson built "$built" --argjson st "$st" \
+            --arg local_id "$local_id" --arg running_id "$running_id" \
+            '. + [{
+                id: (if $id == "" then null else $id end),
+                name: (if $id == "" then null else $name end),
+                status: $st,
+                built: ($built == 1),
+                local_image_id: (if $local_id == "" then null else $local_id end),
+                running_image_id: (if $running_id == "" then null else $running_id end),
+                restart_pending: (
+                    if $local_id == "" or $running_id == "" then false
+                    else $local_id != $running_id end)
+            }]' <<< "$out")"
+    done < <(jq -r '.services // {} | to_entries[]
+                    | [.key, (if .value.build then 1 else 0 end), (.value.image // "")] | @tsv' <<< "$cfg")
+
+    printf '%s' "$out"
+}
+
+# fs_emit <path> <status> <update_available> <docker_running> <images> <code>
+#
+# Prints the document and RETURNS the code -- it does not exit, because
+# repo status nests one of these per location and cannot afford a worker that
+# leaves. fs_run is where the return becomes the caller's.
+fs_emit() {
+    jq -nc --arg p "$1" --argjson s "$2" --argjson u "$3" \
+        --argjson d "$4" --argjson i "$5" \
+        '{path: $p, status: $s, update_available: $u, docker_running: $d, images: $i}'
+    return "$6"
+}
+
+# fs_run <loc> -- the folder status document; returns its code.
+fs_run() {
+    local loc="$1" fvout rc
+
+    # 1. Nothing else can be assessed without a git work tree, so 5 and 6 end
+    #    the run with the remaining fields defaulted.
+    fvout="$(fv_run "$loc")" || true
+    rc="$(fv_exit_code "$fvout")"
+    case "$rc" in
+        5|6)
+            fs_emit "$loc" "$(jq -c '[.location, .worktree, .tracking, .origin]
+                                     | map(select(.status == "Failed")) | .[0]' <<< "$fvout")" \
+                    null null '[]' "$rc"
+            return ;;
+    esac
+
+    # 2. A network fault must not hide the container state, so this failure is
+    #    RECORDED and the run continues. Its code outranks whatever the later
+    #    steps report.
+    local tracked_rc=0 update_available=null branch
+    branch="$(adopt_current_branch "$loc" 2>/dev/null)" || branch=""
+    if [ -z "$branch" ]; then
+        tracked_rc="$E_CMDOUTPUT"
+    elif ! update_available="$(fs_update_available "$loc" "$branch")"; then
+        tracked_rc="$E_CMDOUTPUT"
+        update_available=null
+    fi
+
+    # 3. Not a compose project: docker is irrelevant to this folder and is
+    #    never asked about. docker_running stays NULL -- "does not apply" is a
+    #    different answer from "nothing is running".
+    if ! images_is_compose_project "$loc"; then
+        if [ "$tracked_rc" -ne 0 ]; then
+            fs_emit "$loc" "$(status_obj "$tracked_rc" "Failed" "Cannot determine whether the remote has updates")" \
+                    "$update_available" null '[]' "$tracked_rc"
+            return
+        fi
+        fs_emit "$loc" "$(status_obj 0 "Ok" "Not a docker compose project")" \
+                "$update_available" null '[]' 0
+        return
+    fi
+
+    # 4. A compose project we cannot ask about.
+    if ! compose_available || ! docker_daemon_ok; then
+        local code="$tracked_rc"
+        [ "$code" -ne 0 ] || code="$E_PRECHECK"
+        fs_emit "$loc" "$(status_obj "$E_PRECHECK" "Failed" "docker is not available")" \
+                "$update_available" null '[]' "$code"
+        return
+    fi
+
+    # 5. Container state and the live image list.
+    local running=false cr=0
+    compose_running "$loc" || cr=$?
+    case "$cr" in
+        0) running=true ;;
+        1) running=false ;;
+        *) fs_emit "$loc" "$(status_obj "$E_PRECHECK" "Failed" "cannot determine whether the project is running")" \
+                   "$update_available" null '[]' "$E_PRECHECK"
+           return ;;
+    esac
+
+    local images
+    images="$(fs_images "$loc")" || images='[]'
+
+    if [ "$tracked_rc" -ne 0 ]; then
+        fs_emit "$loc" "$(status_obj "$tracked_rc" "Failed" "Cannot determine whether the remote has updates")" \
+                "$update_available" "$running" "$images" "$tracked_rc"
+        return
+    fi
+    fs_emit "$loc" "$(status_obj 0 "Ok")" "$update_available" "$running" "$images" 0
+}
+
 cmd_folder_status() {
     local args=()
+    local timeout="$STATUS_TIMEOUT_DEFAULT"
     while [ $# -gt 0 ]; do
         case "$1" in
             -h|--help) help_folder_status; exit 0 ;;
+            -t|--timeout)
+                [ $# -ge 2 ] || die "$E_ARGS" "--timeout requires a value"
+                timeout="$2"; shift 2 ;;
+            --timeout=*) timeout="${1#*=}"; shift ;;
             --output-format)
                 [ $# -ge 2 ] || die "$E_ARGS" "--output-format requires a value"
                 output_format_set "$2"; shift 2 ;;
@@ -2552,29 +2797,21 @@ cmd_folder_status() {
         esac
     done
     [ "${#args[@]}" -le 1 ] || die "$E_ARGS" "unexpected argument: ${args[1]}"
+    timeout_validate "$timeout" "--timeout"
 
     precheck_common
     precheck_store
 
-    local path status code=0
-    path="$(folder_resolve "${args[0]:-}")"
+    # Only when nobody set one already: repo status passes its per-repo
+    # deadline down, and that must OVERRIDE this default rather than stacking
+    # a second budget on top of it.
+    [ "$DEADLINE" -gt 0 ] || deadline_set "$timeout"
 
-    # ordered, first failure wins
-    if [ ! -d "$path" ]; then
-        status="$(status_obj "$E_NOTFOUND" "Not Found" "Folder doesnt exist")"
-        code=1
-    elif ! folder_is_git "$path"; then
-        status="$(status_obj "$E_GITFOLDER" "Not Git Folder" "Folder is not a git repo")"
-        code=1
-    elif [ -z "$(repos_find_by_location "$path")" ]; then
-        status="$(status_obj "$E_NOTFOUND" "Not Tracked" "Git repo is not tracked")"
-        code=1
-    else
-        status="$(status_obj 0 "Ok")"
-    fi
-
-    render_output "$(jq -nc --argjson s "$status" '{status: $s}')"
-    exit "$code"
+    local loc doc rc=0
+    loc="$(folder_resolve "${args[0]:-}")"
+    doc="$(fs_run "$loc")" || rc=$?
+    render_output "$doc"
+    exit "$rc"
 }
 
 cmd_validate() {
@@ -2903,6 +3140,7 @@ Usage:
   git-utils repo add <org/name[/branch]> [-n <key>]
   git-utils repo clone <repo> [<folder_name>]
   git-utils repo update <repo> [--dry-run]
+  git-utils repo redeploy <repo> [-i] [-t <s>] [--dry-run]
   git-utils repo delete <repo> [-f] [--with-folders]
   git-utils repo folders (<repo> | -a)
   git-utils repo list
@@ -3138,20 +3376,33 @@ EOF
 
 help_folder_status() {
     cat << 'EOF'
-git-utils folder status [<path>] [--output-format json|text|yaml|plain]
+git-utils folder status [<path>] [-t|--timeout <s>]
+                        [--output-format json|text|yaml|plain]
 
-Reports whether a folder is a tracked git repo. With no argument the
-current folder is used. The argument is always a filesystem path, never
-a repo key.
+Reports one folder: whether its remote has anything new, whether its compose
+containers are running, and how the running containers compare with the
+images on disk. With no argument the current folder is used.
 
-Checks run in order and stop at the first failure:
+  update_available   true/false, or null when it could not be determined
+  docker_running     true/false, or null when this is not a compose project
+  images             one entry per compose service
 
-  code 5  Not Found        the folder does not exist
-  code 6  Not Git Folder   the folder is not a git repo
-  code 5  Not Tracked      the git repo is not in the store
+Nothing is changed. update_available uses `git ls-remote`, not a fetch, so
+.git is never written to -- the trade-off is that it answers "different",
+not "behind or ahead". folder update does the fetch and gets the exact
+answer.
 
-Exits 0 when the folder is a tracked git repo, 1 otherwise. The status
-code above appears in the output, not in the exit code.
+A remote that cannot be reached does NOT hide the container state: the
+failure is recorded, the run continues, and its code outranks the rest.
+
+restart_pending compares IMAGE IDS -- the image a container is running
+against the image its reference resolves to now -- so it means "pulled or
+rebuilt but not restarted". That is a different question from repo status's
+pull_available, which compares registry digests.
+
+Exits 5 or 6 when the folder is not a usable work tree, 10 when git could
+not be asked, 1 when docker could not be asked, and 0 otherwise --
+including when the folder is simply not a compose project.
 EOF
 }
 
@@ -3205,6 +3456,36 @@ git-utils repo clone <repo_key_or_full_name> [<folder_name>]
 Clones a tracked repo from the origin recorded for it, which for a repo
 added by git-utils goes through its deploy key. Defaults the destination
 folder to the repo name.
+EOF
+}
+
+help_repo_redeploy() {
+    cat << 'EOF'
+git-utils repo redeploy <repo_key_or_full_name> [-i|--pull-images]
+                        [-t|--pull-timeout <s>] [--dry-run]
+                        [--output-format json|text|yaml|plain]
+
+Runs folder redeploy on every location of one record. A path is not
+accepted; to redeploy a single checkout use:
+
+  git-utils folder redeploy <path>
+
+Every location is processed even after one fails. A location that is not a
+compose project (14) or whose stack is stopped (16) is SKIPPED, not failed:
+neither is a fault, and a repo that mixes a compose deployment with a plain
+checkout should not report failure for the plain one.
+
+  0   at least one location was redeployed, none failed
+  14  every location was skipped, the first because it is not a compose
+      project
+  16  every location was skipped, the first because nothing is running
+  3   at least one location failed
+  5   the record has no locations
+
+--pull-timeout applies PER folder, not as a budget shared across them.
+
+Unlike repo update this does not check the record's fields, keys or ssh
+config: redeploy touches containers, not git or key material.
 EOF
 }
 
@@ -3301,6 +3582,7 @@ main() {
                 add) shift; cmd_repo_add "$@" ;;
                 delete) shift; cmd_repo_delete "$@" ;;
                 clone) shift; cmd_repo_clone "$@" ;;
+                redeploy) shift; cmd_repo_redeploy "$@" ;;
                 update) shift; cmd_repo_update "$@" ;;
                 folders) shift; cmd_repo_folders "$@" ;;
                 list) shift; cmd_repo_list "$@" ;;
