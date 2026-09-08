@@ -5,3 +5,10 @@
 command-shortcuts-custom
 
 CLAUDE.md
+
+# Lab helpers: the mechanism is committed, the credentials and the target
+# host are per-operator and must not be. The private key especially.
+tests/lab/target
+tests/lab/known_hosts
+tests/lab/*_key
+tests/lab/*_key.pub
