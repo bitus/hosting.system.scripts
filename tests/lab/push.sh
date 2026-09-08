@@ -25,4 +25,12 @@ scp "${LAB_SSH_OPTS[@]}" -q \
     "$REPO_ROOT"/tests/git-utils/*.sh \
     "$LAB_HOST:$LAB_REMOTE_DIR/tests/git-utils/"
 
+# The repository's .git, so the suites that assert file modes recorded in
+# git can actually run here. 17-exec-bit reads `git ls-files -s` to prove
+# the executable bit is committed -- the fault behind fix 50-03 -- and with
+# only scp'd files there is no index to read. Tarred rather than scp -r:
+# a few hundred loose objects over ssh is far slower one file at a time.
+tar -C "$REPO_ROOT" -czf - .git \
+    | ssh "${LAB_SSH_OPTS[@]}" "$LAB_HOST" "tar -xzf - -C '$LAB_REMOTE_DIR'"
+
 printf 'pushed to %s:%s\n' "$LAB_HOST" "$LAB_REMOTE_DIR"

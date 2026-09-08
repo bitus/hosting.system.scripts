@@ -119,6 +119,10 @@ def fold:
   else . end;
 fold'
 
+# Plain renderers. Each is a jq program emitting raw lines for `--output-format
+# plain`.
+readonly PLAIN_ID='.id'
+
 readonly OUTPUT_FORMAT_DEFAULT="plain"
 OUTPUT_FORMAT="$OUTPUT_FORMAT_DEFAULT"
 
@@ -423,6 +427,37 @@ parse_repo_name() {
     validate_part "$REPO_ORG" 3 "org"
     validate_part "$REPO_NAME" 3 "name"
     validate_part "$REPO_BRANCH" 1 "branch"
+}
+
+# resolve_repo_target <value> -- repo key or full name; NEVER a path.
+#
+# Fix 50-04 split the two address spaces: `repo` commands name a record,
+# `folder` commands name a place on disk. The error points at the bridge
+# rather than just refusing, because a user standing in a checkout has to be
+# told what to type instead.
+# shellcheck disable=SC2016  # the single quotes below are literal message
+# text showing the user what to type; $value is inside double quotes and does
+# expand
+resolve_repo_target() {
+    local value="${1:-}" hint="${2:-}"
+    [ -n "$value" ] || die "$E_ARGS" "this command needs a repo key or full repo name"
+    case "$value" in
+        .|..|/*|./*|../*|~*)
+            die "$E_ARGS" "repo commands take a repo key or full repo name, not a path${hint:+ -- for a folder, use: git-utils $hint '$value'} -- or bridge it: git-utils repo <cmd> \"\$(git-utils folder repo '$value')\"" ;;
+    esac
+    if [ -d "$value" ]; then
+        die "$E_ARGS" "'$value' is a folder${hint:+ -- use: git-utils $hint '$value'} -- or bridge it: git-utils repo <cmd> \"\$(git-utils folder repo '$value')\""
+    fi
+
+    if [[ "$value" == */* ]]; then
+        TARGET_KIND="fullname"
+        parse_repo_name "$value"
+        TARGET_VALUE="$value"
+    else
+        TARGET_KIND="key"
+        validate_part "$value" 3 "key"
+        TARGET_VALUE="$value"
+    fi
 }
 
 # resolve_target [<value>]  -- sets TARGET_KIND (path|fullname|key), TARGET_VALUE
@@ -1893,12 +1928,13 @@ EOF
 }
 
 cmd_repo_delete() {
-    local force=0
+    local force=0 with_folders=0
     local args=()
     while [ $# -gt 0 ]; do
         case "$1" in
             -h|--help) help_repo_delete; exit 0 ;;
             -f|--force) force=1; shift ;;
+            --with-folders) with_folders=1; shift ;;
             --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
             -*) die "$E_ARGS" "unknown flag: $1" ;;
             *) args+=("$1"); shift ;;
@@ -1911,7 +1947,7 @@ cmd_repo_delete() {
     precheck_common
     precheck_store
 
-    resolve_target "$target"
+    resolve_repo_target "$target"
     repos_resolve
 
     # git-utils only removes key material it created. A foreign repo's keys and
@@ -1930,20 +1966,40 @@ cmd_repo_delete() {
 
     local loc
     for loc in "${REC_LOCATIONS[@]}"; do
-        [ "$TARGET_KIND" = "path" ] && [ "$loc" = "$TARGET_VALUE" ] && continue
         [ -e "$loc" ] || warn "recorded location no longer exists: $loc"
     done
 
-    if [ "$TARGET_KIND" = "path" ] && [ -d "$TARGET_VALUE/.git" ]; then
-        local dirty
-        dirty="$(cd "$TARGET_VALUE" && git status --porcelain --ignored)"
-        if [ -n "$dirty" ]; then
-            confirm "'$TARGET_VALUE' has untracked/ignored files. Delete anyway?" || exit 0
-        fi
-    fi
-
     local del_key="$REC_KEY"
     local -a del_locations=("${REC_LOCATIONS[@]}")
+
+    if [ "$with_folders" -eq 1 ]; then
+        # Guards and confirmation run BEFORE the store is touched, so
+        # declining leaves the record intact as well as the folders. With a
+        # path target there was one folder at stake and the check could run
+        # late; now every location is.
+        local l
+        for l in "${del_locations[@]}"; do
+            case "$l" in
+                "/"|"$HOME") die "$E_IO" "refusing to delete $l" ;;
+            esac
+        done
+
+        # One prompt naming every dirty location, rather than one per folder.
+        local -a dirty_locs=()
+        for l in "${del_locations[@]}"; do
+            folder_is_git "$l" || continue
+            if [ -n "$(cd "$l" && git status --porcelain --ignored)" ]; then
+                dirty_locs+=("$l")
+            fi
+        done
+        if [ "${#dirty_locs[@]}" -gt 0 ]; then
+            local msg
+            msg="$(printf 'these folders have untracked or ignored files:\n'
+                    printf '  %s\n' "${dirty_locs[@]}"
+                    printf 'Delete them anyway?')"
+            confirm "$msg" || exit 0
+        fi
+    fi
 
     store_lock
     if [ "$owns_keys" -eq 1 ]; then
@@ -1952,19 +2008,22 @@ cmd_repo_delete() {
     repos_delete "$del_key"
     store_unlock
 
-    if [ "$TARGET_KIND" = "path" ]; then
-        case "$TARGET_VALUE" in
-            "/"|"$HOME") die "$E_IO" "refusing to delete $TARGET_VALUE" ;;
-        esac
-        local recorded_match=0 rl
-        for rl in "${del_locations[@]}"; do
-            [ "$rl" = "$TARGET_VALUE" ] && recorded_match=1
+    if [ "$with_folders" -eq 1 ]; then
+        # Only recorded locations are ever removed -- iterating the record IS
+        # the guard the path form needed an explicit check for. A failed rm
+        # leaves an untracked folder and exit 3; the reverse order would leave
+        # a record pointing at nothing, which looks healthy until read.
+        local rc=0 l
+        for l in "${del_locations[@]}"; do
+            [ -e "$l" ] || continue
+            if ! rm -rf "$l"; then
+                warn "failed to remove folder; orphaned path: $l"
+                rc="$E_IO"
+            fi
         done
-        [ "$recorded_match" -eq 1 ] || die "$E_IO" "refusing to delete '$TARGET_VALUE': not a recorded location"
-
-        if ! rm -rf "$TARGET_VALUE"; then
-            warn "failed to remove folder; orphaned path: $TARGET_VALUE"
-            exit "$E_IO"
+        if [ "$rc" -ne 0 ]; then
+            info "deleted repo '$del_key'"
+            exit "$rc"
         fi
     fi
 
@@ -1988,9 +2047,7 @@ cmd_repo_clone() {
     precheck_common
     precheck_store
 
-    resolve_target "$target"
-    [ "$TARGET_KIND" != "path" ] || die "$E_ARGS" "repo clone requires a repo key or full repo name, not a path"
-
+    resolve_repo_target "$target"
     repos_resolve
 
     local out="${dest:-$REC_NAME}"
@@ -2036,7 +2093,7 @@ cmd_repo_update() {
     precheck_common
     precheck_store
 
-    resolve_target "$target"
+    resolve_repo_target "$target"
     repos_resolve
 
     local -a targets=()
@@ -2112,7 +2169,7 @@ cmd_repo_info() {
 
     # all three target forms, resolved exactly as repo update/delete resolve
     # theirs; no argument means the current folder
-    resolve_target "${args[0]:-}"
+    resolve_repo_target "${args[0]:-}"
     repos_resolve
 
     # `{id: $k} + record` puts id first: jq preserves insertion order, and so
@@ -2131,6 +2188,48 @@ folder_is_git() { [ -e "$1/.git" ]; }
 # bare token is a relative path, never a repo key. -m: the path is allowed
 # not to exist, since "Not Found" is one of the answers.
 folder_resolve() { realpath -m -- "${1:-$PWD}"; }
+
+# cmd_folder_repo -- which repo owns this folder?
+#
+# The bridge between the two address spaces. `repo` commands stopped taking
+# paths in fix 50-04, so this is what a caller standing in a checkout pipes
+# into them.
+cmd_folder_repo() {
+    local args=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_folder_repo; exit 0 ;;
+            --output-format)
+                [ $# -ge 2 ] || die "$E_ARGS" "--output-format requires a value"
+                output_format_set "$2"; shift 2 ;;
+            --output-format=*) output_format_set "${1#*=}"; shift ;;
+            --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    [ "${#args[@]}" -le 1 ] || die "$E_ARGS" "unexpected argument: ${args[1]}"
+
+    precheck_common
+    precheck_store
+
+    local loc out rc
+    loc="$(folder_resolve "${args[0]:-}")"
+    out="$(fv_run "$loc")" || true
+    rc="$(fv_exit_code "$out")"
+
+    # 5 and 6 are the codes that mean there is no repo to name: the folder is
+    # missing, is not a work tree, or no record claims it. An origin mismatch
+    # (8) still resolves -- the record is identifiable, it merely disagrees,
+    # and `repo validate` is exactly where a caller would pipe it next.
+    case "$rc" in
+        5|6) exit "$rc" ;;
+    esac
+
+    local id
+    id="$(repos_find_by_location "$loc")"
+    render_output "$(jq -nc --arg id "$id" '{id: $id}')" "$PLAIN_ID"
+}
 
 cmd_folder_status() {
     local args=()
@@ -2222,7 +2321,7 @@ cmd_repo_validate() {
     precheck_common
     precheck_store
 
-    resolve_target "${args[0]}"
+    resolve_repo_target "${args[0]}" "folder validate"
     [ "$TARGET_KIND" != "path" ] \
         || die "$E_ARGS" "repo validate takes a repo key or full repo name, not a path (use 'folder validate')"
     repos_resolve
@@ -2463,8 +2562,11 @@ Usage:
 
   git-utils validate [--fix]
 
-Repo commands accept a repo key, a full org/name/branch, or the path of a
-cloned folder. Folder commands always take a filesystem path.
+Repo commands take a repo key or a full org/name/branch -- never a path.
+Folder commands take a filesystem path. `git-utils folder repo <path>`
+bridges the two:
+
+  git-utils repo info "$(git-utils folder repo)"
 
 repo info, repo validate, folder status, folder validate and validate
 accept --output-format json|text|yaml|plain (default plain).
@@ -2530,6 +2632,7 @@ Checks one repo record. Prints the record with a 'checks' object added:
   fields     every field the schema requires is present
   keys       the deploy key pair exists on disk    (private repos)
   ssh        ~/.ssh/config holds its sentinel block (private, non-foreign)
+  folder repo       which repo owns a folder
   locations  folder validate run against each recorded location
   health     the overall verdict
 
@@ -2600,6 +2703,25 @@ record, 10 unusable origin or detached HEAD, 3 deploy keys not found.
 EOF
 }
 
+help_folder_repo() {
+    cat << 'EOF'
+git-utils folder repo [<path>] [--output-format json|text|yaml|plain]
+
+Prints the id of the repo that owns a folder. With no argument the current
+folder is used.
+
+Repo commands take a repo key or full name, never a path, so this is how a
+checkout reaches them:
+
+  git-utils repo info "$(git-utils folder repo)"
+  git-utils repo validate "$(git-utils folder repo /srv/app)"
+
+Exits 5 when the folder does not exist or no record claims it, 6 when it is
+not a git work tree, and 0 otherwise -- including when the folder's origin
+disagrees with its record, since the repo is still identifiable.
+EOF
+}
+
 help_folder_status() {
     cat << 'EOF'
 git-utils folder status [<path>] [--output-format json|text|yaml|plain]
@@ -2643,15 +2765,22 @@ EOF
 
 help_repo_delete() {
     cat << 'EOF'
-git-utils repo delete [<repo_key_or_full_name_or_path>] [-f|--force]
+git-utils repo delete <repo_key_or_full_name> [-f|--force] [--with-folders]
 
-Removes a tracked repo, its deploy key, and (if a path/current folder
-was given) the cloned folder itself. With no argument, the current
-folder is used.
+Removes a tracked repo and its deploy key. The checkouts are left alone
+unless --with-folders is given, in which case every recorded location is
+removed from disk as well.
+
+A path is not accepted; use: git-utils repo delete "$(git-utils folder repo)"
+
+--with-folders removes ALL of the record's locations, not one. Only
+recorded locations are ever touched, / and $HOME are refused outright, and
+if any location has untracked or ignored files you are asked once, naming
+them -- declining deletes nothing at all, not even the record.
 
 Key material is only removed when git-utils created it. An adopted
 (foreign) repo keeps its key pair and its ~/.ssh/config block, and a
-public repo has none -- in both cases only the record and the folder go.
+public repo has none -- in both cases only the record goes.
 EOF
 }
 
@@ -2749,6 +2878,7 @@ main() {
                     help_main
                     exit 0
                     ;;
+                repo|repository) shift; cmd_folder_repo "$@" ;;
                 status) shift; cmd_folder_status "$@" ;;
                 adopt) shift; cmd_folder_adopt "$@" ;;
                 validate) shift; cmd_folder_validate "$@" ;;

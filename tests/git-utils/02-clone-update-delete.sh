@@ -25,28 +25,34 @@ echo "=== clone to a second location ==="
 run 0 "clone to dest2 -> 0" repo clone clonekey "$WORK/dest2"
 check "2 locations tracked" "$( [ "$(loc_count clonekey)" = "2" ] && echo 1 || echo 0 )"
 
-echo "=== repo update, path target without --all ==="
+echo "=== repo update now always covers every location ==="
+# Before fix 50-04 a path target updated just that location and --all
+# widened it. Path targets are gone, so `repo update <key>` covers every
+# location and there is no narrower form here any more -- updating ONE
+# checkout is `folder update <path>`, which arrives in phase 6.
 echo more >> "$WORK/seed1/f.txt"
 push_seed 1
-run 0 "update dest1 -> 0" repo update "$WORK/dest1"
+run 2 "a path target is now an argument error -> 2" repo update "$WORK/dest1"
+run 0 "update by key -> 0" repo update clonekey
 check "dest1 updated" "$( grep -q more "$WORK/dest1/f.txt" && echo 1 || echo 0 )"
-check "dest2 untouched (no --all)" "$( grep -q more "$WORK/dest2/f.txt" 2>/dev/null && echo 0 || echo 1 )"
+check "dest2 updated too" "$( grep -q more "$WORK/dest2/f.txt" && echo 1 || echo 0 )"
 
-echo "=== repo update --all ==="
-run 0 "update --all -> 0" repo update "$WORK/dest1" --all
-check "dest2 updated with --all" "$( grep -q more "$WORK/dest2/f.txt" && echo 1 || echo 0 )"
-
-echo "=== delete . with untracked files, non-tty, no -f -> 2 ==="
+echo "=== delete: dirty tree, non-tty, no --force -> 2 ==="
+# The cwd form is gone with path targets. What it really exercised -- a
+# dirty checkout refusing to be destroyed without confirmation -- is kept,
+# addressed by key through --with-folders.
 touch "$WORK/dest1/untracked.txt"
-out="$(cd "$WORK/dest1" && bash "$GU" repo delete </dev/null 2>"$WORK/err.log")"; code=$?
-check "delete untracked non-tty -> 2" "$( [ "$code" -eq 2 ] && echo 1 || echo 0 )"
+run 2 "dirty tree, no --force -> 2" repo delete clonekey --with-folders
 check "dest1 not deleted" "$( [ -d "$WORK/dest1" ] && echo 1 || echo 0 )"
+check "record not deleted either" "$( rec_exists clonekey && echo 1 || echo 0 )"
 
-echo "=== delete . with untracked files, --force -> 0 ==="
-out="$(cd "$WORK/dest1" && bash "$GU" repo delete --force </dev/null 2>"$WORK/err.log")"; code=$?
-check "force delete -> 0" "$( [ "$code" -eq 0 ] && echo 1 || echo 0 )"
+echo "=== delete --with-folders --force removes EVERY location ==="
+# The old test asserted dest2 survived, because a path target deleted one
+# folder. --with-folders is deliberately wider: the argument names a record,
+# so every location goes.
+run 0 "force delete -> 0" repo delete clonekey --with-folders --force
 check "dest1 folder removed" "$( [ -d "$WORK/dest1" ] && echo 0 || echo 1 )"
+check "dest2 folder removed as well" "$( [ -d "$WORK/dest2" ] && echo 0 || echo 1 )"
 check "clonekey record removed" "$( rec_exists clonekey && echo 0 || echo 1 )"
-check "dest2 (other location) left on disk" "$( [ -d "$WORK/dest2" ] && echo 1 || echo 0 )"
 
 gu_total

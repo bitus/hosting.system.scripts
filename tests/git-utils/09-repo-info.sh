@@ -21,15 +21,22 @@ check "id has the right value" "$( echo "$BY_KEY" | jq -e '.id == "inf1"' >/dev/
 run 0 "by full name -> 0" repo info infoorg/inforepo/main --output-format json
 check "full-name form matches by-key" "$( [ "$LAST_OUT" = "$BY_KEY" ] && echo 1 || echo 0 )"
 
-run 0 "by path -> 0" repo info "$WORK/tracked" --output-format json
-check "path form matches by-key" "$( [ "$LAST_OUT" = "$BY_KEY" ] && echo 1 || echo 0 )"
+# Fix 50-04 dropped path targets from repo commands. These three forms were
+# path, cwd and '.'; each is now an argument error, and each is followed by
+# the same lookup through `folder repo`. Keeping both halves is the point:
+# the capability moved, it was not lost.
+run 2 "by path -> 2" repo info "$WORK/tracked" --output-format json
+check "the error names the bridge" "$( printf '%s' "$LAST_ERR" | grep -q 'folder repo' && echo 1 || echo 0 )"
+run 2 "explicit . -> 2" repo info . --output-format json
 
 out="$(cd "$WORK/tracked" && bash "$GU" repo info --output-format json </dev/null 2>"$WORK/err.log")"; code=$?
-check "no argument defaults to cwd -> 0" "$( [ "$code" -eq 0 ] && echo 1 || echo 0 )"
-check "cwd form matches by-key" "$( [ "$out" = "$BY_KEY" ] && echo 1 || echo 0 )"
+check "no argument is now an error -> 2" "$( [ "$code" -eq 2 ] && echo 1 || echo 0 )"
 
-out="$(cd "$WORK/tracked" && bash "$GU" repo info . --output-format json </dev/null 2>"$WORK/err.log")"; code=$?
-check "explicit '.' matches by-key" "$( [ "$out" = "$BY_KEY" ] && echo 1 || echo 0 )"
+ID="$(cd "$WORK/tracked" && bash "$GU" folder repo </dev/null 2>/dev/null)"
+run 0 "bridged from a path -> 0" repo info "$ID" --output-format json
+check "bridged form matches by-key" "$( [ "$LAST_OUT" = "$BY_KEY" ] && echo 1 || echo 0 )"
+out="$(cd "$WORK/tracked" && bash "$GU" repo info "$(bash "$GU" folder repo)" --output-format json </dev/null 2>/dev/null)"
+check "bridged from cwd matches by-key" "$( [ "$out" = "$BY_KEY" ] && echo 1 || echo 0 )"
 
 echo "=== record content is the stored record ==="
 check "name" "$( echo "$BY_KEY" | jq -e '.name == "inforepo"' >/dev/null && echo 1 || echo 0 )"
@@ -46,10 +53,15 @@ run 5 "unknown key -> 5" repo info nosuchkey
 run 5 "unknown full name -> 5" repo info someorg/somerepo/main
 mkdir -p "$WORK/untracked"
 ( cd "$WORK/untracked" && git init -q )
-run 5 "untracked git folder -> 5" repo info "$WORK/untracked"
-run 5 "nonexistent path -> 5" repo info "$WORK/no-such-folder"
-out="$(cd "$WORK/untracked" && bash "$GU" repo info </dev/null 2>"$WORK/err.log")"; code=$?
-check "untracked cwd -> 5" "$( [ "$code" -eq 5 ] && echo 1 || echo 0 )"
+# These were path lookups that reported 5 for 'no record claims this'.
+# repo info no longer takes a path at all, so the argument is rejected (2)
+# and `folder repo` is what answers 'which repo?' with 5.
+run 2 "untracked git folder is an argument error -> 2" repo info "$WORK/untracked"
+run 2 "nonexistent path is an argument error -> 2" repo info "$WORK/no-such-folder"
+run 5 "folder repo reports the untracked folder -> 5" folder repo "$WORK/untracked"
+run 5 "folder repo on a missing path -> 5" folder repo "$WORK/no-such-folder"
+out="$(cd "$WORK/untracked" && bash "$GU" folder repo </dev/null 2>/dev/null)"; code=$?
+check "folder repo from an untracked cwd -> 5" "$( [ "$code" -eq 5 ] && echo 1 || echo 0 )"
 
 echo "=== 14: json vs default rendering ==="
 run 0 "default (text) -> 0" repo info inf1
