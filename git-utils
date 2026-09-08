@@ -120,8 +120,10 @@ def fold:
 fold'
 
 # Plain renderers. Each is a jq program emitting raw lines for `--output-format
-# plain`.
+# plain`. A repo key cannot contain a space (CHARSET) but a path can, so a
+# consumer of PLAIN_ID_PATH splits on the FIRST space.
 readonly PLAIN_ID='.id'
+readonly PLAIN_ID_PATH='.[] | "\(.id) \(.path)"'
 
 readonly OUTPUT_FORMAT_DEFAULT="plain"
 OUTPUT_FORMAT="$OUTPUT_FORMAT_DEFAULT"
@@ -2506,6 +2508,53 @@ cmd_folder_adopt() {
     info "adopted '$repo_id' ($ORIGIN_VISIBILITY, foreign=$foreign) at $loc"
 }
 
+# cmd_repo_folders -- a record's locations, exactly as stored.
+#
+# Deliberately does no checking: whether a location still exists is
+# `folder validate`'s question, and pruning dead ones is `validate --fix`'s.
+# This is the plumbing the two fan-out commands walk, so it must report what
+# the store SAYS rather than what the disk currently agrees with.
+cmd_repo_folders() {
+    local args=() all=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_repo_folders; exit 0 ;;
+            -a|--all) all=1; shift ;;
+            --output-format)
+                [ $# -ge 2 ] || die "$E_ARGS" "--output-format requires a value"
+                output_format_set "$2"; shift 2 ;;
+            --output-format=*) output_format_set "${1#*=}"; shift ;;
+            --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    [ "${#args[@]}" -le 1 ] || die "$E_ARGS" "unexpected argument: ${args[1]}"
+
+    precheck_common
+    precheck_store
+
+    local doc
+    if [ "$all" -eq 1 ]; then
+        [ "${#args[@]}" -eq 0 ] || die "$E_ARGS" "--all takes no repo argument"
+        # to_entries keeps the store's key order, and locations[] keeps
+        # theirs, so the listing is stable between runs.
+        doc="$(jq -c '[.repositories | to_entries[] | .key as $k
+                       | .value.locations[]? | {id: $k, path: .path}]' "$REPOS_FILE")"
+    else
+        [ "${#args[@]}" -eq 1 ] || die "$E_ARGS" "this command needs a repo key or full repo name, or --all"
+        resolve_repo_target "${args[0]}"
+        repos_resolve
+        doc="$(jq -c --arg k "$REC_KEY" '[.repositories[$k].locations[]?
+                       | {id: $k, path: .path}]' "$REPOS_FILE")"
+    fi
+
+    # An existing repo with no locations is an empty array and exit 0.
+    # Emptiness is only an error where a caller was about to act on the list,
+    # which is repo update's and repo redeploy's business, not this one's.
+    render_output "$doc" "$PLAIN_ID_PATH"
+}
+
 cmd_repo_list() {
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -2804,6 +2853,24 @@ only that location is updated; --all updates every tracked location.
 EOF
 }
 
+help_repo_folders() {
+    cat << 'EOF'
+git-utils repo folders (<repo_key_or_full_name> | -a|--all)
+                       [--output-format json|text|yaml|plain]
+
+Prints a repo's locations, or every repo's, exactly as the store holds them.
+Nothing is checked: use folder validate for whether a location is healthy,
+and validate --fix to prune ones that no longer exist.
+
+The plain form is 'id path', one per line. A repo key cannot contain a
+space but a path can, so split on the FIRST space:
+
+  git-utils repo folders --all | while read -r id path; do ...; done
+
+A repo with no locations prints nothing and exits 0.
+EOF
+}
+
 help_repo_list() {
     cat << 'EOF'
 git-utils repo list
@@ -2855,6 +2922,7 @@ main() {
                 delete) shift; cmd_repo_delete "$@" ;;
                 clone) shift; cmd_repo_clone "$@" ;;
                 update) shift; cmd_repo_update "$@" ;;
+                folders) shift; cmd_repo_folders "$@" ;;
                 list) shift; cmd_repo_list "$@" ;;
                 keys) shift; cmd_repo_keys "$@" ;;
                 info) shift; cmd_repo_info "$@" ;;
