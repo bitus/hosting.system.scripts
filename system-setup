@@ -65,7 +65,20 @@ declare -A DEP_PACKAGE=(
     [mkfs.xfs]="xfsprogs"
     [mkfs.vfat]="dosfstools"
     [mkfs.ntfs]="ntfs-3g"
+    [growpart]="cloud-guest-utils"
+    [partx]="util-linux"
+    [resize2fs]="e2fsprogs"
+    [xfs_growfs]="xfsprogs"
+    [fatresize]="fatresize"
+    [ntfsresize]="ntfs-3g"
 )
+
+# The tool that grows each filesystem, keyed the same way as the mkfs tables.
+declare -A RESIZE_CMD=( [ext4]="resize2fs" [xfs]="xfs_growfs" [vfat]="fatresize" [ntfs]="ntfsresize" )
+
+# Whether the filesystem must be MOUNTED to be grown. ext4 grows online and
+# xfs_growfs refuses anything else; vfat and ntfs are the other way round.
+declare -A RESIZE_MOUNTED=( [ext4]="yes" [xfs]="yes" [vfat]="no" [ntfs]="no" )
 
 # Filesystem table, keyed by the --type value, so cmd_hdd has one flow.
 # MKFS_FORCE for ntfs is "-F -f": -F forces, -f is fast-format (skip the
@@ -82,6 +95,9 @@ declare -A FSTAB_OPTS=(
 declare -A FSTAB_PASS=( [ext4]="2" [xfs]="2" [vfat]="0" [ntfs]="0" )
 
 VERBOSE=0
+# Set only by `hdd expand` and `hdd remove`, the two commands with a prompt.
+# `system-setup file` deliberately has no way to set it: a configuration
+# document must never be able to destroy data or answer a confirmation.
 FORCE=0
 declare -a ORIG_ARGS=()
 declare -a CLEANUP_TMPFILES=()
@@ -96,6 +112,28 @@ else
     SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)/$(basename "${BASH_SOURCE[0]}")"
 fi
 readonly SELF
+
+# Every disk tool this script drives - sfdisk, blkid, findmnt, the mkfs.*
+# family, and the sfdisk that growpart shells out to - lives in /usr/sbin,
+# which is NOT on a non-root PATH on Debian.
+#
+# require_cmds was already taught to look there, but that only fixes the
+# PRE-CHECK: the actual invocations resolve through PATH at run time. Under
+# sudo the gap is masked by secure_path; it reappears whenever the script is
+# sourced, or run by a root process with a stripped PATH, and the failure is
+# unhelpful - "command not found" for blkid, and for growpart the second-hand
+# "Did not have sfdisk or sgdisk in PATH".
+# INHERITED_PATH is captured first and is what cmd_setup consults. It must
+# decide whether ~/.bashrc needs a PATH entry by looking at the PATH the
+# operator will actually have - not at the one augmented just below, which
+# would always contain sbin and so would always answer "nothing to add".
+readonly INHERITED_PATH="$PATH"
+
+case ":$PATH:" in
+    *:/usr/sbin:*) ;;
+    *) PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin" ;;
+esac
+export PATH
 
 # ---------------------------------------------------------------------------
 # 3. Output helpers
@@ -130,17 +168,15 @@ join_sp() {
     printf '%s' "$*"
 }
 
-# Currently UNREACHABLE, and kept deliberately.
+# Reachable from exactly two places: `hdd remove` and `hdd expand`. Both are
+# destructive in a way no other command is, and neither can be reached from a
+# JSON/YAML document - so a config file still cannot make this script prompt,
+# and `system-setup file` remains safe to drive from CI, Ansible or cron.
 #
-# Every former call site sat behind `if [ "$FORCE" != "1" ]; then die; fi`,
-# and this function returns 0 on its first line when FORCE=1 - so no prompt
-# could execute in either branch. Those calls were removed rather than left to
-# imply an interaction that never happened.
-#
-# The function stays because it is part of the helper set shared with
-# git-utils, and because the escape hatch it implements is what any future
-# prompt would need. Note the consequence while there are none: the script is
-# now entirely non-interactive, and safe to drive from CI, Ansible or cron.
+# The no-TTY branch is the load-bearing one. An unattended caller gets a clear
+# refusal naming --force rather than a read that blocks forever, which is what
+# the 2026-08-26 work was actually about; the prompts removed then were removed
+# because they were unreachable, not because prompting is wrong.
 confirm() {
     local prompt="$1" reply
     if [ "$FORCE" = "1" ]; then
@@ -161,7 +197,14 @@ confirm() {
 # ---------------------------------------------------------------------------
 
 # One process-wide EXIT trap, never a RETURN trap: a `trap ... RETURN` set
-# inside a helper is not reliable across nested function calls in bash. The
+# inside a helper is not reliable across nested function calls in bash.
+#
+# It is a NET, not the primary mechanism, and it has one hole that cannot be
+# closed here: bash resets EXIT traps inside command substitutions, and
+# `cmd_file` runs every task as `out="$( ( "$cmd" ... ) 2>&1 )"`. Temp files a
+# task creates are therefore never swept by this trap on the `file` path. Each
+# helper below removes its own temp file the moment it is done with it; this
+# trap catches only what a die() left behind. The
 # explicit `return 0` matters too - without it the trap's own exit status can
 # silently override an exit code already set by die().
 cleanup_tmpfiles() {
@@ -169,6 +212,15 @@ cleanup_tmpfiles() {
     for f in ${CLEANUP_TMPFILES[@]+"${CLEANUP_TMPFILES[@]}"}; do
         rm -f "$f"
     done
+    # `expand` may have mounted the operator's filesystem somewhere temporary to
+    # grow it. Unmounting here rather than only on the success path is the
+    # point: a die() inside the resize must not leave it mounted at a path
+    # nobody asked for and nobody will think to look at.
+    if [ -n "${HDD_EX_TMPMNT:-}" ]; then
+        umount "$HDD_EX_TMPMNT" 2>/dev/null || true
+        rmdir "$HDD_EX_TMPMNT" 2>/dev/null || true
+        HDD_EX_TMPMNT=""
+    fi
     return 0
 }
 trap cleanup_tmpfiles EXIT
@@ -1013,8 +1065,10 @@ dev_partitions() {
 
 # dev_state <device> -- echoes blank | single | unsafe
 #
-# This classification is the guard between a --force typo and somebody's data,
-# so it errs towards "unsafe" whenever the disk is not obviously ours to take.
+# `init` acts on `blank` and refuses everything else, so only that boundary is
+# load-bearing; the split between `single` and `unsafe` is kept because it is
+# what `hdd_describe` and the refusal message are describing. Errs towards
+# "unsafe" whenever the disk is not obviously ours to take.
 dev_state() {
     local dev="$1" parts n=0
     parts="$(dev_partitions "$dev")"
@@ -1033,6 +1087,267 @@ dev_state() {
 
     printf 'single'
     return 0
+}
+
+# human_bytes <n> -- 1536 -> 1.5K. Empty input prints a dash, so callers can
+# pass an unset value straight through to a table cell.
+human_bytes() {
+    [ -n "${1:-}" ] || { printf -- '-'; return 0; }
+    awk -v b="$1" 'BEGIN {
+        split("B K M G T P", u, " ")
+        i = 1
+        while (b >= 1024 && i < 6) { b /= 1024; i++ }
+        if (i == 1) printf "%d%s", b, u[i]
+        else        printf "%.1f%s", b, u[i]
+    }'
+}
+
+# fstab_state <part> -- managed | yes | no
+#
+# The three-way answer is the point: "managed" is ours to change, "yes" is
+# someone else's entry that must be refused, and "no" is absent. Collapsing
+# the first two would make `remove` delete entries it did not write.
+fstab_state() {
+    if partition_managed "$1"; then printf 'managed'
+    elif partition_in_fstab "$1"; then printf 'yes'
+    else printf 'no'
+    fi
+}
+
+# --- inspection layer ------------------------------------------------------
+#
+# Read-only predicates shared by every hdd subcommand. None of these write,
+# mount, or prompt.
+
+# dev_disks -- every whole disk, one per line. Loop devices are TYPE=loop and
+# optical drives TYPE=rom, so filtering on "disk" excludes both.
+dev_disks() {
+    lsblk -dnro NAME,TYPE 2>/dev/null | awk '$2 == "disk" { print "/dev/" $1 }'
+}
+
+# part_device <part> -- the whole disk a partition belongs to.
+# Read from the kernel rather than by trimming the name: /dev/sdb1 -> /dev/sdb
+# but /dev/nvme0n1p1 -> /dev/nvme0n1 and /dev/loop0p1 -> /dev/loop0, and no
+# string rule covers all three.
+part_device() {
+    local pk
+    pk="$(lsblk -nro PKNAME "$1" 2>/dev/null | head -1)"
+    [ -n "$pk" ] || return 1
+    printf '/dev/%s' "$pk"
+}
+
+# part_number <part> -- its index within the partition table
+part_number() {
+    local n
+    n="$(basename "$1")"
+    [ -f "/sys/class/block/$n/partition" ] || return 1
+    cat "/sys/class/block/$n/partition"
+}
+
+# part_is_partition <part> -- true for a partition, false for a whole disk
+part_is_partition() {
+    [ "$(lsblk -dnro TYPE "$1" 2>/dev/null | head -1)" = "part" ]
+}
+
+# normalise_mount <path> -- absolute, no duplicate or trailing slashes.
+# A bare name becomes /name.
+#
+# Returns non-zero for "/" instead of dying, because it is called through $( ):
+# a `die` inside a command substitution exits only the subshell, and the caller
+# would carry on with an empty mount point and no error.
+normalise_mount() {
+    local m="$1"
+    case "$m" in
+        /*) ;;
+        *) m="/$m" ;;
+    esac
+    while [[ "$m" == *//* ]]; do m="${m//\/\//\/}"; done
+    [ "$m" = "/" ] || m="${m%/}"
+    [ "$m" != "/" ] || return 1
+    printf '%s' "$m"
+}
+
+# hdd_type_of_fstype <blkid-type> -- our --type name for a filesystem blkid
+# found on a partition; non-zero when it is not one we support.
+#
+# Not an identity map: blkid reports `ntfs`, the fstab type is `ntfs3`, and the
+# key both tables are indexed by is `ntfs`.
+hdd_type_of_fstype() {
+    local t
+    for t in ext4 xfs vfat ntfs; do
+        if [ "$1" = "$t" ] || [ "$1" = "${FSTAB_TYPE[$t]}" ]; then
+            printf '%s' "$t"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# hdd_block_find <field> <value> -- the managed block's entry whose field
+# <field> equals <value>; empty when there is none. Field 1 is `UUID=...`,
+# field 2 the mount point, which are the two ways `remove` can be asked.
+hdd_block_find() {
+    local f="$1" v="$2"
+    hdd_block_body | awk -v f="$f" -v v="$v" '$f == v { print; exit }'
+}
+
+# mount_in_fstab <mount> -- true when any fstab line already claims this mount
+# point, ours or anyone's.
+mount_in_fstab() {
+    [ -f "$FSTAB_FILE" ] || return 1
+    awk -v m="$1" '
+        /^[[:space:]]*#/ { next }
+        /^[[:space:]]*$/ { next }
+        $2 == m { found = 1; exit }
+        END { exit(found ? 0 : 1) }
+    ' "$FSTAB_FILE"
+}
+
+# Everything this tool owns in /etc/fstab lives in ONE unnamed block, the same
+# shape /etc/hosts and /etc/resolv.conf use. Membership is decided by UUID.
+#
+# The alternative - a sentinel per device or per partition - makes the block
+# key a device PATH, which is a second and weaker identity for a filesystem
+# that already has a good one two fields away. Paths are recycled: a disk
+# pulled and replaced enumerating at the same /dev/sdb would inherit the old
+# disk's claim, and `init` would adopt a stranger's partition as its own.
+FSTAB_BLOCK_ID=""
+
+# hdd_block_body -- the managed entries, sentinels stripped. Empty when there
+# is no block yet, which is the ordinary state of a host that has never run
+# `hdd`, not an error.
+hdd_block_body() {
+    [ -f "$FSTAB_FILE" ] || return 0
+    block_extract "$FSTAB_FILE" "$FSTAB_BLOCK_ID" | sed '1d;$d'
+}
+
+# hdd_block_set <body> -- replace the managed block. An empty body removes the
+# block outright rather than leaving a bare pair of sentinels behind, so a host
+# whose last managed partition is removed ends up with the fstab it started
+# with.
+hdd_block_set() {
+    local body="$1"
+    if [ -z "$body" ]; then
+        block_delete "$FSTAB_FILE" "$FSTAB_BLOCK_ID"
+        return 0
+    fi
+    block_upsert "$FSTAB_FILE" "$FSTAB_BLOCK_ID" "$(block_marker_open "$FSTAB_BLOCK_ID")
+$body
+$(block_marker_close "$FSTAB_BLOCK_ID")"
+}
+
+# partition_managed <part> -- true when the managed block holds an entry for
+# this partition's filesystem UUID.
+#
+# Field-exact on $1, never a substring search: a UUID can appear as some other
+# field, or in a comment, and "is this string somewhere in the block" is not
+# the question being asked.
+partition_managed() {
+    local uuid
+    uuid="$(part_uuid "$1")"
+    [ -n "$uuid" ] || return 1
+    hdd_block_body | awk -v u="UUID=$uuid" '
+        $1 == u { found = 1; exit }
+        END { exit(found ? 0 : 1) }
+    '
+}
+
+# all_partitions_managed <device> -- true when EVERY partition on <device> has
+# a block of ours in fstab.
+#
+# An empty partition list is deliberately FALSE. "All zero partitions are
+# managed" is vacuously true and completely wrong here: it would wave through
+# a disk carrying a raw filesystem or RAID signature with no partition table,
+# which is precisely the shape this gate exists to refuse.
+all_partitions_managed() {
+    local dev="$1" p found=0
+    while read -r p; do
+        [ -n "$p" ] || continue
+        found=1
+        partition_managed "/dev/$p" || return 1
+    done <<< "$(dev_partitions "$dev")"
+    [ "$found" = "1" ]
+}
+
+# partition_in_fstab <part> -- true when <part> appears in fstab AT ALL.
+#
+# Deliberately distinct from partition_managed: `remove` and `list` must tell
+# "someone else's entry" from "no entry", and those need opposite treatment.
+#
+# Matches the device path, UUID= and PARTUUID= forms. An operator's own entry
+# is almost always UUID=, so matching only the device path would report "not in
+# fstab" for exactly the entries this tool must refuse to touch.
+partition_in_fstab() {
+    local part="$1" uuid puuid
+    [ -f "$FSTAB_FILE" ] || return 1
+    uuid="$(part_uuid "$part")"
+    puuid="$(blkid -s PARTUUID -o value "$part" 2>/dev/null || true)"
+    awk -v p="$part" -v u="$uuid" -v pu="$puuid" '
+        /^[[:space:]]*#/ { next }
+        /^[[:space:]]*$/ { next }
+        {
+            if ($1 == p) { found = 1; exit }
+            if (u  != "" && $1 == "UUID=" u)      { found = 1; exit }
+            if (pu != "" && $1 == "PARTUUID=" pu) { found = 1; exit }
+        }
+        END { exit(found ? 0 : 1) }
+    ' "$FSTAB_FILE"
+}
+
+# part_size_bytes <part> -- the partition's size in bytes
+part_size_bytes() {
+    lsblk -bdnro SIZE "$1" 2>/dev/null | head -1
+}
+
+# growable_of <part> -- bytes the partition could grow by; empty and non-zero
+# when it cannot, or when growpart is unavailable.
+#
+# Parses growpart's OUTPUT, never its exit code. Verified on Debian 13:
+#
+#   growable      CHANGE:   partition=1 ... old: size=409600 new: size=1046495   exit 0
+#   not growable  NOCHANGE: partition 1 is size 1046495. it cannot be grown      exit 1
+#
+# NOCHANGE exits 1, which is indistinguishable from a real failure by status
+# alone - keying on the exit code would report "no free space" and "growpart is
+# broken" identically. Callers decide what a missing growpart means: `list`
+# leaves the column blank, `expand` pre-checks it as a hard dependency.
+growable_of() {
+    local part="$1" dev num out sectors secsz
+    command -v growpart >/dev/null 2>&1 || return 1
+    dev="$(part_device "$part")" || return 1
+    num="$(part_number "$part")" || return 1
+
+    out="$(growpart --dry-run "$dev" "$num" 2>&1 || true)"
+    case "$out" in
+        CHANGE:*) ;;
+        *) return 1 ;;
+    esac
+
+    sectors="$(awk '
+        /^CHANGE:/ {
+            for (i = 1; i <= NF; i++) {
+                if ($i == "old:") { split($(i + 1), a, "="); o = a[2] }
+                if ($i == "new:") { split($(i + 1), b, "="); n = b[2] }
+            }
+            if (o != "" && n != "") { print n - o }
+            exit
+        }' <<< "$out")"
+    [ -n "$sectors" ] || return 1
+    [ "$sectors" -gt 0 ] || return 1
+
+    secsz="$(cat "/sys/class/block/$(basename "$dev")/queue/logical_block_size" 2>/dev/null || true)"
+    [ -n "$secsz" ] || secsz=512
+    printf '%s' "$(( sectors * secsz ))"
+}
+
+# part_free_space <part> -- filesystem free bytes; empty when not mounted.
+# An unmounted filesystem's free space needs per-filesystem tooling and is
+# deliberately not attempted.
+part_free_space() {
+    local mnt
+    mnt="$(mount_point_of "$1")"
+    [ -n "$mnt" ] || return 1
+    df -B1 --output=avail "$mnt" 2>/dev/null | tail -1 | tr -d ' '
 }
 
 hdd_describe() {
@@ -1089,35 +1404,58 @@ hdd_fstab_rollback() {
     [ -n "$HDD_FSTAB_ROLLBACK" ] && [ -f "$HDD_FSTAB_ROLLBACK" ] || return 0
     cp -p "$HDD_FSTAB_ROLLBACK" "$FSTAB_FILE"
     warn "$FSTAB_FILE restored to its state from before this run"
+    rm -f "$HDD_FSTAB_ROLLBACK"
+    HDD_FSTAB_ROLLBACK=""
     return 0
 }
 
+# hdd_fstab_write <part> <uuid> -- add or replace this partition's entry in
+# the managed block.
 hdd_fstab_write() {
-    local uuid="$1" content tmp
+    local part="$1" uuid="$2" body line tmp
 
     backup_once "$FSTAB_FILE"
     hdd_fstab_snapshot
 
-    # Our own block first, so the legacy-line sweep below cannot eat it.
-    block_delete "$FSTAB_FILE" "$HDD_DEVICE"
+    # Take our own entries out of the file BEFORE the sweep below, which drops
+    # anything claiming $HDD_MOUNT and would otherwise eat the sibling entries
+    # it is meant to preserve.
+    #
+    # Two keys are dropped from the body: this UUID, so re-running with a
+    # different --mount replaces the entry rather than adding a second one for
+    # one filesystem; and this mount point, so two filesystems cannot both
+    # claim it.
+    body="$(hdd_block_body | awk -v u="UUID=$uuid" -v m="$HDD_MOUNT" '
+        ($1 == u) || ($2 == m) { next }
+        { print }
+    ')"
+    block_delete "$FSTAB_FILE" "$FSTAB_BLOCK_ID"
 
-    # Reconcile: drop any line that refers to this device by PATH, or that
-    # claims our mount point. Device names are not stable across reboots -
-    # that instability is exactly why the replacement keys on UUID.
+    # Reconcile the rest of the file: drop any line naming this partition by
+    # path, or claiming our mount point. Device names are not stable across
+    # reboots - that instability is exactly why the replacement keys on UUID.
+    #
+    # An exact match on $1, not a prefix: a prefix test is a whole-disk
+    # assumption written in string operations, and sweeping /dev/sdb would
+    # take /dev/sdb2's entry with it.
     tmp="$(mktemp "${FSTAB_FILE}.XXXXXX")"
     CLEANUP_TMPFILES+=("$tmp")
-    awk -v dev="$HDD_DEVICE" -v mnt="$HDD_MOUNT" '
+    awk -v part="$part" -v mnt="$HDD_MOUNT" '
         /^[[:space:]]*#/  { print; next }
         /^[[:space:]]*$/  { print; next }
-        (index($1, dev) == 1) || ($2 == mnt) { next }
+        ($1 == part) || ($2 == mnt) { next }
         { print }
     ' "$FSTAB_FILE" > "$tmp"
     cat "$tmp" > "$FSTAB_FILE"
+    rm -f "$tmp"
 
-    content="$(block_marker_open "$HDD_DEVICE")
-UUID=$uuid  $HDD_MOUNT  ${FSTAB_TYPE[$HDD_TYPE]}  ${FSTAB_OPTS[$HDD_TYPE]}  0  ${FSTAB_PASS[$HDD_TYPE]}
-$(block_marker_close "$HDD_DEVICE")"
-    block_upsert "$FSTAB_FILE" "$HDD_DEVICE" "$content"
+    line="UUID=$uuid  $HDD_MOUNT  ${FSTAB_TYPE[$HDD_TYPE]}  ${FSTAB_OPTS[$HDD_TYPE]}  0  ${FSTAB_PASS[$HDD_TYPE]}"
+    if [ -n "$body" ]; then
+        hdd_block_set "$body
+$line"
+    else
+        hdd_block_set "$line"
+    fi
     return 0
 }
 
@@ -1134,27 +1472,599 @@ hdd_fstab_verify() {
         systemctl daemon-reload >/dev/null 2>&1 || true
         die "$E_IO" "'mount -a' failed; $FSTAB_FILE restored and no changes kept"
     fi
+    # The new fstab is proven mountable, so the rollback copy has done its job.
+    # Removed here rather than left to the EXIT trap, which does not run on the
+    # `file` path - see the trap's comment.
+    if [ -n "$HDD_FSTAB_ROLLBACK" ]; then
+        rm -f "$HDD_FSTAB_ROLLBACK"
+        HDD_FSTAB_ROLLBACK=""
+    fi
     return 0
 }
 
-hdd_already_configured() {
-    local part="$1" fstype mnt uuid
-    [ "$(dev_state "$HDD_DEVICE")" = "single" ] || return 1
-    fstype="$(part_fstype "$part")"
-    [ "$fstype" = "${FSTAB_TYPE[$HDD_TYPE]}" ] || [ "$fstype" = "$HDD_TYPE" ] || return 1
-    [ "$(mount_point_of "$part")" = "$HDD_MOUNT" ] || return 1
-    uuid="$(part_uuid "$part")"
-    [ -n "$uuid" ] || return 1
-    grep -qF "UUID=$uuid  $HDD_MOUNT  " "$FSTAB_FILE" 2>/dev/null || return 1
+# hdd_migrate_blocks <device> -- fold any per-device or per-partition block
+# for this disk into the single managed block. Returns 0 when it moved
+# something, 1 when there was nothing to move.
+#
+# Two earlier spellings exist: releases before 2026-08-30 keyed the block on
+# the whole disk, and a short-lived revision of that fix keyed it on the
+# partition. Neither is recognised by partition_managed, so without this a
+# host would be refused a disk this tool provisioned itself.
+#
+# The bodies move VERBATIM. A migration is a re-keying, not a reconfiguration:
+# an operator running `init` with a different --mount must not thereby have a
+# live filesystem moved out from under them. Changing where a managed
+# partition mounts is `hdd remove` followed by `hdd init`.
+#
+# Scoped to one disk on purpose - `init` was asked about $device and has no
+# business rewriting entries for the others.
+hdd_migrate_blocks() {
+    local dev="$1" ids id p want body acc moved=0
+
+    [ -f "$FSTAB_FILE" ] || return 1
+    ids="$(awk '/^# >>> system-setup \/dev\// { print $4 }' "$FSTAB_FILE")"
+    [ -n "$ids" ] || return 1
+
+    want="$dev"
+    while read -r p; do
+        [ -n "$p" ] || continue
+        want="$want
+/dev/$p"
+    done <<< "$(dev_partitions "$dev")"
+
+    acc="$(hdd_block_body)"
+    while read -r id; do
+        [ -n "$id" ] || continue
+        grep -qxF "$id" <<< "$want" || continue
+        body="$(block_extract "$FSTAB_FILE" "$id" | sed '1d;$d')"
+        [ -n "$body" ] || continue
+        info "folding the fstab block for $id into the managed block"
+        block_delete "$FSTAB_FILE" "$id"
+        if [ -n "$acc" ]; then
+            acc="$acc
+$body"
+        else
+            acc="$body"
+        fi
+        moved=1
+    done <<< "$ids"
+
+    [ "$moved" = "1" ] || return 1
+    backup_once "$FSTAB_FILE"
+    hdd_block_set "$acc"
     return 0
 }
 
+cmd_hdd_list() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_hdd_list; exit "$E_OK" ;;
+            --) shift; [ $# -eq 0 ] || die "$E_ARGS" "unexpected argument: $1" ;;
+            *) die "$E_ARGS" "unexpected argument: $1" ;;
+        esac
+    done
+
+    require_cmds lsblk blkid
+    require_sudo
+    # Elevating a read-only command looks heavy-handed, but the block devices
+    # are root:disk - blkid cannot read them as an ordinary user, and every
+    # column but DEVICE and SIZE would come back blank.
+    elevate "${ORIG_ARGS[@]}"
+
+    local -a rows=()
+    rows+=("DEVICE	PARTITION	FS	MOUNT	SIZE	GROWABLE	FREE	FSTAB")
+
+    local dev part parts fs mnt size grow free state
+    for dev in $(dev_disks); do
+        parts="$(dev_partitions "$dev")"
+        if [ -z "$parts" ]; then
+            size="$(human_bytes "$(lsblk -bdno SIZE "$dev" 2>/dev/null || true)")"
+            rows+=("$dev	-	-	-	$size	-	-	-")
+            continue
+        fi
+        for part in $parts; do
+            part="/dev/$part"
+            fs="$(part_fstype "$part")"
+            mnt="$(mount_point_of "$part")"
+            size="$(human_bytes "$(lsblk -bdno SIZE "$part" 2>/dev/null || true)")"
+            grow="$(human_bytes "$(growable_of "$part" || true)")"
+            free="$(human_bytes "$(part_free_space "$part" || true)")"
+            state="$(fstab_state "$part")"
+            rows+=("$dev	$part	${fs:--}	${mnt:--}	$size	$grow	$free	$state")
+        done
+    done
+
+    # Column widths are computed from the data. A fixed layout wraps on the
+    # first host with a long mount path, and mawk (Debian's default awk) has
+    # neither true 2-D arrays nor sprintf("%-*s"), so both are done by hand.
+    printf '%b
+' "${rows[@]}" | awk -F'	' '
+        { for (i = 1; i <= NF; i++) { if (length($i) > w[i]) w[i] = length($i)
+                                      cell[NR "," i] = $i }
+          nr = NR; nf = NF }
+        END {
+            for (r = 1; r <= nr; r++) {
+                line = ""
+                for (i = 1; i <= nf; i++) {
+                    v = cell[r "," i]
+                    line = line v
+                    if (i < nf) { pad = w[i] - length(v) + 2; while (pad-- > 0) line = line " " }
+                }
+                print line
+            }
+        }'
+
+    if ! command -v growpart >/dev/null 2>&1; then
+        info ""
+        info "note: GROWABLE is blank because growpart is not installed (sudo apt install cloud-guest-utils -y)"
+    fi
+    return 0
+}
+
+# hdd is a command group, in the shape git-utils uses for `repo`.
 cmd_hdd() {
+    local sub="${1:-}"
+    case "$sub" in
+        -h|--help) help_hdd; exit "$E_OK" ;;
+        init)   shift; cmd_hdd_init   ${1+"$@"} ;;
+        list)   shift; cmd_hdd_list   ${1+"$@"} ;;
+        add)    shift; cmd_hdd_add    ${1+"$@"} ;;
+        expand) shift; cmd_hdd_expand ${1+"$@"} ;;
+        remove) shift; cmd_hdd_remove ${1+"$@"} ;;
+        "")     help_hdd >&2; exit "$E_ARGS" ;;
+        *)      printf 'error: unknown hdd subcommand: %s
+' "$sub" >&2
+                help_hdd >&2
+                exit "$E_ARGS" ;;
+    esac
+}
+
+# Set by hdd_expand_plan, read by the confirm step and hdd_expand_apply.
+# One decision, three consumers - so --dry-run and a real run cannot disagree
+# about what would happen.
+HDD_EX_PART=""      # the partition
+HDD_EX_DEV=""       # its disk
+HDD_EX_NUM=""       # its index on that disk
+HDD_EX_BYTES=""     # growable space immediately after it
+HDD_EX_TYPE=""      # our --type name for its filesystem
+HDD_EX_MOUNT=""     # where it is mounted now, empty if it is not
+HDD_EX_NEEDS=""     # none | mount | unmount: the mount-state change required
+HDD_EX_TMPMNT=""    # a temporary mount, while one exists
+
+hdd_expand_plan() {
+    local part="$1" fstype
+
+    HDD_EX_PART="$part"
+    dev_exists "$part" || die "$E_NOTFOUND" "block device '$part' not found"
+    part_is_partition "$part" \
+        || die "$E_ARGS" "$part is a whole disk; 'hdd expand' grows a partition"
+
+    HDD_EX_DEV="$(part_device "$part")" || die "$E_IO" "could not find the disk holding $part"
+    HDD_EX_NUM="$(part_number "$part")" || die "$E_IO" "could not find the partition number of $part"
+
+    fstype="$(part_fstype "$part")"
+    [ -n "$fstype" ] || die "$E_ARGS" "$part has no filesystem to grow"
+    HDD_EX_TYPE="$(hdd_type_of_fstype "$fstype")" \
+        || die "$E_ARGS" "$part is formatted as '$fstype', not one of: ext4 xfs vfat ntfs"
+
+    # Both prechecks before any measurement: "growpart is missing" (exit 1) and
+    # "there is nothing to grow into" (exit 2) are different answers, and the
+    # operator needs to be told which one they got.
+    require_cmds growpart partx "${RESIZE_CMD[$HDD_EX_TYPE]}"
+
+    HDD_EX_BYTES="$(growable_of "$part")" || HDD_EX_BYTES=""
+    [ -n "$HDD_EX_BYTES" ] \
+        || die "$E_ARGS" "$part has no free space immediately after it; growpart can only extend into the space that follows a partition"
+
+    HDD_EX_MOUNT="$(mount_point_of "$part")"
+    if [ "${RESIZE_MOUNTED[$HDD_EX_TYPE]}" = "yes" ]; then
+        if [ -n "$HDD_EX_MOUNT" ]; then HDD_EX_NEEDS="none"; else HDD_EX_NEEDS="mount"; fi
+    else
+        if [ -n "$HDD_EX_MOUNT" ]; then HDD_EX_NEEDS="unmount"; else HDD_EX_NEEDS="none"; fi
+    fi
+    return 0
+}
+
+# hdd_expand_report -- the plan in words, shared by --dry-run and the real run
+# so that the two describe the same operation in the same terms.
+hdd_expand_report() {
+    info "  partition: $HDD_EX_PART (${HDD_EX_TYPE}, disk $HDD_EX_DEV, number $HDD_EX_NUM)"
+    info "  growable:  $(human_bytes "$HDD_EX_BYTES")"
+    case "$HDD_EX_NEEDS" in
+        none)    info "  mounted:   ${HDD_EX_MOUNT:-no} - no change of mount state needed" ;;
+        mount)   info "  mounted:   no - it must be mounted temporarily to grow $HDD_EX_TYPE" ;;
+        unmount) info "  mounted:   $HDD_EX_MOUNT - it must be unmounted to grow $HDD_EX_TYPE, then remounted there" ;;
+    esac
+    return 0
+}
+
+# hdd_resize_fs <mountpoint> -- grow the filesystem to fill the partition.
+#
+# xfs_growfs takes a MOUNT POINT; every other tool takes the device. Getting
+# that backwards fails with an error that does not say so.
+hdd_resize_fs() {
+    local mnt="$1" part="$HDD_EX_PART"
+    case "$HDD_EX_TYPE" in
+        ext4) resize2fs "$part" >/dev/null 2>&1 || die "$E_IO" "resize2fs failed on $part" ;;
+        xfs)  xfs_growfs "$mnt" >/dev/null 2>&1 || die "$E_IO" "xfs_growfs failed on $mnt" ;;
+        vfat)
+            # fatresize computes `-s max` in WHOLE-DISK coordinates rather
+            # than the partition's, and lands past the end of the device;
+            # passing the exact partition size trips an assertion inside
+            # libparted and aborts with SIGABRT. Verified against fatresize
+            # 1.1.0: one MiB short of the partition is the largest value that
+            # works, and that MiB is not worth chasing.
+            local target
+            target="$(( $(part_size_bytes "$part") - 1048576 ))"
+            [ "$target" -gt 0 ] || die "$E_IO" "$part is too small to resize"
+            fatresize -f -s "$target" "$part" >/dev/null 2>&1 \
+                || die "$E_IO" "fatresize failed on $part"
+            ;;
+        ntfs)
+            # Verified against ntfs-3g on Debian 13: GROWING needs no stdin and
+            # asks nothing - the "are you sure" prompt belongs to the shrink
+            # path. --force is kept because it is what carries a volume flagged
+            # dirty, and because it costs nothing here.
+            #
+            # Deliberately NOT `printf 'y' | ntfsresize`: piping into a program
+            # that never reads is how the 2026-08-26 --purge work produced a
+            # SIGPIPE that pipefail reported as the command failing.
+            ntfsresize --force "$part" >/dev/null 2>&1 \
+                || die "$E_IO" "ntfsresize failed on $part (a volume flagged dirty may need ntfsfix or chkdsk first)"
+            ;;
+    esac
+    return 0
+}
+
+hdd_expand_apply() {
+    local part="$HDD_EX_PART" before after mnt
+
+    before="$(part_size_bytes "$part")"
+    info "growing $part into $(human_bytes "$HDD_EX_BYTES")"
+    growpart "$HDD_EX_DEV" "$HDD_EX_NUM" >/dev/null 2>&1 \
+        || die "$E_IO" "growpart failed on $HDD_EX_DEV $HDD_EX_NUM"
+    partx -u "$HDD_EX_DEV" >/dev/null 2>&1 || true
+    udevadm settle >/dev/null 2>&1 || true
+
+    case "$HDD_EX_NEEDS" in
+        none)
+            hdd_resize_fs "$HDD_EX_MOUNT"
+            ;;
+        mount)
+            # Mounted rather than resized offline on purpose: resize2fs refuses
+            # an unchecked unmounted filesystem with "Please run 'e2fsck -f'
+            # first", and running a data-modifying fsck on the operator's
+            # behalf is not this command's job.
+            HDD_EX_TMPMNT="$(mktemp -d)"
+            mount "$part" "$HDD_EX_TMPMNT" || die "$E_IO" "failed to mount $part to grow it"
+            hdd_resize_fs "$HDD_EX_TMPMNT"
+            umount "$HDD_EX_TMPMNT" || die "$E_IO" "failed to unmount $HDD_EX_TMPMNT after growing"
+            rmdir "$HDD_EX_TMPMNT" 2>/dev/null || true
+            HDD_EX_TMPMNT=""
+            ;;
+        unmount)
+            umount "$HDD_EX_MOUNT" || die "$E_IO" "failed to unmount $HDD_EX_MOUNT (is something using it?)"
+            hdd_resize_fs ""
+            mount "$part" "$HDD_EX_MOUNT" || die "$E_IO" "grew $part but failed to remount it at $HDD_EX_MOUNT"
+            ;;
+    esac
+
+    after="$(part_size_bytes "$part")"
+    info "hdd expanded:"
+    info "  partition: $part"
+    info "  size:      $(human_bytes "$before") -> $(human_bytes "$after")"
+    mnt="$(mount_point_of "$part")"
+    info "  mounted:   ${mnt:-no}"
+    return 0
+}
+
+cmd_hdd_expand() {
+    local opt_part="" opt_dryrun=0
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_hdd_expand; exit "$E_OK" ;;
+            -p|--partition)
+                [ $# -ge 2 ] || die "$E_ARGS" "--partition requires a value"
+                opt_part="$2"; shift 2 ;;
+            --partition=*) opt_part="${1#*=}"; shift ;;
+            -f|--force) FORCE=1; shift ;;
+            --dry-run) opt_dryrun=1; shift ;;
+            --) shift; [ $# -eq 0 ] || die "$E_ARGS" "unexpected argument: $1" ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) die "$E_ARGS" "unexpected argument: $1" ;;
+        esac
+    done
+
+    [ -n "$opt_part" ] || die "$E_ARGS" "--partition is required"
+
+    require_cmds blkid findmnt mount
+    require_sudo
+    elevate "${ORIG_ARGS[@]}"
+
+    hdd_expand_plan "$opt_part"
+    debug "plan: type=$HDD_EX_TYPE bytes=$HDD_EX_BYTES mount='${HDD_EX_MOUNT:-}' needs=$HDD_EX_NEEDS"
+
+    if [ "$opt_dryrun" = "1" ]; then
+        info "dry run: $opt_part can be expanded"
+        hdd_expand_report
+        info "nothing was changed"
+        exit "$E_OK"
+    fi
+
+    info "expanding $opt_part:"
+    hdd_expand_report
+
+    # Confirmation is required exactly when the mount state has to change - and
+    # the two directions are not equally recoverable, so they are not gated the
+    # same way.
+    case "$HDD_EX_NEEDS" in
+        none) ;;
+        mount)
+            # Mounting a filesystem the operator has deliberately left offline
+            # is a side effect they may not want at all. An explicit flag, not
+            # a yes/no: this one cannot be answered into existence at a prompt.
+            [ "$FORCE" = "1" ] || die "$E_EXISTS" \
+                "$opt_part is not mounted, and growing $HDD_EX_TYPE requires it to be; re-run with --force to mount it temporarily"
+            ;;
+        unmount)
+            # Unmount and remount at the same place: the end state matches the
+            # start state, so a prompt is proportionate.
+            if ! confirm "Unmount $HDD_EX_MOUNT, grow the filesystem, and remount it there?"; then
+                info "cancelled; nothing was changed"
+                exit "$E_OK"
+            fi
+            ;;
+    esac
+
+    hdd_expand_apply
+}
+
+# Set by hdd_remove_checks, read by hdd_remove_apply. Globals rather than a
+# return value because a function called through $( ) runs in a subshell and
+# cannot set anything the caller goes on to read.
+HDD_RM_LINE=""
+HDD_RM_MOUNT=""
+
+# hdd_remove_checks <partition> <mount> -- exactly one of the two is non-empty.
+# Resolves the fstab entry and refuses if there is not exactly one of ours.
+hdd_remove_checks() {
+    local part="$1" mount="$2" uuid
+
+    HDD_RM_LINE=""
+    HDD_RM_MOUNT=""
+
+    if [ -n "$part" ]; then
+        dev_exists "$part" || die "$E_NOTFOUND" "block device '$part' not found"
+        part_is_partition "$part" \
+            || die "$E_ARGS" "$part is a whole disk; 'hdd remove' takes a partition"
+        uuid="$(part_uuid "$part")"
+        [ -n "$uuid" ] || die "$E_IO" "could not read a UUID from $part"
+
+        HDD_RM_LINE="$(hdd_block_find 1 "UUID=$uuid")"
+        if [ -z "$HDD_RM_LINE" ]; then
+            if partition_in_fstab "$part"; then
+                die "$E_EXISTS" "$part has an entry in $FSTAB_FILE that system-setup did not write; it will not be removed"
+            fi
+            die "$E_NOTFOUND" "$part has no entry in $FSTAB_FILE"
+        fi
+    else
+        HDD_RM_LINE="$(hdd_block_find 2 "$mount")"
+        if [ -z "$HDD_RM_LINE" ]; then
+            if mount_in_fstab "$mount"; then
+                die "$E_EXISTS" "$mount has an entry in $FSTAB_FILE that system-setup did not write; it will not be removed"
+            fi
+            die "$E_NOTFOUND" "no entry in $FSTAB_FILE written by system-setup mounts $mount"
+        fi
+    fi
+
+    HDD_RM_MOUNT="$(awk '{ print $2 }' <<< "$HDD_RM_LINE")"
+    [ -n "$HDD_RM_MOUNT" ] || die "$E_IO" "could not read a mount point from: $HDD_RM_LINE"
+    return 0
+}
+
+hdd_remove_apply() {
+    local src body
+
+    # Unmount BEFORE touching fstab. "Device or resource busy" is the failure
+    # this command actually hits, and hitting it first means nothing has been
+    # changed when it does.
+    src="$(findmnt -nro SOURCE "$HDD_RM_MOUNT" 2>/dev/null | head -1 || true)"
+    if [ -n "$src" ]; then
+        info "unmounting $src from $HDD_RM_MOUNT"
+        umount "$HDD_RM_MOUNT" || die "$E_IO" "failed to unmount $HDD_RM_MOUNT (is something using it?)"
+    fi
+
+    backup_once "$FSTAB_FILE"
+    hdd_fstab_snapshot
+    body="$(hdd_block_body | grep -vxF -- "$HDD_RM_LINE" || true)"
+    hdd_block_set "$body"
+
+    # Removing an entry can no more be assumed safe than adding one, and the
+    # rollback copy is the same mechanism.
+    hdd_fstab_verify
+
+    info "hdd removed:"
+    info "  entry: $HDD_RM_LINE"
+    info "  mount: $HDD_RM_MOUNT (the directory is left in place)"
+    info "the partition, its filesystem and its data were not touched"
+    return 0
+}
+
+cmd_hdd_remove() {
+    local opt_part="" opt_mount="" opt_dryrun=0
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_hdd_remove; exit "$E_OK" ;;
+            -p|--partition)
+                [ $# -ge 2 ] || die "$E_ARGS" "--partition requires a value"
+                opt_part="$2"; shift 2 ;;
+            --partition=*) opt_part="${1#*=}"; shift ;;
+            -m|--mount)
+                [ $# -ge 2 ] || die "$E_ARGS" "--mount requires a value"
+                opt_mount="$2"; shift 2 ;;
+            --mount=*) opt_mount="${1#*=}"; shift ;;
+            -f|--force) FORCE=1; shift ;;
+            --dry-run) opt_dryrun=1; shift ;;
+            --) shift; [ $# -eq 0 ] || die "$E_ARGS" "unexpected argument: $1" ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) die "$E_ARGS" "unexpected argument: $1" ;;
+        esac
+    done
+
+    if [ -n "$opt_part" ] && [ -n "$opt_mount" ]; then
+        die "$E_ARGS" "--partition and --mount are alternatives; give exactly one"
+    fi
+    if [ -z "$opt_part" ] && [ -z "$opt_mount" ]; then
+        die "$E_ARGS" "one of --partition or --mount is required"
+    fi
+    if [ -n "$opt_mount" ]; then
+        opt_mount="$(normalise_mount "$opt_mount")" \
+            || die "$E_ARGS" "refusing to use / as the mount point"
+    fi
+
+    require_cmds blkid findmnt umount
+    require_sudo
+    elevate "${ORIG_ARGS[@]}"
+
+    hdd_remove_checks "$opt_part" "$opt_mount"
+    debug "resolved: entry='$HDD_RM_LINE' mount=$HDD_RM_MOUNT dry_run=$opt_dryrun"
+
+    # Before the prompt, not after: a dry run reports and stops, and must never
+    # ask a question about work it is not going to do.
+    if [ "$opt_dryrun" = "1" ]; then
+        info "dry run: would remove the entry for $HDD_RM_MOUNT"
+        info "  $HDD_RM_LINE"
+        info "nothing was changed"
+        exit "$E_OK"
+    fi
+
+    # Not `|| die "$E_OK"` - declining is not an error, and die would print
+    # it as one.
+    if ! confirm "Remove the fstab entry for $HDD_RM_MOUNT? The partition and its data are not touched."; then
+        info "cancelled; nothing was changed"
+        exit "$E_OK"
+    fi
+
+    hdd_remove_apply
+}
+
+# hdd_add_checks <part> -- every refusal `add` can make, in order. Silent on
+# success. Reads $HDD_MOUNT.
+#
+# Kept apart from hdd_add_apply so that --dry-run runs exactly this and stops.
+# A dry run and a real run cannot then disagree about whether the operation was
+# possible, which is the only property that makes a dry run worth having.
+hdd_add_checks() {
+    local part="$1" fstype mnt
+
+    dev_exists "$part" || die "$E_NOTFOUND" "block device '$part' not found"
+    part_is_partition "$part" \
+        || die "$E_ARGS" "$part is a whole disk; 'hdd add' adopts a partition, and 'hdd init' prepares a disk"
+
+    fstype="$(part_fstype "$part")"
+    [ -n "$fstype" ] \
+        || die "$E_ARGS" "$part has no filesystem; 'hdd add' adopts one that exists"
+    hdd_type_of_fstype "$fstype" >/dev/null \
+        || die "$E_ARGS" "$part is formatted as '$fstype', not one of: ext4 xfs vfat ntfs"
+
+    if partition_managed "$part"; then
+        die "$E_EXISTS" "$part is already recorded in $FSTAB_FILE by system-setup"
+    fi
+    if partition_in_fstab "$part"; then
+        die "$E_EXISTS" "$part already has an entry in $FSTAB_FILE that system-setup did not write"
+    fi
+
+    mnt="$(mount_point_of "$part")"
+    [ -z "$mnt" ] || die "$E_EXISTS" "$part is already mounted at $mnt"
+
+    # The mount point, from both directions. hdd_fstab_write drops any entry
+    # claiming $HDD_MOUNT - which is right for `init` re-running on one disk,
+    # and would silently evict somebody else's partition here.
+    if mount_in_fstab "$HDD_MOUNT"; then
+        die "$E_EXISTS" "$HDD_MOUNT is already claimed by an entry in $FSTAB_FILE"
+    fi
+    if findmnt -n "$HDD_MOUNT" >/dev/null 2>&1; then
+        die "$E_EXISTS" "$HDD_MOUNT is already a mount point"
+    fi
+
+    [ -n "$(part_uuid "$part")" ] || die "$E_IO" "could not read a UUID from $part"
+    return 0
+}
+
+hdd_add_apply() {
+    local part="$1" uuid mnt
+
+    uuid="$(part_uuid "$part")"
+    if [ ! -d "$HDD_MOUNT" ]; then
+        mkdir -p "$HDD_MOUNT" || die "$E_IO" "failed to create $HDD_MOUNT"
+    fi
+
+    hdd_fstab_write "$part" "$uuid"
+    hdd_fstab_verify
+
+    mnt="$(mount_point_of "$part")"
+    [ "$mnt" = "$HDD_MOUNT" ] || die "$E_IO" "$part did not end up mounted at $HDD_MOUNT"
+
+    info "hdd added:"
+    info "  device: $part"
+    info "  uuid:   $uuid"
+    info "  type:   ${FSTAB_TYPE[$HDD_TYPE]}"
+    info "  mount:  $HDD_MOUNT"
+    return 0
+}
+
+cmd_hdd_add() {
+    local opt_part="" opt_mount="" opt_dryrun=0
+
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_hdd_add; exit "$E_OK" ;;
+            -p|--partition)
+                [ $# -ge 2 ] || die "$E_ARGS" "--partition requires a value"
+                opt_part="$2"; shift 2 ;;
+            --partition=*) opt_part="${1#*=}"; shift ;;
+            -m|--mount)
+                [ $# -ge 2 ] || die "$E_ARGS" "--mount requires a value"
+                opt_mount="$2"; shift 2 ;;
+            --mount=*) opt_mount="${1#*=}"; shift ;;
+            --dry-run) opt_dryrun=1; shift ;;
+            --) shift; [ $# -eq 0 ] || die "$E_ARGS" "unexpected argument: $1" ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) die "$E_ARGS" "unexpected argument: $1" ;;
+        esac
+    done
+
+    [ -n "$opt_part" ]  || die "$E_ARGS" "--partition is required"
+    [ -n "$opt_mount" ] || die "$E_ARGS" "--mount is required"
+    opt_mount="$(normalise_mount "$opt_mount")" \
+        || die "$E_ARGS" "refusing to use / as the mount point"
+
+    require_cmds blkid findmnt mount
+    require_sudo
+    elevate "${ORIG_ARGS[@]}"
+
+    HDD_MOUNT="$opt_mount"
+    hdd_add_checks "$opt_part"
+    HDD_TYPE="$(hdd_type_of_fstype "$(part_fstype "$opt_part")")"
+    debug "resolved: partition=$opt_part mount=$HDD_MOUNT type=$HDD_TYPE dry_run=$opt_dryrun"
+
+    if [ "$opt_dryrun" = "1" ]; then
+        info "dry run: $opt_part would be added at $HDD_MOUNT as ${FSTAB_TYPE[$HDD_TYPE]}"
+        info "nothing was changed"
+        exit "$E_OK"
+    fi
+
+    hdd_add_apply "$opt_part"
+}
+
+cmd_hdd_init() {
     local opt_device="$DEFAULT_DEVICE" opt_mount="$DEFAULT_MOUNT" opt_type="$DEFAULT_FSTYPE"
 
     while [ $# -gt 0 ]; do
         case "$1" in
-            -h|--help) help_hdd; exit "$E_OK" ;;
+            -h|--help) help_hdd_init; exit "$E_OK" ;;
             -d|--device)
                 [ $# -ge 2 ] || die "$E_ARGS" "--device requires a value"
                 opt_device="$2"; shift 2 ;;
@@ -1167,7 +2077,6 @@ cmd_hdd() {
                 [ $# -ge 2 ] || die "$E_ARGS" "--type requires a value"
                 opt_type="$2"; shift 2 ;;
             --type=*) opt_type="${1#*=}"; shift ;;
-            -f|--force) FORCE=1; shift ;;
             --) shift; [ $# -eq 0 ] || die "$E_ARGS" "unexpected argument: $1" ;;
             -*) die "$E_ARGS" "unknown flag: $1" ;;
             *) die "$E_ARGS" "unexpected argument: $1" ;;
@@ -1177,20 +2086,13 @@ cmd_hdd() {
     [ -n "${MKFS_CMD[$opt_type]:-}" ] \
         || die "$E_ARGS" "invalid --type: '$opt_type' (expected one of: ext4 xfs vfat ntfs)"
 
-    # Normalise the mount point to an absolute path: prepend /, collapse
-    # duplicate slashes, drop any trailing slash.
-    case "$opt_mount" in
-        /*) ;;
-        *) opt_mount="/$opt_mount" ;;
-    esac
-    while [[ "$opt_mount" == *//* ]]; do opt_mount="${opt_mount//\/\//\/}"; done
-    [ "$opt_mount" = "/" ] || opt_mount="${opt_mount%/}"
-    [ "$opt_mount" != "/" ] || die "$E_ARGS" "refusing to use / as the mount point"
+    opt_mount="$(normalise_mount "$opt_mount")" \
+        || die "$E_ARGS" "refusing to use / as the mount point"
 
     HDD_DEVICE="$opt_device"
     HDD_MOUNT="$opt_mount"
     HDD_TYPE="$opt_type"
-    debug "resolved: device=$HDD_DEVICE mount=$HDD_MOUNT type=$HDD_TYPE force=$FORCE"
+    debug "resolved: device=$HDD_DEVICE mount=$HDD_MOUNT type=$HDD_TYPE"
 
     require_cmds sfdisk blkid "${MKFS_CMD[$HDD_TYPE]}"
     require_sudo
@@ -1198,57 +2100,37 @@ cmd_hdd() {
 
     dev_exists "$HDD_DEVICE" || die "$E_NOTFOUND" "block device '$HDD_DEVICE' not found"
 
-    local part state fstype mnt uuid
+    local part state mnt uuid
     part="$(part_name "$HDD_DEVICE" 1)"
-    if hdd_already_configured "$part"; then
-        info "hdd already configured: $part ($HDD_TYPE) mounted at $HDD_MOUNT"
-        exit "$E_OK"
-    fi
 
     state="$(dev_state "$HDD_DEVICE")"
     debug "device state: $state"
 
+    # Normalise any earlier-release block for this disk before deciding
+    # anything. It says the same thing in an older spelling, and every check
+    # below - and hdd_fstab_write's dedup - can only see the current one.
+    if hdd_migrate_blocks "$HDD_DEVICE"; then
+        hdd_fstab_snapshot
+        hdd_fstab_verify
+    fi
+
+    # `init` provisions a RAW disk and nothing else. Every other shape is
+    # either already ours - in which case there is nothing to do - or somebody
+    # else's, in which case the answer is no. There is no override: reusing an
+    # occupied disk is now an explicit `hdd remove` first.
     case "$state" in
-        unsafe)
-            info "$HDD_DEVICE is not in a state this command will modify on its own:"
-            hdd_describe "$HDD_DEVICE"
-            if [ "$FORCE" != "1" ]; then
-                die "$E_EXISTS" "refusing to touch $HDD_DEVICE (re-run with --force to override)"
-            fi
-            local p
-            for p in $(dev_partitions "$HDD_DEVICE"); do
-                mnt="$(mount_point_of "/dev/$p")"
-                [ -z "$mnt" ] || umount "/dev/$p" || die "$E_IO" "failed to unmount /dev/$p"
-            done
-            hdd_partition
-            hdd_format "$part"
-            ;;
         blank)
             hdd_partition
             hdd_format "$part"
             ;;
-        single)
-            fstype="$(part_fstype "$part")"
-            mnt="$(mount_point_of "$part")"
-            debug "partition $part: fstype='${fstype:-none}' mount='${mnt:-none}'"
-
-            if [ "$fstype" = "${FSTAB_TYPE[$HDD_TYPE]}" ] || [ "$fstype" = "$HDD_TYPE" ]; then
-                # Right filesystem. Only the mount point can be wrong.
-                if [ -n "$mnt" ] && [ "$mnt" != "$HDD_MOUNT" ]; then
-                    if [ "$FORCE" != "1" ]; then
-                        die "$E_EXISTS" "$part is mounted at $mnt, not $HDD_MOUNT (re-run with --force to move it)"
-                    fi
-                    umount "$part" || die "$E_IO" "failed to unmount $part"
-                fi
-            else
-                if [ "$FORCE" != "1" ]; then
-                    die "$E_EXISTS" "$part is formatted as '${fstype:-unformatted}', not '$HDD_TYPE' (re-run with --force to reformat)"
-                fi
-                if [ -n "$mnt" ]; then
-                    umount "$part" || die "$E_IO" "failed to unmount $part"
-                fi
-                hdd_format "$part"
+        *)
+            if all_partitions_managed "$HDD_DEVICE"; then
+                info "hdd already configured: every partition on $HDD_DEVICE is managed by system-setup"
+                exit "$E_OK"
             fi
+            info "$HDD_DEVICE carries partitions or data this command did not create:"
+            hdd_describe "$HDD_DEVICE"
+            die "$E_EXISTS" "refusing to touch $HDD_DEVICE; use 'hdd add' to adopt an existing partition, or 'hdd remove' to release one"
             ;;
     esac
 
@@ -1259,7 +2141,7 @@ cmd_hdd() {
         mkdir -p "$HDD_MOUNT" || die "$E_IO" "failed to create $HDD_MOUNT"
     fi
 
-    hdd_fstab_write "$uuid"
+    hdd_fstab_write "$part" "$uuid"
     hdd_fstab_verify
 
     mnt="$(mount_point_of "$part")"
@@ -1282,7 +2164,10 @@ docker_resolve_user() {
         || die "$E_PRECHECK" "cannot resolve the home directory of user '$DOCKER_USER'"
     [ -d "$DOCKER_USER_HOME" ] \
         || die "$E_PRECHECK" "home directory '$DOCKER_USER_HOME' of user '$DOCKER_USER' does not exist"
-    DOCKER_WORKSPACE="$DOCKER_USER_HOME/docker"
+    # A --workspace given on the command line wins; this is only the default,
+    # and it cannot be computed before the sudo re-exec because it depends on
+    # the ORIGINAL user's home.
+    [ -n "${DOCKER_WORKSPACE:-}" ] || DOCKER_WORKSPACE="$DOCKER_USER_HOME/docker"
     DOCKER_BASHRC="$DOCKER_USER_HOME/.bashrc"
     debug "invoking user: $DOCKER_USER (home: $DOCKER_USER_HOME)"
     return 0
@@ -1325,15 +2210,42 @@ docker_pool_write() {
 }
 
 # The workspace folder is created only when absent. An existing folder is left
-# ENTIRELY alone - no chown, no chmod, no recursion. It holds Compose projects
-# and bind-mounted data, so a recursive chown on a re-run could rewrite the
-# ownership of live container data.
+# An existing workspace is left alone when the user can already write to it.
+# When they cannot, only the DIRECTORY's ownership is repaired - never its
+# contents. It holds Compose projects and bind-mounted data, so a recursive
+# chown would rewrite the ownership of live container data.
 docker_workspace() {
+    if [ -e "$DOCKER_WORKSPACE" ] && [ ! -d "$DOCKER_WORKSPACE" ]; then
+        die "$E_ARGS" "$DOCKER_WORKSPACE exists and is not a directory"
+    fi
+
     if [ -d "$DOCKER_WORKSPACE" ]; then
-        debug "workspace exists; leaving ownership and mode untouched"
-        info "workspace folder already present: $DOCKER_WORKSPACE"
+        # Ask the USER whether they can write, rather than inferring it from
+        # mode bits and ownership. That inference gets ACLs, supplementary
+        # groups and setgid directories wrong, and this is the one question
+        # that matters.
+        if sudo -u "$DOCKER_USER" test -w "$DOCKER_WORKSPACE"; then
+            debug "workspace exists and is writable by $DOCKER_USER; touching nothing"
+            info "workspace folder already present: $DOCKER_WORKSPACE"
+            return 0
+        fi
+
+        # NON-RECURSIVE, and deliberately so. DO NOT ADD -R.
+        #
+        # The workspace holds Compose projects and bind-mounted container
+        # data. A recursive chown would rewrite the ownership of live data
+        # that containers are running against. Fixing the directory's own
+        # ownership grants exactly the access that is missing and leaves every
+        # file beneath it alone.
+        info "workspace folder $DOCKER_WORKSPACE is not writable by $DOCKER_USER; fixing the directory itself"
+        chown "$DOCKER_USER:" "$DOCKER_WORKSPACE" \
+            || die "$E_IO" "failed to set ownership on $DOCKER_WORKSPACE"
+        sudo -u "$DOCKER_USER" test -w "$DOCKER_WORKSPACE" \
+            || die "$E_IO" "$DOCKER_WORKSPACE is still not writable by $DOCKER_USER"
+        info "  ownership of the directory changed; nothing inside it was touched"
         return 0
     fi
+
     mkdir -p "$DOCKER_WORKSPACE" || die "$E_IO" "failed to create $DOCKER_WORKSPACE"
     chown "$DOCKER_USER:" "$DOCKER_WORKSPACE" || die "$E_IO" "failed to set ownership on $DOCKER_WORKSPACE"
     chmod 755 "$DOCKER_WORKSPACE"
@@ -1548,7 +2460,7 @@ docker_do_uninstall() {
 }
 
 cmd_docker() {
-    local opt_network="" opt_size="" opt_uninstall=0
+    local opt_network="" opt_size="" opt_workspace="" opt_uninstall=0
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -1561,6 +2473,10 @@ cmd_docker() {
                 [ $# -ge 2 ] || die "$E_ARGS" "--size requires a value"
                 opt_size="$2"; shift 2 ;;
             --size=*) opt_size="${1#*=}"; shift ;;
+            -w|--workspace)
+                [ $# -ge 2 ] || die "$E_ARGS" "--workspace requires a value"
+                opt_workspace="$2"; shift 2 ;;
+            --workspace=*) opt_workspace="${1#*=}"; shift ;;
             -u|--uninstall) opt_uninstall=1; shift ;;
             --) shift; [ $# -eq 0 ] || die "$E_ARGS" "unexpected argument: $1" ;;
             -*) die "$E_ARGS" "unknown flag: $1" ;;
@@ -1572,6 +2488,20 @@ cmd_docker() {
         || die "$E_ARGS" "--size requires --network"
     [ "$opt_uninstall" -eq 0 ] || [ -z "$opt_network" ] \
         || die "$E_ARGS" "--uninstall cannot be combined with --network"
+    [ "$opt_uninstall" -eq 0 ] || [ -z "$opt_workspace" ] \
+        || die "$E_ARGS" "--uninstall cannot be combined with --workspace"
+
+    if [ -n "$opt_workspace" ]; then
+        # Absolute only, and normalised the same way mount points are. A
+        # relative path would resolve against root's cwd after the sudo
+        # re-exec, which is never what the operator meant.
+        case "$opt_workspace" in
+            /*) ;;
+            *) die "$E_ARGS" "invalid --workspace: '$opt_workspace' (must be an absolute path)" ;;
+        esac
+        opt_workspace="$(normalise_mount "$opt_workspace")" \
+            || die "$E_ARGS" "refusing to use / as the workspace"
+    fi
 
     if [ -n "$opt_network" ]; then
         cidr_valid "$opt_network" \
@@ -1584,8 +2514,9 @@ cmd_docker() {
 
     DOCKER_NETWORK="$opt_network"
     DOCKER_SIZE="$opt_size"
+    DOCKER_WORKSPACE="$opt_workspace"
     DOCKER_UNINSTALL="$opt_uninstall"
-    debug "resolved: network=${DOCKER_NETWORK:-none} size=${DOCKER_SIZE:-n/a} uninstall=$DOCKER_UNINSTALL"
+    debug "resolved: network=${DOCKER_NETWORK:-none} size=${DOCKER_SIZE:-n/a} workspace=${DOCKER_WORKSPACE:-default} uninstall=$DOCKER_UNINSTALL"
 
     require_cmds jq
     require_sudo
@@ -1603,7 +2534,10 @@ cmd_docker() {
     local installed=0 pool_ok=0 ws_ok=0 home_ok=0
     if docker_installed; then installed=1; fi
     if [ -z "$DOCKER_NETWORK" ]; then pool_ok=1; elif docker_pool_matches; then pool_ok=1; fi
-    if [ -d "$DOCKER_WORKSPACE" ]; then ws_ok=1; fi
+    # Writable, not merely present: --workspace can now name a directory that
+    # exists but belongs to someone else, and "already configured" must not be
+    # reported for a workspace the operator cannot write to.
+    if [ -d "$DOCKER_WORKSPACE" ] && sudo -u "$DOCKER_USER" test -w "$DOCKER_WORKSPACE"; then ws_ok=1; fi
     if docker_home_present; then home_ok=1; fi
     debug "state: installed=$installed pool_ok=$pool_ok workspace=$ws_ok docker_home=$home_ok"
 
@@ -1886,7 +2820,6 @@ file_elevate() {
     local rc=0
     local -a argv=(file "$FILE_PATH")
     if [ "$VERBOSE" = "1" ]; then argv+=(--verbose); fi
-    if [ "$FORCE" = "1" ]; then argv+=(--force); fi
     debug "elevating: sudo -- $SELF $(join_sp "${argv[@]}")"
     sudo -- "$SELF" "${argv[@]}" || rc=$?
     exit "$rc"
@@ -2026,10 +2959,11 @@ json_validate() {
     fi
 
     if json_has_node docker; then
-        json_fields docker enabled network size
+        json_fields docker enabled network size workspace
         json_expect docker enabled boolean
         json_expect docker network string
         json_expect docker size number
+        json_expect docker workspace string
         local dn ds
         dn="$(jf '.docker.network // empty')"
         ds="$(jf '.docker.size // empty')"
@@ -2045,6 +2979,18 @@ json_validate() {
         fi
         if [ "$(jf '.docker.enabled')" = "false" ] && [ -n "$dn" ]; then
             file_err "docker.network cannot be combined with docker.enabled: false"
+        fi
+        local dw
+        dw="$(jf '.docker.workspace // empty')"
+        if [ -n "$dw" ]; then
+            case "$dw" in
+                /) file_err "invalid docker.workspace: '/' " ;;
+                /*) ;;
+                *) file_err "invalid docker.workspace: '$dw' (must be an absolute path)" ;;
+            esac
+            if [ "$(jf '.docker.enabled')" = "false" ]; then
+                file_err "docker.workspace cannot be combined with docker.enabled: false"
+            fi
         fi
     fi
 
@@ -2130,13 +3076,10 @@ file_args_hdd() {
     [ -z "$dev" ] || FILE_ARGS+=(--device "$dev")
     [ -z "$mnt" ] || FILE_ARGS+=(--mount "$mnt")
     [ -z "$typ" ] || FILE_ARGS+=(--type "$typ")
-    # Passed explicitly rather than relying on the global, so the --dry-run
-    # plan line shows exactly what a real run would do.
-    if [ "$FORCE" = "1" ]; then FILE_ARGS+=(--force); fi
 }
 
 file_args_docker() {
-    local net size
+    local net size ws
     FILE_ARGS=()
     if [ "$(jf '.docker.enabled')" = "false" ]; then
         FILE_ARGS=(--uninstall)
@@ -2144,8 +3087,10 @@ file_args_docker() {
     fi
     net="$(jf '.docker.network // empty')"
     size="$(jf '.docker.size // empty')"
-    [ -z "$net" ] || FILE_ARGS+=(--network "$net")
+    ws="$(jf '.docker.workspace // empty')"
+    [ -z "$net" ]  || FILE_ARGS+=(--network "$net")
     [ -z "$size" ] || FILE_ARGS+=(--size "$size")
+    [ -z "$ws" ]   || FILE_ARGS+=(--workspace "$ws")
 }
 
 file_args_ntp() {
@@ -2191,10 +3136,6 @@ cmd_file() {
         case "$1" in
             -h|--help) help_file; exit "$E_OK" ;;
             --dry-run) opt_dryrun=1; shift ;;
-            # Sets the same global the CLI sets. hdd is its only consumer.
-            # Deliberately a command-line flag and NOT a document field: a
-            # configuration file alone must never be able to destroy data.
-            -f|--force) FORCE=1; shift ;;
             --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
             # A bare - is the conventional "read from stdin" argument, not a
             # flag; it must be matched before the -* case swallows it.
@@ -2253,17 +3194,21 @@ cmd_file() {
     local first_rc=0 cmd rc out label
 
     for node in "${present[@]}"; do
+        # `label` is what the --dry-run plan line prints, and it is not always
+        # the node name: the network node runs `ip`, and the hdd node means
+        # `hdd init` specifically - the other hdd subcommands have no document
+        # representation.
         case "$node" in
-            network) cmd=cmd_ip; file_args_network ;;
-            tz)      cmd=cmd_tz; file_args_tz ;;
-            hdd)     cmd=cmd_hdd; file_args_hdd ;;
-            docker)  cmd=cmd_docker; file_args_docker ;;
-            ntp)     cmd=cmd_ntp; file_args_ntp ;;
+            network) cmd=cmd_ip;       label="ip";       file_args_network ;;
+            tz)      cmd=cmd_tz;       label="tz";       file_args_tz ;;
+            hdd)     cmd=cmd_hdd_init; label="hdd init"; file_args_hdd ;;
+            docker)  cmd=cmd_docker;   label="docker";   file_args_docker ;;
+            ntp)     cmd=cmd_ntp;      label="ntp";      file_args_ntp ;;
         esac
 
         if [ "$FILE_DRYRUN" -eq 1 ]; then
             info ""
-            info "[$node] would run: system-setup ${node/network/ip} $(join_sp ${FILE_ARGS[@]+"${FILE_ARGS[@]}"})"
+            info "[$node] would run: system-setup $label $(join_sp ${FILE_ARGS[@]+"${FILE_ARGS[@]}"})"
             results+=("$node|0|dry-run")
             continue
         fi
@@ -2385,7 +3330,9 @@ cmd_setup() {
     fi
 
     local bashrc="$HOME/.bashrc" path_needed=1
-    case ":$PATH:" in
+    # INHERITED_PATH, not PATH: see where it is captured. Asking the augmented
+    # PATH would always find sbin and never write the block.
+    case ":$INHERITED_PATH:" in
         *":$sbin:"*) path_needed=0 ;;
     esac
 
@@ -2422,11 +3369,11 @@ system-setup - basic configuration for freshly deployed Debian 12 VMs
 
 Usage:
   system-setup ip <ip[/mask]> -n <fqdn> [-m <mask>] [-g <gw>] [-d <dns>]... [--no-ipv6] [--no-restart]
-  system-setup hdd [-d <device>] [-m <mount>] [-t <ext4|xfs|vfat|ntfs>] [-f]
-  system-setup docker [-n <cidr> [-s <bits>]] | -u
+  system-setup hdd <init|add|expand|remove|list> [...]
+  system-setup docker [-n <cidr> [-s <bits>]] [-w <path>] | -u
   system-setup ntp [-s <server>]... | -u
   system-setup tz <zone>
-  system-setup file <path|-> [--dry-run] [-f]
+  system-setup file <path|-> [--dry-run]
   system-setup setup
 
 Aliases:
@@ -2464,24 +3411,114 @@ EOF
 
 help_hdd() {
     cat << 'EOF'
-system-setup hdd [-d <device>] [-m <mount>] [-t <ext4|xfs|vfat|ntfs>] [-f]
+system-setup hdd <subcommand>
 
-Partitions, formats and mounts a second disk, recording it in /etc/fstab by UUID.
+  init    prepare a raw disk: partition, format, mount, record in fstab
+  add     adopt an existing partition: mount it and record it in fstab
+  expand  grow a partition into free space, then grow its filesystem
+  remove  drop a managed mount: unmount and delete its fstab entry
+  list    show every disk, partition, mount and fstab state
+
+Run 'system-setup hdd <subcommand> -h' for the details of one.
+EOF
+}
+
+help_hdd_init() {
+    cat << 'EOF'
+system-setup hdd init [-d <device>] [-m <mount>] [-t <ext4|xfs|vfat|ntfs>]
+
+Prepares a RAW disk: one partition spanning it, a filesystem, a mount, and an
+/etc/fstab entry recorded by UUID.
 
   -d, --device <dev>     default /dev/sdb
   -m, --mount <path>     default /data; a bare name is taken as /<name>
   -t, --type <fs>        ext4 | xfs | vfat | ntfs; default ext4
-  -f, --force            permit destructive changes (reformat, unmount), and
-                         skip the confirmation prompt
 
-Without --force, a disk that is already formatted differently or mounted
-elsewhere is reported and left untouched.
+Only a disk with no partitions and no filesystem is touched. A disk whose
+partitions this tool already manages reports success and changes nothing; any
+other disk is refused. To adopt a partition that already exists, use 'hdd add'.
+
+The fstab entry is recorded in a single '# >>> system-setup >>>' block, and a
+partition is recognised as managed by its filesystem UUID - not by its device
+name, which is not stable.
+EOF
+}
+
+help_hdd_add() {
+    cat << 'EOF'
+system-setup hdd add -p <partition> -m <mount> [--dry-run]
+
+Adopts a partition that ALREADY has a filesystem: mounts it and records it in
+/etc/fstab by UUID. It never partitions, formats, or writes to the filesystem.
+
+  -p, --partition <part> required; a partition, not a whole disk
+  -m, --mount <path>     required; a bare name is taken as /<name>
+      --dry-run          run every check and report, changing nothing
+
+Refused if the partition is already mounted, already has an fstab entry, has no
+filesystem or one that is not ext4/xfs/vfat/ntfs, or if the mount point is
+already claimed. To prepare a raw disk instead, use 'hdd init'.
+EOF
+}
+
+help_hdd_expand() {
+    cat << 'EOF'
+system-setup hdd expand -p <partition> [-f] [--dry-run]
+
+Grows a partition into the free space that FOLLOWS it, then grows its
+filesystem to match. A partition with another partition after it cannot grow,
+however much space the disk has elsewhere.
+
+  -p, --partition <part> the partition to grow
+  -f, --force            permit a change of mount state without asking
+      --dry-run          report what would happen, changing nothing
+
+Filesystems disagree about being resized while mounted: ext4 and xfs must be
+mounted, vfat and ntfs must not. Confirmation - or --force - is required
+exactly when the mount state has to change; when the partition is already in
+the state its filesystem needs, expand proceeds without asking.
+EOF
+}
+
+help_hdd_remove() {
+    cat << 'EOF'
+system-setup hdd remove (-p <partition> | -m <mount>) [-f] [--dry-run]
+
+Removes a MOUNT CONFIGURATION: unmounts the partition and deletes its entry
+from /etc/fstab. It does not touch the partition, its filesystem, or any data
+on it, and it leaves the mount-point directory in place.
+
+  -p, --partition <part> the partition to release
+  -m, --mount <path>     or the mount point, for a disk that is no longer
+                         attached: a UUID cannot be read off a missing disk
+  -f, --force            skip the confirmation prompt
+      --dry-run          run every check and report, without prompting
+
+Exactly one of --partition and --mount is required. An entry this tool did not
+write is never removed. Removing the last entry removes the block with it.
+EOF
+}
+
+help_hdd_list() {
+    cat << 'EOF'
+system-setup hdd list
+
+Shows every disk on the host, one row per partition.
+
+  GROWABLE  free space immediately after the partition, which is what
+            'hdd expand' can claim. Blank when growpart is not installed.
+  FREE      free space inside the filesystem. Blank when not mounted.
+  FSTAB     managed  the entry is in one of this tool's sentinel blocks
+            yes      in fstab, but written by someone else
+            no       not in fstab
+
+Loop devices are omitted. The root disk is included.
 EOF
 }
 
 help_docker() {
     cat << 'EOF'
-system-setup docker [-n <cidr> [-s <bits>]] | -u
+system-setup docker [-n <cidr> [-s <bits>]] [-w <path>] | -u
 
 Installs Docker by the official Debian procedure, creates the workspace
 folder, and exports DOCKER_HOME in ~/.bashrc. The shell shortcuts themselves
@@ -2490,11 +3527,17 @@ are installed by 'system-setup setup' and activate once DOCKER_HOME is set.
   -n, --network <cidr>   address pool that user-defined networks are carved
                          from (default-address-pools), e.g. 10.100.0.0/16
   -s, --size <bits>      prefix length of each network from that pool; default 24
+  -w, --workspace <path> where DOCKER_HOME points; absolute, default ~/docker
   -u, --uninstall        remove Docker and the DOCKER_HOME export
+
+An existing workspace is left alone when you can already write to it. If you
+cannot, only the DIRECTORY's ownership is repaired - never its contents, which
+may be bind-mounted into running containers. Changing --workspace between runs
+repoints DOCKER_HOME and leaves the old directory on disk.
 
 Applying a pool change restarts dockerd, which stops running containers.
 This command never deletes data. --uninstall leaves /var/lib/docker,
-/var/lib/containerd and $HOME/docker in place; removing them is yours to do.
+/var/lib/containerd and the workspace in place; removing them is yours to do.
 EOF
 }
 
@@ -2532,9 +3575,11 @@ tz -> hdd -> docker -> ntp -> network. A failing task does not stop the
 sequence; the exit code is that of the first failure.
 
       --dry-run          validate everything and print the plan, change nothing
-  -f, --force            permit destructive hdd operations (reformat, unmount).
-                         Deliberately a flag, not a document field: a config
-                         file on its own can never destroy data.
+
+No task reachable from a document is destructive or interactive: the hdd node
+means 'hdd init', which only ever provisions a raw disk. Growing, releasing and
+reformatting are 'hdd expand' and 'hdd remove', which take --force of their own
+and cannot be named from a file.
 EOF
 }
 
