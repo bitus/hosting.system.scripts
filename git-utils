@@ -776,12 +776,6 @@ images_is_compose_project() {
     return 1
 }
 
-# images_compose_available -- v2 plugin probe; never touches the daemon
-images_compose_available() {
-    command -v docker >/dev/null 2>&1 || return 1
-    docker compose version >/dev/null 2>&1
-}
-
 # images_compose_config_json <loc>
 # Prints `docker compose config --format json`, preferring --profile '*'.
 # Verifies the wildcard actually pulled in every declared profile's
@@ -832,7 +826,7 @@ images_collect() {
     mapfile -t a_lines < <(images_read_file "$loc")
 
     if images_is_compose_project "$loc"; then
-        if ! images_compose_available; then
+        if ! compose_available; then
             warn "docker compose not available; leaving images unchanged for $loc"
             return 1
         fi
@@ -881,7 +875,132 @@ images_update_record() {
 }
 
 # ---------------------------------------------------------------------------
-# 11. Key layer -- keys_*
+# 11. Deadline helpers -- deadline_* / run_bounded
+# ---------------------------------------------------------------------------
+
+# A deadline bounds a whole unit of work -- one repo, for `repo status` --
+# rather than one call. Every external call inside it runs under `timeout`
+# with whatever is left, so the unit finishes on time without any call being
+# killed from outside the script.
+#
+# 0 means unbounded, which is the state for every command that has no
+# --timeout. Commands that do have one set it, do their work, and clear it.
+DEADLINE=0
+
+deadline_set()   { DEADLINE=$(( $(date +%s) + $1 )); }
+deadline_clear() { DEADLINE=0; }
+
+# deadline_remaining -- prints the seconds left, or "-" when unbounded.
+#
+# Returns 1 when the budget is spent, printing nothing. Callers branch on the
+# return value, not on the text, so "no deadline" and "no time left" can never
+# be confused -- which is the bug this shape exists to prevent.
+deadline_remaining() {
+    [ "$DEADLINE" -gt 0 ] || { printf '%s' '-'; return 0; }
+    local r=$(( DEADLINE - $(date +%s) ))
+    [ "$r" -gt 0 ] || return 1
+    printf '%s' "$r"
+}
+
+# run_bounded <cmd> [args...] -- run under timeout(1) when a deadline is set.
+#
+# Returns TIMEOUT_EXIT without running anything when the budget is already
+# spent, so "we ran out of time before trying" and "the call timed out" reach
+# every caller as the same code. Callers map that to a domain code (10 for
+# git, 18 for images); a bare 124 tells a user nothing.
+run_bounded() {
+    local r
+    r="$(deadline_remaining)" || return "$TIMEOUT_EXIT"
+    if [ "$r" = "-" ]; then
+        "$@"
+    else
+        timeout "$r" "$@"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 12. Docker layer -- docker_* / compose_* / image_*
+# ---------------------------------------------------------------------------
+
+# Four distinct probes, because conflating them produces the wrong error.
+# Notably a plugin probe is NOT a daemon probe: `docker compose version`
+# answers "can we parse compose files" without ever contacting dockerd, which
+# is why fix 50-01 could keep working on hosts with no daemon running.
+docker_available()  { command -v docker >/dev/null 2>&1; }
+compose_available() { docker_available && docker compose version >/dev/null 2>&1; }
+buildx_available()  { docker_available && docker buildx version >/dev/null 2>&1; }
+docker_daemon_ok()  { run_bounded docker info >/dev/null 2>&1; }
+
+# compose_running <loc> -- is any container of this project up?
+#
+#   0  yes
+#   1  no
+#   2  could not determine (daemon down, timeout, unparseable project)
+#
+# The third code matters: without it "nothing is running" and "we could not
+# ask" are the same answer, and a redeploy would report a stopped stack on a
+# host whose daemon is simply unreachable. Same convention as
+# images_compose_extract's return 2.
+compose_running() {
+    local loc="$1" out
+    out="$(cd "$loc" && run_bounded docker compose ps --status running -q)" || return 2
+    [ -n "$out" ]
+}
+
+# compose_ps_json <loc> -- `docker compose ps` as a JSON array.
+#
+# `--format json` emits JSON Lines (one object per line), not an array, so
+# this slurps. Verified against docker 28.2.2.
+compose_ps_json() {
+    local loc="$1" out
+    out="$(cd "$loc" && run_bounded docker compose ps --format json)" || return 1
+    printf '%s' "$out" | jq -s '.'
+}
+
+# --- identifiers ----------------------------------------------------------
+#
+# Docker exposes two unrelated namespaces and calling both of them "digest"
+# is how this gets broken:
+#
+#   image IDs    .Id / a container's .Image   -> restart_pending
+#   repo digests .RepoDigests / buildx        -> pull_available
+#
+# On a containerd-backed image store the two coincide, so a crossed
+# comparison passes every test on such a host and then reports a permanent
+# false positive on a host with the classic store, where .Id is the config
+# digest. The two pairs are kept apart here so a caller has to reach for the
+# wrong one deliberately.
+
+# image_id_local <ref> -- the id of the image this reference resolves to
+image_id_local() { run_bounded docker image inspect "$1" --format '{{.Id}}'; }
+
+# container_image_id <container> -- the id of the image it is actually running
+container_image_id() { run_bounded docker container inspect "$1" --format '{{.Image}}'; }
+
+# image_repo_digest <ref> -- the pulled index digest, bare (no name@ prefix).
+# Empty output means the image is present but was never pulled from a
+# registry, which is not an error.
+image_repo_digest() {
+    local out
+    out="$(run_bounded docker image inspect "$1" --format '{{json .RepoDigests}}')" || return 1
+    printf '%s' "$out" | jq -r '.[0] // empty' | sed 's/^[^@]*@//'
+}
+
+# image_remote_digest <ref> -- the registry's current index digest.
+#
+# buildx, not `docker manifest inspect`: the latter's per-platform entry is a
+# manifest digest and never equals what a pull records locally, so comparing
+# the two reports "update available" forever on any multi-arch image.
+#
+# The output is JSON-quoted and carries no trailing newline.
+image_remote_digest() {
+    local out
+    out="$(run_bounded docker buildx imagetools inspect "$1" --format '{{json .Manifest.Digest}}')" || return 1
+    printf '%s' "$out" | tr -d '"'
+}
+
+# ---------------------------------------------------------------------------
+# 13. Key layer -- keys_*
 # ---------------------------------------------------------------------------
 
 keys_check() {
@@ -934,7 +1053,7 @@ keys_delete() {
 }
 
 # ---------------------------------------------------------------------------
-# 12. Adoption layer -- adopt_*
+# 14. Adoption layer -- adopt_*
 # ---------------------------------------------------------------------------
 
 # adopt_current_branch <loc> -- prints the checked-out branch name.
@@ -1065,7 +1184,7 @@ adopt_block_exists() {
 }
 
 # ---------------------------------------------------------------------------
-# 13. Validation layer -- fv_* / rv_* / db_validate
+# 15. Validation layer -- fv_* / rv_* / db_validate
 # ---------------------------------------------------------------------------
 
 # fv_run <abs_path> -- prints the folder-validate JSON; returns 1 when any
@@ -1468,7 +1587,7 @@ db_validate() {
 }
 
 # ---------------------------------------------------------------------------
-# 14. Command implementations
+# 16. Command implementations
 # ---------------------------------------------------------------------------
 
 cmd_setup() {
@@ -2172,7 +2291,7 @@ cmd_repo_keys() {
 }
 
 # ---------------------------------------------------------------------------
-# 15. Help screens
+# 17. Help screens
 # ---------------------------------------------------------------------------
 
 help_main() {
@@ -2419,7 +2538,7 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# 16. Argument router
+# 18. Argument router
 # ---------------------------------------------------------------------------
 
 main() {
