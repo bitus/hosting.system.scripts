@@ -164,6 +164,73 @@ if [ -z "$SHELL_ERR" ]; then ok; else bad "B10: login shell emits errors :: $SHE
 if bash -n "$REPO/command-shortcuts" 2>/dev/null; then ok; else bad "B10b: command-shortcuts is not valid bash"; fi
 if LC_ALL=C grep -q "$(printf '\r')" "$REPO/command-shortcuts"; then bad "B10c: CRLF in command-shortcuts"; else ok; fi
 
+
+echo
+echo "=== B11: command-shortcuts-custom, the per-host file ==="
+CUSTOM="$REPO/command-shortcuts-custom"
+CUSTOM_LINE="[ -f \"$CUSTOM\" ] && . \"$CUSTOM\""
+rm -f "$CUSTOM"
+
+echo "--- B11: the line is written even though the file does not exist ---"
+# That is the whole design: an admin drops the file in later and it loads at
+# the next login, with no second `setup` run.
+run B11 0 "per-host shortcuts will load from" setup
+if grep -qF "$CUSTOM_LINE" "$BASHRC"; then ok; else bad "B11b: custom source line absent from $BASHRC"; fi
+assert B11c "[ \"$(block_count '>>> system-setup shortcuts >>>')\" = 1 ]"
+# it must be guarded, or a missing file breaks every login shell
+if grep -qF "[ -f \"$CUSTOM\" ] &&" "$BASHRC"; then ok; else bad "B11d: the custom line is not guarded on existence"; fi
+
+echo "--- B12: a login shell is clean with the file absent ---"
+SHELL_ERR="$(bash -ic true 2>&1 | grep -vE '^$|cannot set terminal process group|no job control in this shell')"
+if [ -z "$SHELL_ERR" ]; then ok; else bad "B12: shell errors with no custom file :: $SHELL_ERR"; fi
+
+echo "--- B13: creating it later takes effect with no re-run ---"
+printf 'ss_custom_marker() { echo CUSTOM_OK; }\n' > "$CUSTOM"
+OUT="$(bash -ic 'ss_custom_marker' 2>&1)"
+if grep -q CUSTOM_OK <<< "$OUT"; then ok; else bad "B13: custom shortcuts not loaded :: $OUT"; fi
+
+echo "--- B14: it is sourced AFTER the shipped file, so it can override ---"
+SN="$(grep -nF "[ -f \"$REPO/command-shortcuts\" ]" "$BASHRC" | head -1 | cut -d: -f1)"
+CN="$(grep -nF "$CUSTOM_LINE" "$BASHRC" | head -1 | cut -d: -f1)"
+if [ -n "$SN" ] && [ -n "$CN" ] && [ "$CN" -gt "$SN" ]; then ok; else bad "B14: custom line at $CN is not after the shipped line at $SN"; fi
+
+echo "--- B15: re-running setup is idempotent with the file present ---"
+run B15 0 "per-host shortcuts sourced from" setup
+assert B15b "[ \"$(block_count '>>> system-setup shortcuts >>>')\" = 1 ]"
+if [ "$(grep -cF "$CUSTOM_LINE" "$BASHRC")" = 1 ]; then ok; else bad "B15c: the custom line was duplicated"; fi
+
+echo "--- B16: a host whose block predates this change re-converges ---"
+# cmd_setup calls shortcuts_install unconditionally and block_upsert replaces
+# the block wholesale, so a block carrying only the shipped line is repaired
+# on the next run. (shortcuts_present would answer this too, but nothing
+# calls it - the convergence here is block_upsert's, not a predicate's.)
+grep -vF "$CUSTOM_LINE" "$BASHRC" > /tmp/ss-br.tmp && mv /tmp/ss-br.tmp "$BASHRC"
+if grep -qF "$CUSTOM_LINE" "$BASHRC"; then bad "B16a: could not strip the custom line for the test"; else ok; fi
+run B16 0 "shell shortcuts sourced" setup
+if grep -qF "$CUSTOM_LINE" "$BASHRC"; then ok; else bad "B16b: setup did not restore the custom line"; fi
+
+echo "--- B17: a CRLF custom file warns but is still wired up ---"
+printf 'ss_custom_marker() { echo CUSTOM_OK; }\r\n' > "$CUSTOM"
+OUT="$(bash "$SCRIPT" setup 2>&1)"
+if grep -q "CRLF line endings" <<< "$OUT"; then ok; else bad "B17: no CRLF warning for the custom file :: $OUT"; fi
+if grep -qF "$CUSTOM_LINE" "$BASHRC"; then ok; else bad "B17b: the line was dropped; it should be installed either way"; fi
+printf 'ss_custom_marker() { echo CUSTOM_OK; }\n' > "$CUSTOM"
+
+echo "--- B18: the file is git-untracked and ignored ---"
+# Only meaningful in a checkout. The lab host runs from a plain copy of the
+# scripts, so this asserts nothing there and says so rather than failing.
+if git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+    if git -C "$REPO" check-ignore -q command-shortcuts-custom 2>/dev/null; then ok; else
+        bad "B18: command-shortcuts-custom is not gitignored - a host-specific file would be committed"
+    fi
+    if [ -z "$(git -C "$REPO" ls-files command-shortcuts-custom 2>/dev/null)" ]; then ok; else
+        bad "B18b: command-shortcuts-custom is tracked in git"
+    fi
+else
+    echo "  (not a git checkout, skipping)"
+fi
+rm -f "$CUSTOM"
+
 echo
 echo "passed: $PASS   failed: $FAIL"
 if [ "$FAIL" -ne 0 ]; then

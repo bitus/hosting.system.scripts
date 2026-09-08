@@ -178,6 +178,23 @@ C3OUT="$(bash -ic 'type dcu 2>/dev/null | head -1' 2>/dev/null)"
 if grep -q 'dcu is aliased' <<< "$C3OUT"; then bad "C3e: docker aliases survived uninstall"; else ok; fi
 run C3f 0 "Docker installed" docker
 
+
+echo
+echo "=== C7: convergence requires EVERY docker package, not just docker-ce ==="
+# A host installed before a package joined DOCKER_PKGS - docker-buildx-plugin,
+# say - has docker-ce and not the plugin. Checking only docker-ce reports
+# "already configured" and the missing package is never installed.
+if grep -q 'docker-buildx-plugin' "$SCRIPT"; then ok; else bad "C7: docker-buildx-plugin is not in the package list"; fi
+MISSING="$(bash -c "source '$SCRIPT'; docker_missing_pkgs" 2>/dev/null)"
+if [ -z "$MISSING" ]; then ok; else bad "C7b: packages missing on this host: $MISSING"; fi
+if bash -c "source '$SCRIPT'; docker_installed" 2>/dev/null; then ok; else bad "C7c: docker_installed is false on a converged host"; fi
+# and the predicate really does look past docker-ce
+if bash -c "source '$SCRIPT'; pkg_installed() { [ \"\$1\" = docker-ce ]; }; docker_installed" 2>/dev/null; then
+    bad "C7d: docker_installed returned true with only docker-ce present"
+else ok; fi
+# buildx is actually usable, not merely installed
+if docker buildx version >/dev/null 2>&1; then ok; else bad "C7e: 'docker buildx version' failed"; fi
+
 echo
 echo "passed: $PASS   failed: $FAIL"
 if [ "$FAIL" -ne 0 ]; then

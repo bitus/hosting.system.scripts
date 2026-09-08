@@ -32,6 +32,10 @@ readonly TIMESYNCD_BAK="/etc/systemd/timesyncd.conf.bak"
 readonly DOCKER_DAEMON_FILE="/etc/docker/daemon.json"
 readonly SYSCTL_IPV6_FILE="/etc/sysctl.d/99-system-setup-ipv6.conf"
 readonly SHORTCUTS_NAME="command-shortcuts"
+# Per-host shortcuts, git-untracked, written by whoever administers the box.
+# It sits beside command-shortcuts and is sourced after it, so a host can add
+# to - or override - anything the shipped file defines.
+readonly SHORTCUTS_CUSTOM_NAME="command-shortcuts-custom"
 readonly BASHRC_ID_SHORTCUTS="shortcuts"
 readonly BASHRC_ID_DOCKER="docker"
 readonly ZONEINFO_DIR="/usr/share/zoneinfo"
@@ -598,8 +602,27 @@ user_home() {
     printf '%s' "$home"
 }
 
+# docker_missing_pkgs -- the DOCKER_PKGS that are not installed, space
+# separated; empty when all of them are.
+docker_missing_pkgs() {
+    local pkg out=""
+    for pkg in "${DOCKER_PKGS[@]}"; do
+        pkg_installed "$pkg" || out="$out $pkg"
+    done
+    printf '%s' "${out# }"
+}
+
+# docker_installed -- EVERY package in DOCKER_PKGS, not just docker-ce.
+#
+# Checking only docker-ce is the same mistake as checking a workspace for
+# presence rather than writability: a host installed before a package joined
+# that list - docker-buildx-plugin, say - or installed by hand, reports
+# "already configured" and never receives the missing one. The convergence
+# check has to ask about the whole desired state or it converges on a subset
+# of it.
 docker_installed() {
-    command -v docker >/dev/null 2>&1 && pkg_installed docker-ce
+    command -v docker >/dev/null 2>&1 || return 1
+    [ -z "$(docker_missing_pkgs)" ]
 }
 
 # restart_unit <unit> -- clear any failed state, then restart.
@@ -2278,6 +2301,16 @@ shortcuts_is_crlf() {
 # must not break the operator's login shell.
 shortcuts_line() { printf '[ -f "%s" ] && . "%s"' "$1" "$1"; }
 
+# shortcuts_custom_path <resolved-shortcuts-path> -- the per-host file beside
+# it. Derived from the already-resolved path rather than resolved itself,
+# because it need NOT exist: it is created per host, usually after setup has
+# run, and the `[ -f ]` guard in the sourcing line is what decides at shell
+# start. Writing the line unconditionally is the point - an operator drops the
+# file in later and it is picked up on the next login, with no re-run.
+shortcuts_custom_path() {
+    printf '%s/%s' "$(dirname "$1")" "$SHORTCUTS_CUSTOM_NAME"
+}
+
 # Remove a LEGACY docker-id shortcuts block.
 #
 # The "docker" sentinel id is REUSED by this change: it used to hold the
@@ -2317,14 +2350,40 @@ shortcuts_install() {
         : > "$bashrc"
         chmod 644 "$bashrc"
     fi
+    local custom
+    custom="$(shortcuts_custom_path "$src")"
+
+    # A CRLF custom file breaks the login shell exactly as the shipped one
+    # would - but it is warned about and still sourced, where a CRLF
+    # command-shortcuts is skipped outright. The asymmetry is deliberate: the
+    # shipped file is ours and a CRLF one means the checkout is broken, while
+    # this file belongs to the operator and may legitimately not exist yet, or
+    # be mid-edit. Omitting the line would leave a silent gap that only
+    # another `setup` run could close.
+    if [ -f "$custom" ] && shortcuts_is_crlf "$custom"; then
+        warn "$custom has CRLF line endings and will break every login shell that sources it"
+        warn "convert it to LF (dos2unix $custom); the line is installed either way"
+    fi
+
     content="$(block_marker_open "$BASHRC_ID_SHORTCUTS")
 $(shortcuts_line "$src")
+$(shortcuts_line "$custom")
 $(block_marker_close "$BASHRC_ID_SHORTCUTS")"
     block_upsert "$bashrc" "$BASHRC_ID_SHORTCUTS" "$content"
     info "shell shortcuts sourced from $src in $bashrc"
+    if [ -f "$custom" ]; then
+        info "per-host shortcuts sourced from $custom"
+    else
+        info "per-host shortcuts will load from $custom if you create it"
+    fi
     return 0
 }
 
+# NOTE: currently UNCALLED. cmd_setup runs shortcuts_migrate + shortcuts_install
+# unconditionally and lets block_upsert converge, so nothing asks this
+# question. Kept because it is the predicate any "report without changing"
+# path would need, and updated alongside shortcuts_install so the two cannot
+# drift - but do not mistake it for the reason a stale block re-converges.
 shortcuts_present() {
     local bashrc="$1" src
     src="$(shortcuts_path)" || return 1
@@ -2333,7 +2392,9 @@ shortcuts_present() {
     if shortcuts_is_crlf "$src"; then return 1; fi
     [ -f "$bashrc" ] || return 1
     grep -qF "$(block_marker_open "$BASHRC_ID_SHORTCUTS")" "$bashrc" || return 1
-    grep -qF "$(shortcuts_line "$src")" "$bashrc"
+    grep -qF "$(shortcuts_line "$src")" "$bashrc" || return 1
+    # Both lines: a block carrying only the shipped one is not fully installed.
+    grep -qF "$(shortcuts_line "$(shortcuts_custom_path "$src")")" "$bashrc"
 }
 
 # DOCKER_HOME lives in ~/.bashrc, in this command's own sentinel block.
@@ -2547,6 +2608,13 @@ cmd_docker() {
     fi
 
     if [ "$installed" -eq 0 ]; then
+        # Distinguish "no Docker at all" from "Docker, minus a plugin". The
+        # second is the ordinary state of a host provisioned before a package
+        # joined DOCKER_PKGS, and telling the operator it is being installed
+        # from scratch would be untrue.
+        if command -v docker >/dev/null 2>&1; then
+            info "Docker is installed but incomplete; missing: $(docker_missing_pkgs)"
+        fi
         docker_do_install
     else
         info "Docker is already installed"
@@ -3589,6 +3657,11 @@ system-setup setup
 
 Installs system-setup as a symlink in /usr/local/sbin (or /usr/sbin), adds
 that folder to PATH in ~/.bashrc, and sources command-shortcuts from there.
+
+It also sources command-shortcuts-custom from the same folder, for shortcuts
+specific to this host. That file is git-untracked and need not exist yet - the
+line guards on existence, so create it whenever you like and it loads at the
+next login without re-running setup.
 
 Already-open shells must run 'source ~/.bashrc' to see the change.
 EOF
