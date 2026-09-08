@@ -8,8 +8,17 @@ IFS=$'\n\t'
 
 # shellcheck disable=SC2034  # E_OK documents the full exit-code space; success needs no explicit exit
 readonly E_OK=0 E_PRECHECK=1 E_ARGS=2 E_IO=3 E_EXISTS=4 E_NOTFOUND=5
-# shellcheck disable=SC2034  # E_GITFOLDER/E_MISMATCH/E_GITOUTPUT land with the commands that raise them
-readonly E_GITFOLDER=6 E_MISMATCH=8 E_GITOUTPUT=10 E_DBFORMAT=90
+# shellcheck disable=SC2034  # E_GITFOLDER/E_MISMATCH/E_CMDOUTPUT land with the commands that raise them
+readonly E_GITFOLDER=6 E_MISMATCH=8 E_CMDOUTPUT=10 E_DBFORMAT=90
+# shellcheck disable=SC2034  # the docker codes land with the commands added by fix 50-04
+readonly E_NOCOMPOSE=14 E_NOTRUNNING=16 E_IMAGE=18 E_NOUPDATE=22
+
+# What timeout(1) returns when it kills the command it wrapped. Mapped to a
+# domain code by every caller -- a bare 124 tells the user nothing.
+# shellcheck disable=SC2034
+readonly TIMEOUT_EXIT=124
+# shellcheck disable=SC2034
+readonly PULL_TIMEOUT_DEFAULT=300 STATUS_TIMEOUT_DEFAULT=60
 readonly SCHEMA_VERSION="1.1"
 readonly SCHEMA_REGEX='^[0-9]+(\.[0-9]+)?$'
 readonly REPOS_FILE="$HOME/.repositories.json"
@@ -110,22 +119,35 @@ def fold:
   else . end;
 fold'
 
-readonly OUTPUT_FORMAT_DEFAULT="text"
+readonly OUTPUT_FORMAT_DEFAULT="plain"
 OUTPUT_FORMAT="$OUTPUT_FORMAT_DEFAULT"
 
 # output_format_set <value> -- validate and assign, for the flag loops
 output_format_set() {
     case "$1" in
-        json|text|yaml) OUTPUT_FORMAT="$1" ;;
-        *) die "$E_ARGS" "invalid --output-format: '$1' (expected json, text or yaml)" ;;
+        json|text|yaml|plain) OUTPUT_FORMAT="$1" ;;
+        *) die "$E_ARGS" "invalid --output-format: '$1' (expected json, text, yaml or plain)" ;;
     esac
 }
 
-# render_output <json> -- emit per $OUTPUT_FORMAT
+# render_output <json> [plain_filter] -- emit per $OUTPUT_FORMAT
+#
+# `plain` is the default format and means "line-oriented, easy for a pipe to
+# consume". Only a few commands have a sensible line form; the rest pass no
+# filter and `plain` falls through to `text`, so making it the default changed
+# nothing for any command that existed before fix 50-04.
+#
+# plain_filter is a jq program emitting raw lines (jq -r).
 render_output() {
-    local json="$1"
+    local json="$1" plain_filter="${2:-}"
     case "$OUTPUT_FORMAT" in
-        json)      printf '%s' "$json" | jq . ;;
+        json)  printf '%s' "$json" | jq . ;;
+        plain)
+            if [ -n "$plain_filter" ]; then
+                printf '%s' "$json" | jq -r "$plain_filter"
+            else
+                printf '%s' "$json" | jq "$FOLD_FILTER" | yq -y .
+            fi ;;
         text|yaml) printf '%s' "$json" | jq "$FOLD_FILTER" | yq -y . ;;
         *)         die "$E_ARGS" "invalid output format: '$OUTPUT_FORMAT'" ;;
     esac
@@ -2022,11 +2044,11 @@ cmd_folder_adopt() {
 
     local branch url
     branch="$(adopt_current_branch "$loc")" \
-        || die "$E_GITOUTPUT" "cannot determine the current branch of '$loc' (detached HEAD?)"
+        || die "$E_CMDOUTPUT" "cannot determine the current branch of '$loc' (detached HEAD?)"
     url="$(adopt_read_origin "$loc")" \
-        || die "$E_GITOUTPUT" "cannot read the 'origin' remote of '$loc'"
+        || die "$E_CMDOUTPUT" "cannot read the 'origin' remote of '$loc'"
     adopt_parse_origin "$url" \
-        || die "$E_GITOUTPUT" "unsupported origin URL: '$url'"
+        || die "$E_CMDOUTPUT" "unsupported origin URL: '$url'"
 
     # Only the id is validated. org, name and branch are recorded as they are:
     # adoption describes a repo that already exists, so rejecting, say, a
@@ -2179,7 +2201,10 @@ Repo commands accept a repo key, a full org/name/branch, or the path of a
 cloned folder. Folder commands always take a filesystem path.
 
 repo info, repo validate, folder status, folder validate and validate
-accept --output-format json|text|yaml (default text).
+accept --output-format json|text|yaml|plain (default plain).
+
+`plain` is line-oriented output for pipes. Where a command defines no line
+form it is identical to `text`.
 
 Aliases:
   git-utils repos ...   same as 'git-utils repo ...'
@@ -2194,7 +2219,7 @@ EOF
 help_repo_info() {
     cat << 'EOF'
 git-utils repo info [<repo_key_or_full_name_or_path>]
-                    [--output-format json|text|yaml]
+                    [--output-format json|text|yaml|plain]
 
 Prints one repo record, with its id as the first field. With no argument
 the current folder is used.
@@ -2207,7 +2232,7 @@ EOF
 
 help_validate() {
     cat << 'EOF'
-git-utils validate [--fix] [--output-format json|text|yaml]
+git-utils validate [--fix] [--output-format json|text|yaml|plain]
 
 Checks the whole store: that it parses, that it is in a layout this
 script understands, that its schema version is one it knows, and then
@@ -2232,7 +2257,7 @@ EOF
 help_repo_validate() {
     cat << 'EOF'
 git-utils repo validate <repo_key_or_full_name> [--fix]
-                        [--output-format json|text|yaml]
+                        [--output-format json|text|yaml|plain]
 
 Checks one repo record. Prints the record with a 'checks' object added:
 
@@ -2258,7 +2283,7 @@ EOF
 
 help_folder_validate() {
     cat << 'EOF'
-git-utils folder validate [<path>] [--output-format json|text|yaml]
+git-utils folder validate [<path>] [--output-format json|text|yaml|plain]
 
 Checks one cloned folder against the store. With no argument the current
 folder is used. There is no --fix; nothing is repaired or written.
@@ -2304,7 +2329,7 @@ EOF
 
 help_folder_status() {
     cat << 'EOF'
-git-utils folder status [<path>] [--output-format json|text|yaml]
+git-utils folder status [<path>] [--output-format json|text|yaml|plain]
 
 Reports whether a folder is a tracked git repo. With no argument the
 current folder is used. The argument is always a filesystem path, never

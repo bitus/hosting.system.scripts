@@ -22,7 +22,10 @@ FAILED_SUITES=()
 
 for s in "${SUITES[@]}"; do
     echo "═══ $s ═══"
-    out="$(bash "$s" 2>&1)"
+    # stdin from /dev/null: a suite that reaches an unexpected confirm()
+    # prompt must fail fast instead of blocking the whole run forever on a
+    # read that will never be answered.
+    out="$(bash "$s" 2>&1 </dev/null)"
     echo "$out" | grep -E '^(FAIL|TOTAL)' || true
     line="$(echo "$out" | grep '^TOTAL:' | tail -1)"
     p="$(echo "$line" | sed -n 's/^TOTAL: \([0-9]*\) passed.*/\1/p')"
