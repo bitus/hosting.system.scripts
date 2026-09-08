@@ -2138,6 +2138,172 @@ ru_emit() {
         '{status: $s, locations: $l}')" "$PLAIN_PATH_STATUS"
 }
 
+# rs_images <key> -- the stored image list, extended with what docker and,
+# under -i, the registry know.
+#
+# There is no `built` field here, unlike folder status. It is not derivable:
+# the store carries no provenance, and a locally built image still has a
+# RepoDigests entry, so no digest test separates one from a registry image.
+# Fix 50-01 already excludes compose services with a build: key from the
+# store, so a stored image is meant to be a registry image; anything built
+# locally is there because someone listed it in .images, and it simply fails
+# its registry lookup with 18 -- honest, because we could not check it.
+#
+# The digests compared here are REPO digests on both sides. folder status
+# compares image IDs. The two namespaces coincide on a containerd store, so a
+# crossed comparison would test clean here and be permanently wrong elsewhere.
+rs_images() {
+    local key="$1" check="$2" out='[]' ref local_d remote_d st pull
+    local -a refs=()
+    mapfile -t refs < <(repos_get_images "$key" | jq -r '.[]?')
+    [ "${#refs[@]}" -gt 0 ] || { printf '[]'; return 0; }
+
+    for ref in "${refs[@]}"; do
+        [ -n "$ref" ] || continue
+        local_d=""
+        remote_d=""
+        pull=null
+        st="$(status_obj 0 "Ok")"
+
+        if docker_available; then
+            local_d="$(image_repo_digest "$ref" 2>/dev/null)" || local_d=""
+        fi
+
+        if [ "$check" -eq 1 ]; then
+            if ! buildx_available; then
+                st="$(status_obj "$E_IMAGE" "Failed" "docker buildx is not available")"
+            elif ! remote_d="$(image_remote_digest "$ref" 2>/dev/null)"; then
+                remote_d=""
+                st="$(status_obj "$E_IMAGE" "Failed" "cannot read the registry digest for '$ref'")"
+            fi
+            if [ -n "$remote_d" ] && [ -n "$local_d" ]; then
+                if [ "$remote_d" = "$local_d" ]; then pull=false; else pull=true; fi
+            fi
+        fi
+
+        out="$(jq -c --arg id "$ref" --arg name "$(image_ref_repo "$ref")" \
+            --argjson st "$st" --arg l "$local_d" --arg r "$remote_d" \
+            --argjson pull "$pull" --argjson check "$check" \
+            '. + [ {id: $id, name: $name, status: $st}
+                   + (if $check == 1
+                      then {remote_digest: (if $r == "" then null else $r end),
+                            local_digest:  (if $l == "" then null else $l end),
+                            pull_available: $pull}
+                      else {local_digest: (if $l == "" then null else $l end)}
+                      end) ]' <<< "$out")"
+    done
+    printf '%s' "$out"
+}
+
+# rs_repo <key> <check_images> -- one repo's status document; returns the
+# repo-level code.
+#
+# Status is the FIRST hit of: the record's own checks, then any location, then
+# any image -- a walk over the document that was actually assembled, so it
+# cannot drift from what was collected.
+rs_repo() {
+    local key="$1" check="$2"
+    local rvout bad locs_doc='[]' images loc doc rc
+
+    rvout="$(rv_run "$key")" || true
+    bad="$(jq -c '[.checks.fields, .checks.keys, .checks.ssh]
+                  | map(select(.status == "Failed")) | .[0] // empty' <<< "$rvout")"
+
+    local -a locs=()
+    mapfile -t locs < <(repos_locations_list "$key")
+    for loc in "${locs[@]}"; do
+        rc=0
+        doc="$(fs_run "$loc")" || rc=$?
+        locs_doc="$(jq -c --argjson d "$doc" '. + [$d]' <<< "$locs_doc")"
+    done
+
+    images="$(rs_images "$key" "$check")"
+
+    local top
+    if [ -n "$bad" ]; then
+        top="$bad"
+    else
+        top="$(jq -c --argjson l "$locs_doc" --argjson i "$images" \
+            'first((( $l | map(.status) | map(select(.code != 0)) | .[0] ),
+                    ( $i | map(.status) | map(select(.code != 0)) | .[0] ))
+                   // empty)
+             // {code: 0, status: "Ok", description: ""}' <<< '{}')"
+    fi
+
+    jq -nc --arg k "$key" --argjson rec "$(jq -c --arg k "$key" '.repositories[$k]' "$REPOS_FILE")" \
+        --argjson st "$top" --argjson im "$images" --argjson lo "$locs_doc" \
+        '{id: $k}
+         + ($rec | {name, org, branch, visibility, foreign, origin})
+         + {status: $st, images: $im, locations: $lo}'
+
+    return "$(jq -r '.code' <<< "$top")"
+}
+
+# cmd_repo_status -- record, locations and image freshness for one repo or all.
+cmd_repo_status() {
+    local args=() all=0 check=0
+    local timeout="$STATUS_TIMEOUT_DEFAULT"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_repo_status; exit 0 ;;
+            -a|--all) all=1; shift ;;
+            -i|--check-images) check=1; shift ;;
+            -t|--timeout)
+                [ $# -ge 2 ] || die "$E_ARGS" "--timeout requires a value"
+                timeout="$2"; shift 2 ;;
+            --timeout=*) timeout="${1#*=}"; shift ;;
+            --output-format)
+                [ $# -ge 2 ] || die "$E_ARGS" "--output-format requires a value"
+                output_format_set "$2"; shift 2 ;;
+            --output-format=*) output_format_set "${1#*=}"; shift ;;
+            --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    [ "${#args[@]}" -le 1 ] || die "$E_ARGS" "unexpected argument: ${args[1]}"
+    timeout_validate "$timeout" "--timeout"
+
+    precheck_common
+    precheck_store
+
+    local doc rc=0
+    if [ "$all" -eq 1 ]; then
+        [ "${#args[@]}" -eq 0 ] || die "$E_ARGS" "--all takes no repo argument"
+        local -a keys=()
+        mapfile -t keys < <(repos_all_ids)
+        if [ "${#keys[@]}" -eq 0 ]; then
+            die "$E_NOTFOUND" "no repositories are registered"
+        fi
+        local k krc out='[]'
+        for k in "${keys[@]}"; do
+            krc=0
+            # A budget per repo, cleared afterwards, so one slow repo cannot
+            # eat the next one's time.
+            deadline_set "$timeout"
+            doc="$(rs_repo "$k" "$check")" || krc=$?
+            deadline_clear
+            [ "$krc" -eq 0 ] || rc=1
+            out="$(jq -c --argjson d "$doc" '. + [$d]' <<< "$out")"
+        done
+        render_output "$out"
+        exit "$rc"
+    fi
+
+    [ "${#args[@]}" -eq 1 ] || die "$E_ARGS" "this command needs a repo key or full repo name, or --all"
+    resolve_repo_target "${args[0]}"
+    repos_resolve
+
+    deadline_set "$timeout"
+    doc="$(rs_repo "$REC_KEY" "$check")" || rc=$?
+    deadline_clear
+    # A single repo is a single object, not an array of one: a caller asking
+    # about one repo should not have to unwrap it.
+    render_output "$doc"
+    exit "$rc"
+}
+
+
 # cmd_repo_redeploy -- folder redeploy across every location of one record.
 #
 # Deliberately does NOT run the record's fields/keys/ssh checks the way repo
@@ -3459,6 +3625,40 @@ folder to the repo name.
 EOF
 }
 
+help_repo_status() {
+    cat << 'EOF'
+git-utils repo status (<repo_key_or_full_name> | -a|--all)
+                      [-i|--check-images] [-t|--timeout <s>]
+                      [--output-format json|text|yaml|plain]
+
+Reports a repo: its record, one folder status per location, and its images.
+A single repo is a single object; --all is an array.
+
+  -i   also ask each image's registry for its current digest. Needs the
+       docker buildx plugin; without -i no registry call is made at all.
+
+Status is the first of: the record's own fields/keys/ssh checks, then any
+location with a non-zero code, then any image with a non-zero status.
+
+--timeout bounds ONE repo, not the whole command, so under --all the
+worst case is repos x timeout. Nothing is ever killed from outside: work
+that did not finish is represented in the document rather than missing from
+it, and a timed-out check is Failed -- an unknown reported as healthy is the
+failure this command exists to prevent.
+
+pull_available compares REGISTRY digests: is there something newer to pull.
+That is a different question from folder status's restart_pending, which
+compares image ids to ask whether a container is running what is on disk.
+
+There is no `built` field here. It cannot be derived from the store, and a
+field that is right most of the time is worse than no field.
+
+Exits with the repo's status code for a single repo; under --all, 1 if any
+repo has a non-zero status, 5 if no repositories are registered, else 0.
+EOF
+}
+
+
 help_repo_redeploy() {
     cat << 'EOF'
 git-utils repo redeploy <repo_key_or_full_name> [-i|--pull-images]
@@ -3582,6 +3782,7 @@ main() {
                 add) shift; cmd_repo_add "$@" ;;
                 delete) shift; cmd_repo_delete "$@" ;;
                 clone) shift; cmd_repo_clone "$@" ;;
+                status) shift; cmd_repo_status "$@" ;;
                 redeploy) shift; cmd_repo_redeploy "$@" ;;
                 update) shift; cmd_repo_update "$@" ;;
                 folders) shift; cmd_repo_folders "$@" ;;
