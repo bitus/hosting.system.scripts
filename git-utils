@@ -2196,6 +2196,95 @@ folder_resolve() { realpath -m -- "${1:-$PWD}"; }
 # The bridge between the two address spaces. `repo` commands stopped taking
 # paths in fix 50-04, so this is what a caller standing in a checkout pipes
 # into them.
+# fu_status <status_json> <exit_code> -- emit the document and leave.
+#
+# Every exit from cmd_folder_update goes through here, so the command always
+# produces a document -- a caller parsing stdout gets one whether the update
+# happened, was unnecessary, or failed.
+fu_status() {
+    render_output "$(jq -nc --argjson s "$1" '{status: $s}')"
+    exit "$2"
+}
+
+# cmd_folder_update -- bring one checkout up to date, if it is behind.
+cmd_folder_update() {
+    local args=() dry=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_folder_update; exit 0 ;;
+            --dry-run) dry=1; shift ;;
+            --output-format)
+                [ $# -ge 2 ] || die "$E_ARGS" "--output-format requires a value"
+                output_format_set "$2"; shift 2 ;;
+            --output-format=*) output_format_set "${1#*=}"; shift ;;
+            --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    [ "${#args[@]}" -le 1 ] || die "$E_ARGS" "unexpected argument: ${args[1]}"
+
+    precheck_common
+    precheck_store
+
+    local loc fvout rc
+    loc="$(folder_resolve "${args[0]:-}")"
+
+    # A folder we cannot vouch for is not one to run `reset --hard` in. The
+    # first failed check's own status object becomes this command's, so the
+    # reason travels with the code.
+    fvout="$(fv_run "$loc")" || true
+    rc="$(fv_exit_code "$fvout")"
+    if [ "$rc" -ne 0 ]; then
+        fu_status "$(jq -c '[.location, .worktree, .tracking, .origin]
+                             | map(select(.status == "Failed")) | .[0]' <<< "$fvout")" "$rc"
+    fi
+
+    local branch
+    if ! branch="$(adopt_current_branch "$loc")" || [ -z "$branch" ]; then
+        fu_status "$(status_obj "$E_CMDOUTPUT" "Failed" "Cannot determine the current branch")" "$E_CMDOUTPUT"
+    fi
+
+    # git writes progress to stderr and `reset`/`clean` write to stdout;
+    # stdout belongs to the document, so their chatter is sent to stderr.
+    if ! git -C "$loc" fetch origin >&2; then
+        fu_status "$(status_obj "$E_CMDOUTPUT" "Failed" "git fetch failed")" "$E_CMDOUTPUT"
+    fi
+
+    # Plumbing, not `git status | grep behind`: status output is localised,
+    # and on a DIVERGED branch it says "have diverged" with no "behind" in
+    # it -- so the one case reset --hard exists to repair would report
+    # nothing to do. rev-list counts what the remote has and we do not, which
+    # is non-zero for behind and diverged alike.
+    local behind
+    if ! behind="$(git -C "$loc" rev-list --count "HEAD..origin/$branch" 2>/dev/null)"; then
+        fu_status "$(status_obj "$E_CMDOUTPUT" "Failed" "cannot compare against origin/$branch")" "$E_CMDOUTPUT"
+    fi
+    case "$behind" in
+        ""|*[!0-9]*) fu_status "$(status_obj "$E_CMDOUTPUT" "Failed" "unexpected rev-list output: '$behind'")" "$E_CMDOUTPUT" ;;
+    esac
+
+    if [ "$behind" -eq 0 ]; then
+        # 22 is a success in the everyday sense -- nothing was wrong, there
+        # was simply nothing to do -- so the status passes. It is distinct
+        # from 0 so a cron job can tell 'deployed' from 'no change' without
+        # parsing anything.
+        fu_status "$(status_obj "$E_NOUPDATE" "Skipped" "Already up to date")" "$E_NOUPDATE"
+    fi
+
+    if [ "$dry" -eq 1 ]; then
+        fu_status "$(status_obj 0 "Ok" "$behind commit(s) available")" 0
+    fi
+
+    if ! git -C "$loc" reset --hard "origin/$branch" >&2; then
+        fu_status "$(status_obj "$E_CMDOUTPUT" "Failed" "git reset --hard failed")" "$E_CMDOUTPUT"
+    fi
+    if ! git -C "$loc" clean -fd >&2; then
+        fu_status "$(status_obj "$E_CMDOUTPUT" "Failed" "git clean failed")" "$E_CMDOUTPUT"
+    fi
+    fu_status "$(status_obj 0 "Ok" "Updated $behind commit(s)")" 0
+}
+
 cmd_folder_repo() {
     local args=()
     while [ $# -gt 0 ]; do
@@ -2752,6 +2841,34 @@ record, 10 unusable origin or detached HEAD, 3 deploy keys not found.
 EOF
 }
 
+help_folder_update() {
+    cat << 'EOF'
+git-utils folder update [<path>] [--dry-run]
+                        [--output-format json|text|yaml|plain]
+
+Updates one checkout, but only when it is actually behind its remote. With
+no argument the current folder is used. Also available as 'git-utils update'.
+
+  1. folder validate; a folder that does not check out is not reset
+  2. git fetch origin
+  3. if the remote has commits this checkout does not:
+     git reset --hard origin/<branch> && git clean -fd
+
+The branch comes from the checkout, which folder validate has already
+reconciled with the record.
+
+--dry-run stops after step 3's decision. It still fetches, so it writes to
+.git, but never touches the working tree.
+
+Exits 0 when it updated (or would, under --dry-run), 22 when already up to
+date, 10 on a git failure, or the failing check's code from folder validate.
+
+Note that 'reset --hard' and 'clean -fd' discard local commits and untracked
+files in the checkout. That is the intended behaviour for a deployment
+target; it is not a merge.
+EOF
+}
+
 help_folder_repo() {
     cat << 'EOF'
 git-utils folder repo [<path>] [--output-format json|text|yaml|plain]
@@ -2946,6 +3063,7 @@ main() {
                     help_main
                     exit 0
                     ;;
+                update) shift; cmd_folder_update "$@" ;;
                 repo|repository) shift; cmd_folder_repo "$@" ;;
                 status) shift; cmd_folder_status "$@" ;;
                 adopt) shift; cmd_folder_adopt "$@" ;;
@@ -2962,7 +3080,7 @@ main() {
             ;;
         update)
             shift
-            cmd_repo_update "$@"
+            cmd_folder_update "$@"
             ;;
         *)
             help_main

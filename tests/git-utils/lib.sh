@@ -103,7 +103,9 @@ images_of()      { jq -c --arg k "$1" '.repositories[$k].images' "$(store)"; }
 has_images_key() { rec_has "$1" images; }
 loc_count()      { jq -r --arg k "$1" '.repositories[$k].locations | length' "$(store)"; }
 loc_path()       { jq -r --arg k "$1" --argjson i "${2:-0}" '.repositories[$k].locations[$i].path' "$(store)"; }
-store_patch()    { local t; t="$(jq "$1" "$(store)")" && printf '%s' "$t" > "$(store)"; }
+# store_patch <jq args...> -- all arguments are passed to jq, so a filter
+# can take --arg/--argjson rather than having values spliced into it.
+store_patch()    { local t; t="$(jq "$@" "$(store)")" && printf '%s' "$t" > "$(store)"; }
 
 # --- git fixtures ----------------------------------------------------------
 
