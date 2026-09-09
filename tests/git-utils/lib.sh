@@ -12,6 +12,7 @@ GU_SRC="${GU_SRC:-$HERE/../../git-utils}"
 
 PASS=0
 FAIL=0
+SKIPPED=0
 
 # gu_init <workdir> -- fresh disposable HOME + a copy of the script under test
 gu_init() {
@@ -41,6 +42,18 @@ run() {
     fi
 }
 
+# skip <description> [reason] -- an assertion that CANNOT run here.
+#
+# Deliberately not a pass. A check that quietly passes when its precondition
+# is absent is worse than no check: it reports evidence it never gathered.
+# Skips are counted and printed so an environment that cannot run something
+# says so out loud.
+skip() {
+    SKIPPED=$((SKIPPED+1))
+    printf 'SKIP %s%s
+' "$1" "${2:+ ($2)}"
+}
+
 # check <description> <0|1>
 check() {
     local desc="$1" cond="$2"
@@ -50,7 +63,11 @@ check() {
 
 gu_total() {
     echo
-    echo "TOTAL: $PASS passed, $FAIL failed"
+    if [ "$SKIPPED" -gt 0 ]; then
+        echo "TOTAL: $PASS passed, $FAIL failed, $SKIPPED skipped"
+    else
+        echo "TOTAL: $PASS passed, $FAIL failed"
+    fi
     [ "$FAIL" -eq 0 ]
 }
 
@@ -86,7 +103,9 @@ images_of()      { jq -c --arg k "$1" '.repositories[$k].images' "$(store)"; }
 has_images_key() { rec_has "$1" images; }
 loc_count()      { jq -r --arg k "$1" '.repositories[$k].locations | length' "$(store)"; }
 loc_path()       { jq -r --arg k "$1" --argjson i "${2:-0}" '.repositories[$k].locations[$i].path' "$(store)"; }
-store_patch()    { local t; t="$(jq "$1" "$(store)")" && printf '%s' "$t" > "$(store)"; }
+# store_patch <jq args...> -- all arguments are passed to jq, so a filter
+# can take --arg/--argjson rather than having values spliced into it.
+store_patch()    { local t; t="$(jq "$@" "$(store)")" && printf '%s' "$t" > "$(store)"; }
 
 # --- git fixtures ----------------------------------------------------------
 

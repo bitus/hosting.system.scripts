@@ -18,15 +18,21 @@ fi
 
 TOTAL_PASS=0
 TOTAL_FAIL=0
+TOTAL_SKIP=0
 FAILED_SUITES=()
 
 for s in "${SUITES[@]}"; do
     echo "═══ $s ═══"
-    out="$(bash "$s" 2>&1)"
-    echo "$out" | grep -E '^(FAIL|TOTAL)' || true
+    # stdin from /dev/null: a suite that reaches an unexpected confirm()
+    # prompt must fail fast instead of blocking the whole run forever on a
+    # read that will never be answered.
+    out="$(bash "$s" 2>&1 </dev/null)"
+    echo "$out" | grep -E '^(FAIL|SKIP|TOTAL)' || true
     line="$(echo "$out" | grep '^TOTAL:' | tail -1)"
     p="$(echo "$line" | sed -n 's/^TOTAL: \([0-9]*\) passed.*/\1/p')"
-    f="$(echo "$line" | sed -n 's/.* \([0-9]*\) failed$/\1/p')"
+    f="$(echo "$line" | sed -n 's/.* \([0-9]*\) failed\(, .*\)\?$/\1/p')"
+    k="$(echo "$line" | sed -n 's/.* \([0-9]*\) skipped$/\1/p')"
+    TOTAL_SKIP=$(( TOTAL_SKIP + ${k:-0} ))
     TOTAL_PASS=$(( TOTAL_PASS + ${p:-0} ))
     TOTAL_FAIL=$(( TOTAL_FAIL + ${f:-0} ))
     [ "${f:-0}" -eq 0 ] || FAILED_SUITES+=("$s")
@@ -34,7 +40,11 @@ for s in "${SUITES[@]}"; do
 done
 
 echo "═══════════════════════════════"
-echo "GRAND TOTAL: $TOTAL_PASS passed, $TOTAL_FAIL failed"
+if [ "$TOTAL_SKIP" -gt 0 ]; then
+    echo "GRAND TOTAL: $TOTAL_PASS passed, $TOTAL_FAIL failed, $TOTAL_SKIP skipped"
+else
+    echo "GRAND TOTAL: $TOTAL_PASS passed, $TOTAL_FAIL failed"
+fi
 if [ "${#FAILED_SUITES[@]}" -gt 0 ]; then
     echo "failing suites: ${FAILED_SUITES[*]}"
     exit 1

@@ -8,8 +8,17 @@ IFS=$'\n\t'
 
 # shellcheck disable=SC2034  # E_OK documents the full exit-code space; success needs no explicit exit
 readonly E_OK=0 E_PRECHECK=1 E_ARGS=2 E_IO=3 E_EXISTS=4 E_NOTFOUND=5
-# shellcheck disable=SC2034  # E_GITFOLDER/E_MISMATCH/E_GITOUTPUT land with the commands that raise them
-readonly E_GITFOLDER=6 E_MISMATCH=8 E_GITOUTPUT=10 E_DBFORMAT=90
+# shellcheck disable=SC2034  # E_GITFOLDER/E_MISMATCH/E_CMDOUTPUT land with the commands that raise them
+readonly E_GITFOLDER=6 E_MISMATCH=8 E_CMDOUTPUT=10 E_DBFORMAT=90
+# shellcheck disable=SC2034  # the docker codes land with the commands added by fix 50-04
+readonly E_NOCOMPOSE=14 E_NOTRUNNING=16 E_IMAGE=18 E_NOUPDATE=22
+
+# What timeout(1) returns when it kills the command it wrapped. Mapped to a
+# domain code by every caller -- a bare 124 tells the user nothing.
+# shellcheck disable=SC2034
+readonly TIMEOUT_EXIT=124
+# shellcheck disable=SC2034
+readonly PULL_TIMEOUT_DEFAULT=300 STATUS_TIMEOUT_DEFAULT=60
 readonly SCHEMA_VERSION="1.1"
 readonly SCHEMA_REGEX='^[0-9]+(\.[0-9]+)?$'
 readonly REPOS_FILE="$HOME/.repositories.json"
@@ -110,22 +119,42 @@ def fold:
   else . end;
 fold'
 
-readonly OUTPUT_FORMAT_DEFAULT="text"
+# Plain renderers. Each is a jq program emitting raw lines for `--output-format
+# plain`. A repo key cannot contain a space (CHARSET) but a path can, so a
+# consumer of PLAIN_ID_PATH splits on the FIRST space.
+readonly PLAIN_ID='.id'
+readonly PLAIN_ID_PATH='.[] | "\(.id) \(.path)"'
+readonly PLAIN_PATH_STATUS='.locations[] | "\(.path) - \(.status.status)" + (if (.status.description // "") == "" then "" else " - \(.status.description)" end)'
+
+readonly OUTPUT_FORMAT_DEFAULT="plain"
 OUTPUT_FORMAT="$OUTPUT_FORMAT_DEFAULT"
 
 # output_format_set <value> -- validate and assign, for the flag loops
 output_format_set() {
     case "$1" in
-        json|text|yaml) OUTPUT_FORMAT="$1" ;;
-        *) die "$E_ARGS" "invalid --output-format: '$1' (expected json, text or yaml)" ;;
+        json|text|yaml|plain) OUTPUT_FORMAT="$1" ;;
+        *) die "$E_ARGS" "invalid --output-format: '$1' (expected json, text, yaml or plain)" ;;
     esac
 }
 
-# render_output <json> -- emit per $OUTPUT_FORMAT
+# render_output <json> [plain_filter] -- emit per $OUTPUT_FORMAT
+#
+# `plain` is the default format and means "line-oriented, easy for a pipe to
+# consume". Only a few commands have a sensible line form; the rest pass no
+# filter and `plain` falls through to `text`, so making it the default changed
+# nothing for any command that existed before fix 50-04.
+#
+# plain_filter is a jq program emitting raw lines (jq -r).
 render_output() {
-    local json="$1"
+    local json="$1" plain_filter="${2:-}"
     case "$OUTPUT_FORMAT" in
-        json)      printf '%s' "$json" | jq . ;;
+        json)  printf '%s' "$json" | jq . ;;
+        plain)
+            if [ -n "$plain_filter" ]; then
+                printf '%s' "$json" | jq -r "$plain_filter"
+            else
+                printf '%s' "$json" | jq "$FOLD_FILTER" | yq -y .
+            fi ;;
         text|yaml) printf '%s' "$json" | jq "$FOLD_FILTER" | yq -y . ;;
         *)         die "$E_ARGS" "invalid output format: '$OUTPUT_FORMAT'" ;;
     esac
@@ -401,6 +430,37 @@ parse_repo_name() {
     validate_part "$REPO_ORG" 3 "org"
     validate_part "$REPO_NAME" 3 "name"
     validate_part "$REPO_BRANCH" 1 "branch"
+}
+
+# resolve_repo_target <value> -- repo key or full name; NEVER a path.
+#
+# Fix 50-04 split the two address spaces: `repo` commands name a record,
+# `folder` commands name a place on disk. The error points at the bridge
+# rather than just refusing, because a user standing in a checkout has to be
+# told what to type instead.
+# shellcheck disable=SC2016  # the single quotes below are literal message
+# text showing the user what to type; $value is inside double quotes and does
+# expand
+resolve_repo_target() {
+    local value="${1:-}" hint="${2:-}"
+    [ -n "$value" ] || die "$E_ARGS" "this command needs a repo key or full repo name"
+    case "$value" in
+        .|..|/*|./*|../*|~*)
+            die "$E_ARGS" "repo commands take a repo key or full repo name, not a path${hint:+ -- for a folder, use: git-utils $hint '$value'} -- or bridge it: git-utils repo <cmd> \"\$(git-utils folder repo '$value')\"" ;;
+    esac
+    if [ -d "$value" ]; then
+        die "$E_ARGS" "'$value' is a folder${hint:+ -- use: git-utils $hint '$value'} -- or bridge it: git-utils repo <cmd> \"\$(git-utils folder repo '$value')\""
+    fi
+
+    if [[ "$value" == */* ]]; then
+        TARGET_KIND="fullname"
+        parse_repo_name "$value"
+        TARGET_VALUE="$value"
+    else
+        TARGET_KIND="key"
+        validate_part "$value" 3 "key"
+        TARGET_VALUE="$value"
+    fi
 }
 
 # resolve_target [<value>]  -- sets TARGET_KIND (path|fullname|key), TARGET_VALUE
@@ -754,12 +814,6 @@ images_is_compose_project() {
     return 1
 }
 
-# images_compose_available -- v2 plugin probe; never touches the daemon
-images_compose_available() {
-    command -v docker >/dev/null 2>&1 || return 1
-    docker compose version >/dev/null 2>&1
-}
-
 # images_compose_config_json <loc>
 # Prints `docker compose config --format json`, preferring --profile '*'.
 # Verifies the wildcard actually pulled in every declared profile's
@@ -810,7 +864,7 @@ images_collect() {
     mapfile -t a_lines < <(images_read_file "$loc")
 
     if images_is_compose_project "$loc"; then
-        if ! images_compose_available; then
+        if ! compose_available; then
             warn "docker compose not available; leaving images unchanged for $loc"
             return 1
         fi
@@ -859,7 +913,178 @@ images_update_record() {
 }
 
 # ---------------------------------------------------------------------------
-# 11. Key layer -- keys_*
+# 11. Deadline helpers -- deadline_* / run_bounded
+# ---------------------------------------------------------------------------
+
+# A deadline bounds a whole unit of work -- one repo, for `repo status` --
+# rather than one call. Every external call inside it runs under `timeout`
+# with whatever is left, so the unit finishes on time without any call being
+# killed from outside the script.
+#
+# 0 means unbounded, which is the state for every command that has no
+# --timeout. Commands that do have one set it, do their work, and clear it.
+DEADLINE=0
+
+deadline_set()   { DEADLINE=$(( $(date +%s) + $1 )); }
+deadline_clear() { DEADLINE=0; }
+
+# deadline_remaining -- prints the seconds left, or "-" when unbounded.
+#
+# Returns 1 when the budget is spent, printing nothing. Callers branch on the
+# return value, not on the text, so "no deadline" and "no time left" can never
+# be confused -- which is the bug this shape exists to prevent.
+deadline_remaining() {
+    [ "$DEADLINE" -gt 0 ] || { printf '%s' '-'; return 0; }
+    local r=$(( DEADLINE - $(date +%s) ))
+    [ "$r" -gt 0 ] || return 1
+    printf '%s' "$r"
+}
+
+# run_bounded <cmd> [args...] -- run under timeout(1) when a deadline is set.
+#
+# Returns TIMEOUT_EXIT without running anything when the budget is already
+# spent, so "we ran out of time before trying" and "the call timed out" reach
+# every caller as the same code. Callers map that to a domain code (10 for
+# git, 18 for images); a bare 124 tells a user nothing.
+run_bounded() {
+    local r
+    r="$(deadline_remaining)" || return "$TIMEOUT_EXIT"
+    if [ "$r" = "-" ]; then
+        "$@"
+    else
+        timeout "$r" "$@"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 12. Docker layer -- docker_* / compose_* / image_*
+# ---------------------------------------------------------------------------
+
+# Four distinct probes, because conflating them produces the wrong error.
+# Notably a plugin probe is NOT a daemon probe: `docker compose version`
+# answers "can we parse compose files" without ever contacting dockerd, which
+# is why fix 50-01 could keep working on hosts with no daemon running.
+docker_available()  { command -v docker >/dev/null 2>&1; }
+compose_available() { docker_available && docker compose version >/dev/null 2>&1; }
+buildx_available()  { docker_available && docker buildx version >/dev/null 2>&1; }
+docker_daemon_ok()  { run_bounded docker info >/dev/null 2>&1; }
+
+# compose_running <loc> -- is any container of this project up?
+#
+#   0  yes
+#   1  no
+#   2  could not determine (daemon down, timeout, unparseable project)
+#
+# The third code matters: without it "nothing is running" and "we could not
+# ask" are the same answer, and a redeploy would report a stopped stack on a
+# host whose daemon is simply unreachable. Same convention as
+# images_compose_extract's return 2.
+compose_running() {
+    local loc="$1" out
+    out="$(cd "$loc" && run_bounded docker compose ps --status running -q)" || return 2
+    [ -n "$out" ]
+}
+
+# compose_ps_json <loc> -- `docker compose ps` as a JSON array.
+#
+# `--format json` emits JSON Lines (one object per line), not an array, so
+# this slurps. Verified against docker 28.2.2.
+compose_ps_json() {
+    local loc="$1" out
+    out="$(cd "$loc" && run_bounded docker compose ps --format json)" || return 1
+    printf '%s' "$out" | jq -s '.'
+}
+
+# --- identifiers ----------------------------------------------------------
+#
+# Docker exposes two unrelated namespaces and calling both of them "digest"
+# is how this gets broken:
+#
+#   image IDs    .Id / a container's .Image   -> restart_pending
+#   repo digests .RepoDigests / buildx        -> pull_available
+#
+# On a containerd-backed image store the two coincide, so a crossed
+# comparison passes every test on such a host and then reports a permanent
+# false positive on a host with the classic store, where .Id is the config
+# digest. The two pairs are kept apart here so a caller has to reach for the
+# wrong one deliberately.
+
+# image_id_local <ref> -- the id of the image this reference resolves to
+image_id_local() { run_bounded docker image inspect "$1" --format '{{.Id}}'; }
+
+# container_image_id <container> -- the id of the image it is actually running
+container_image_id() { run_bounded docker container inspect "$1" --format '{{.Image}}'; }
+
+# image_ref_repo <ref> -- the repository part, with any tag or digest removed.
+#
+# The tag is only stripped when the colon is in the LAST path segment: a
+# registry port ("localhost:5000/foo") also contains one, and stripping that
+# would leave "localhost".
+image_ref_repo() {
+    local ref="${1%@*}" last
+    last="${ref##*/}"
+    case "$last" in
+        *:*) printf '%s' "${ref%:*}" ;;
+        *)   printf '%s' "$ref" ;;
+    esac
+}
+
+# image_repo_digest <ref> -- the pulled index digest, bare (no name@ prefix).
+#
+# Selects the RepoDigests entry belonging to THIS reference's repository
+# rather than taking .[0]. An image pulled from a mirror carries several:
+# public.ecr.aws/docker/library/alpine:3.20 comes back with both
+# "alpine@sha256:..." and "public.ecr.aws/docker/library/alpine@sha256:...",
+# and .[0] is whichever docker listed first -- not necessarily the one whose
+# registry we are about to compare against.
+#
+# Empty output means no repo digest for this reference: the image was built
+# locally, or was only ever tagged. That is not an error.
+image_repo_digest() {
+    local out repo
+    out="$(run_bounded docker image inspect "$1" --format '{{json .RepoDigests}}')" || return 1
+    repo="$(image_ref_repo "$1")"
+    printf '%s' "$out"         | jq -r --arg repo "$repo" '[.[] | select(startswith($repo + "@"))] | .[0] // empty'         | sed 's/^[^@]*@//'
+}
+
+# image_remote_digest <ref> -- the registry's current index digest.
+#
+# buildx, not `docker manifest inspect`: the latter's per-platform entry is a
+# manifest digest and never equals what a pull records locally, so comparing
+# the two reports "update available" forever on any multi-arch image.
+#
+# The plain output, NOT --format. This is a knowing exception to this
+# script's rule against parsing human-readable output, and the reason is
+# measured rather than assumed: ANY --format makes buildx resolve the whole
+# manifest tree -- one registry request per platform, sixteen for alpine --
+# while the default output needs only the index. Under registry rate limiting
+# the --format forms fail on a child manifest while the plain form still
+# answers. `repo status -i` walks every image of every repo, so a 16x request
+# amplification is disqualifying.
+#
+# The exception is narrower than it looks: `Digest:` is an untranslated field
+# label, unlike `git status`, whose text is localised and whose phrasing
+# changes with the state being described. The shape check below turns a
+# future format change into a loud failure rather than a wrong digest.
+#
+# A failed fetch prints nothing, and the tempting alternative (`imagetools
+# inspect --raw | sha256sum`) hashes whatever came back -- error text, or no
+# bytes at all -- into a well-formed digest that can never match. Returning 1
+# keeps "could not ask" distinct from "asked, and it differs".
+image_remote_digest() {
+    local out digest
+    out="$(run_bounded docker buildx imagetools inspect "$1")" || return 1
+    digest="$(printf '%s
+' "$out" | awk '/^Digest:/ {print $2; exit}')"
+    case "$digest" in
+        sha256:*) [ "${#digest}" -eq 71 ] || return 1 ;;
+        *) return 1 ;;
+    esac
+    printf '%s' "$digest"
+}
+
+# ---------------------------------------------------------------------------
+# 13. Key layer -- keys_*
 # ---------------------------------------------------------------------------
 
 keys_check() {
@@ -912,7 +1137,7 @@ keys_delete() {
 }
 
 # ---------------------------------------------------------------------------
-# 12. Adoption layer -- adopt_*
+# 14. Adoption layer -- adopt_*
 # ---------------------------------------------------------------------------
 
 # adopt_current_branch <loc> -- prints the checked-out branch name.
@@ -1043,8 +1268,122 @@ adopt_block_exists() {
 }
 
 # ---------------------------------------------------------------------------
-# 13. Validation layer -- fv_* / rv_* / db_validate
+# 15. Validation layer -- fv_* / rv_* / db_validate
 # ---------------------------------------------------------------------------
+
+# The four folder checks. Each prints one status object and nothing else, so
+# `folder validate --check-type <name>` is a call to one of them and batch mode
+# is a call to all four. Keeping them separate is what makes single-check mode
+# honest: the Skip rules live inside the checks, not in the assembler, so
+# asking for one check gives the same verdict it would have given in a batch.
+
+# fv_location <loc>
+fv_location() {
+    if [ -d "$1" ]; then
+        status_obj 0 "Ok"
+    else
+        status_obj "$E_NOTFOUND" "Failed" "Folder does not exist"
+    fi
+}
+
+# fv_worktree <loc> -- is this a git work tree?
+#
+# folder_is_git tests `-e .git`, not `-d`: in a linked worktree or a submodule
+# `.git` is a FILE pointing at the real git directory. The older `-d` tests in
+# repo update/delete are the backlog item this check retires.
+fv_worktree() {
+    local loc="$1"
+    if [ ! -d "$loc" ]; then
+        status_obj 0 "Skipped" "Folder does not exist"
+    elif folder_is_git "$loc"; then
+        status_obj 0 "Ok"
+    else
+        status_obj "$E_GITFOLDER" "Failed" "Folder is not a git work tree"
+    fi
+}
+
+# fv_tracking <loc> -- does any record claim this folder?
+#
+# Deliberately NOT skipped when the folder is missing: a record listing a path
+# that no longer exists is exactly the interesting case, and `validate --fix`
+# is what prunes it.
+fv_tracking() {
+    local id
+    id="$(repos_find_by_location "$1" || true)"
+    if [ -n "$id" ]; then
+        status_obj 0 "Ok"
+    else
+        status_obj "$E_NOTFOUND" "Failed" "Folder is not tracked"
+    fi
+}
+
+# fv_origin <loc> -- do the folder's remote and branch match its record?
+#
+# Skipped whenever an earlier check already explains the problem, so one fault
+# is never counted twice. Until fix 50-04 this check had to Fail for "exists
+# but is not a git repo", because nothing else reported it; `worktree` reports
+# it now, so this skips that case too.
+fv_origin() {
+    local loc="$1" id
+    id="$(repos_find_by_location "$loc" || true)"
+
+    if [ ! -d "$loc" ]; then
+        status_obj 0 "Skipped" "Folder does not exist"
+        return 0
+    fi
+    if ! folder_is_git "$loc"; then
+        status_obj 0 "Skipped" "Folder is not a git work tree"
+        return 0
+    fi
+    if [ -z "$id" ]; then
+        status_obj 0 "Skipped" "Folder is not tracked"
+        return 0
+    fi
+
+    local url branch e_origin e_branch
+    url="$(adopt_read_origin "$loc" || true)"
+    branch="$(adopt_current_branch "$loc" || true)"
+    e_origin="$(repos_get_field "$id" origin)"
+    e_branch="$(repos_get_field "$id" branch)"
+
+    if [ -z "$url" ]; then
+        status_obj "$E_MISMATCH" "Failed" "Repo has no 'origin' remote"
+    elif [ -z "$e_origin" ]; then
+        # a record defect, not a folder defect -- repo validate's `fields`
+        # check is what reports it, and --fix is what repairs it
+        status_obj 0 "Skipped" "Record has no origin to compare"
+    elif [ "$url" != "$e_origin" ]; then
+        status_obj "$E_MISMATCH" "Failed" "Origin does not match the record"
+    elif [ -z "$branch" ]; then
+        status_obj "$E_MISMATCH" "Failed" "Cannot determine the current branch"
+    elif [ "$branch" != "$e_branch" ]; then
+        status_obj "$E_MISMATCH" "Failed" "Branch '$branch' does not match the record's '$e_branch'"
+    else
+        status_obj 0 "Ok"
+    fi
+}
+
+# FV_CHECKS -- the check order, which is also the order the exit code is
+# resolved in. An array, not a string: IFS has no space in this script.
+declare -ra FV_CHECKS=(location worktree tracking origin)
+
+# fv_checks_list -- the check names as one space-separated line.
+#
+# "${FV_CHECKS[*]}" alone would join them with a NEWLINE: [*] joins on the
+# first character of IFS, and this script sets IFS to newline-tab. The two
+# error messages below were arriving as four lines each before this existed.
+fv_checks_list() { local IFS=' '; printf '%s' "${FV_CHECKS[*]}"; }
+
+# fv_check <name> <loc> -- run exactly one check
+fv_check() {
+    case "$1" in
+        location) fv_location "$2" ;;
+        worktree) fv_worktree "$2" ;;
+        tracking) fv_tracking "$2" ;;
+        origin)   fv_origin   "$2" ;;
+        *) die "$E_ARGS" "invalid --check-type: '$1' (expected $(fv_checks_list))" ;;
+    esac
+}
 
 # fv_run <abs_path> -- prints the folder-validate JSON; returns 1 when any
 # check Failed, 0 otherwise.
@@ -1054,64 +1393,28 @@ adopt_block_exists() {
 # and re-entering the script would repeat every pre-check and re-read the store
 # for each one.
 fv_run() {
-    local loc="$1"
-    local s_location s_tracking s_origin id rc=0
-
-    if [ -d "$loc" ]; then
-        s_location="$(status_obj 0 "Ok")"
-    else
-        s_location="$(status_obj "$E_NOTFOUND" "Failed" "Folder does not exist")"
-    fi
-
-    id="$(repos_find_by_location "$loc" || true)"
-    if [ -n "$id" ]; then
-        s_tracking="$(status_obj 0 "Ok")"
-    else
-        s_tracking="$(status_obj "$E_NOTFOUND" "Failed" "Folder is not tracked")"
-    fi
-
-    # `origin` is Skipped whenever an earlier check already explains the
-    # problem, so one fault is not counted twice. It is NOT skipped for a
-    # tracked folder that exists but is not a git repo: nothing else reports
-    # that, and skipping it would let a rotted location pass as healthy.
-    if [ ! -d "$loc" ]; then
-        s_origin="$(status_obj 0 "Skipped" "Folder does not exist")"
-    elif [ -z "$id" ]; then
-        s_origin="$(status_obj 0 "Skipped" "Folder is not tracked")"
-    elif ! folder_is_git "$loc"; then
-        s_origin="$(status_obj "$E_GITFOLDER" "Failed" "Folder is not a git repo")"
-    else
-        local url branch e_origin e_branch
-        url="$(adopt_read_origin "$loc" || true)"
-        branch="$(adopt_current_branch "$loc" || true)"
-        e_origin="$(repos_get_field "$id" origin)"
-        e_branch="$(repos_get_field "$id" branch)"
-
-        if [ -z "$url" ]; then
-            s_origin="$(status_obj "$E_MISMATCH" "Failed" "Repo has no 'origin' remote")"
-        elif [ -z "$e_origin" ]; then
-            # a record defect, not a folder defect -- repo validate's `fields`
-            # check is what reports it, and --fix is what repairs it
-            s_origin="$(status_obj 0 "Skipped" "Record has no origin to compare")"
-        elif [ "$url" != "$e_origin" ]; then
-            s_origin="$(status_obj "$E_MISMATCH" "Failed" "Origin does not match the record")"
-        elif [ -z "$branch" ]; then
-            s_origin="$(status_obj "$E_MISMATCH" "Failed" "Cannot determine the current branch")"
-        elif [ "$branch" != "$e_branch" ]; then
-            s_origin="$(status_obj "$E_MISMATCH" "Failed" "Branch '$branch' does not match the record's '$e_branch'")"
-        else
-            s_origin="$(status_obj 0 "Ok")"
-        fi
-    fi
-
-    jq -nc --argjson l "$s_location" --argjson t "$s_tracking" --argjson o "$s_origin" \
-        '{location: $l, tracking: $t, origin: $o}'
-
-    local s
-    for s in "$s_location" "$s_tracking" "$s_origin"; do
-        if status_failed "$s"; then rc=1; fi
+    local loc="$1" name out rc=0
+    local doc="{}"
+    for name in "${FV_CHECKS[@]}"; do
+        out="$(fv_check "$name" "$loc")"
+        doc="$(jq -c --arg k "$name" --argjson v "$out" '. + {($k): $v}' <<< "$doc")"
+        if status_failed "$out"; then rc=1; fi
     done
+    printf '%s
+' "$doc"
     return "$rc"
+}
+
+# fv_exit_code <fv_run json> -- the first failed check's own code, in
+# FV_CHECKS order, or 0 when nothing failed.
+#
+# `folder validate` reports the code of the fault rather than a bare 1, so a
+# caller can tell "no such folder" (5) from "not a git work tree" (6) without
+# parsing the document.
+fv_exit_code() {
+    jq -r '[.location, .worktree, .tracking, .origin]
+           | map(select(.status == "Failed"))
+           | if length == 0 then 0 else .[0].code end' <<< "$1"
 }
 
 # RV_REQUIRED_FIELDS -- every record must carry these. private_key/public_key
@@ -1446,7 +1749,7 @@ db_validate() {
 }
 
 # ---------------------------------------------------------------------------
-# 14. Command implementations
+# 16. Command implementations
 # ---------------------------------------------------------------------------
 
 cmd_setup() {
@@ -1628,12 +1931,13 @@ EOF
 }
 
 cmd_repo_delete() {
-    local force=0
+    local force=0 with_folders=0
     local args=()
     while [ $# -gt 0 ]; do
         case "$1" in
             -h|--help) help_repo_delete; exit 0 ;;
             -f|--force) force=1; shift ;;
+            --with-folders) with_folders=1; shift ;;
             --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
             -*) die "$E_ARGS" "unknown flag: $1" ;;
             *) args+=("$1"); shift ;;
@@ -1646,7 +1950,7 @@ cmd_repo_delete() {
     precheck_common
     precheck_store
 
-    resolve_target "$target"
+    resolve_repo_target "$target"
     repos_resolve
 
     # git-utils only removes key material it created. A foreign repo's keys and
@@ -1665,20 +1969,40 @@ cmd_repo_delete() {
 
     local loc
     for loc in "${REC_LOCATIONS[@]}"; do
-        [ "$TARGET_KIND" = "path" ] && [ "$loc" = "$TARGET_VALUE" ] && continue
         [ -e "$loc" ] || warn "recorded location no longer exists: $loc"
     done
 
-    if [ "$TARGET_KIND" = "path" ] && [ -d "$TARGET_VALUE/.git" ]; then
-        local dirty
-        dirty="$(cd "$TARGET_VALUE" && git status --porcelain --ignored)"
-        if [ -n "$dirty" ]; then
-            confirm "'$TARGET_VALUE' has untracked/ignored files. Delete anyway?" || exit 0
-        fi
-    fi
-
     local del_key="$REC_KEY"
     local -a del_locations=("${REC_LOCATIONS[@]}")
+
+    if [ "$with_folders" -eq 1 ]; then
+        # Guards and confirmation run BEFORE the store is touched, so
+        # declining leaves the record intact as well as the folders. With a
+        # path target there was one folder at stake and the check could run
+        # late; now every location is.
+        local l
+        for l in "${del_locations[@]}"; do
+            case "$l" in
+                "/"|"$HOME") die "$E_IO" "refusing to delete $l" ;;
+            esac
+        done
+
+        # One prompt naming every dirty location, rather than one per folder.
+        local -a dirty_locs=()
+        for l in "${del_locations[@]}"; do
+            folder_is_git "$l" || continue
+            if [ -n "$(cd "$l" && git status --porcelain --ignored)" ]; then
+                dirty_locs+=("$l")
+            fi
+        done
+        if [ "${#dirty_locs[@]}" -gt 0 ]; then
+            local msg
+            msg="$(printf 'these folders have untracked or ignored files:\n'
+                    printf '  %s\n' "${dirty_locs[@]}"
+                    printf 'Delete them anyway?')"
+            confirm "$msg" || exit 0
+        fi
+    fi
 
     store_lock
     if [ "$owns_keys" -eq 1 ]; then
@@ -1687,19 +2011,22 @@ cmd_repo_delete() {
     repos_delete "$del_key"
     store_unlock
 
-    if [ "$TARGET_KIND" = "path" ]; then
-        case "$TARGET_VALUE" in
-            "/"|"$HOME") die "$E_IO" "refusing to delete $TARGET_VALUE" ;;
-        esac
-        local recorded_match=0 rl
-        for rl in "${del_locations[@]}"; do
-            [ "$rl" = "$TARGET_VALUE" ] && recorded_match=1
+    if [ "$with_folders" -eq 1 ]; then
+        # Only recorded locations are ever removed -- iterating the record IS
+        # the guard the path form needed an explicit check for. A failed rm
+        # leaves an untracked folder and exit 3; the reverse order would leave
+        # a record pointing at nothing, which looks healthy until read.
+        local rc=0 l
+        for l in "${del_locations[@]}"; do
+            [ -e "$l" ] || continue
+            if ! rm -rf "$l"; then
+                warn "failed to remove folder; orphaned path: $l"
+                rc="$E_IO"
+            fi
         done
-        [ "$recorded_match" -eq 1 ] || die "$E_IO" "refusing to delete '$TARGET_VALUE': not a recorded location"
-
-        if ! rm -rf "$TARGET_VALUE"; then
-            warn "failed to remove folder; orphaned path: $TARGET_VALUE"
-            exit "$E_IO"
+        if [ "$rc" -ne 0 ]; then
+            info "deleted repo '$del_key'"
+            exit "$rc"
         fi
     fi
 
@@ -1723,9 +2050,7 @@ cmd_repo_clone() {
     precheck_common
     precheck_store
 
-    resolve_target "$target"
-    [ "$TARGET_KIND" != "path" ] || die "$E_ARGS" "repo clone requires a repo key or full repo name, not a path"
-
+    resolve_repo_target "$target"
     repos_resolve
 
     local out="${dest:-$REC_NAME}"
@@ -1753,77 +2078,380 @@ cmd_repo_clone() {
     info "cloned into $out"
 }
 
-cmd_repo_update() {
-    local all=0
-    local args=()
+# FANOUT_DOC / FANOUT_ACTED -- outputs of fanout_run, which cannot return
+# both a document and a code through stdout without the caller re-parsing.
+FANOUT_DOC='[]'
+FANOUT_ACTED=''
+
+# fanout_run <worker_fn> <skip_codes_csv> <loc>... -- run the worker on
+# every location, never aborting, and aggregate.
+#
+# Sets FANOUT_DOC to the locations array and FANOUT_ACTED to the first
+# location the worker actually acted on (empty if none). Returns the
+# aggregate code.
+#
+# repo update and repo redeploy differ only in the worker and in which codes
+# count as 'nothing to do' -- 22 for one, 14 and 16 for the other. Sharing
+# this is what keeps their exit tables from drifting apart.
+fanout_run() {
+    local fn="$1" skips="$2"
+    shift 2
+    local loc st rc failed=0 first_skip=0
+    FANOUT_DOC='[]'
+    FANOUT_ACTED=""
+
+    for loc in "$@"; do
+        rc=0
+        st="$("$fn" "$loc")" || rc=$?
+        FANOUT_DOC="$(jq -c --arg p "$loc" --argjson s "$st" \
+            '. + [{path: $p, status: $s}]' <<< "$FANOUT_DOC")"
+
+        if [ "$rc" -eq 0 ]; then
+            [ -n "$FANOUT_ACTED" ] || FANOUT_ACTED="$loc"
+        elif [[ ",$skips," == *",$rc,"* ]]; then
+            [ "$first_skip" -eq 0 ] && first_skip="$rc"
+        else
+            failed=1
+        fi
+    done
+
+    # Order matters: a failure anywhere outranks any amount of success, and
+    # 'everything was skipped' outranks 0 so a run in which nothing happened
+    # never reports as though something did.
+    if [ "$failed" -eq 1 ]; then
+        return "$E_IO"
+    elif [ -n "$FANOUT_ACTED" ]; then
+        return 0
+    elif [ "$first_skip" -ne 0 ]; then
+        return "$first_skip"
+    fi
+    return 0
+}
+
+# ru_emit <top_status_json> <locations_json> -- the fan-out document.
+#
+# Always both keys, even when the run stopped before reaching any location:
+# a caller that parses `.locations` should never have to special-case its
+# absence.
+ru_emit() {
+    render_output "$(jq -nc --argjson s "$1" --argjson l "$2" \
+        '{status: $s, locations: $l}')" "$PLAIN_PATH_STATUS"
+}
+
+# rs_images <key> -- the stored image list, extended with what docker and,
+# under -i, the registry know.
+#
+# There is no `built` field here, unlike folder status. It is not derivable:
+# the store carries no provenance, and a locally built image still has a
+# RepoDigests entry, so no digest test separates one from a registry image.
+# Fix 50-01 already excludes compose services with a build: key from the
+# store, so a stored image is meant to be a registry image; anything built
+# locally is there because someone listed it in .images, and it simply fails
+# its registry lookup with 18 -- honest, because we could not check it.
+#
+# The digests compared here are REPO digests on both sides. folder status
+# compares image IDs. The two namespaces coincide on a containerd store, so a
+# crossed comparison would test clean here and be permanently wrong elsewhere.
+rs_images() {
+    local key="$1" check="$2" out='[]' ref local_d remote_d st pull
+    local -a refs=()
+    mapfile -t refs < <(repos_get_images "$key" | jq -r '.[]?')
+    [ "${#refs[@]}" -gt 0 ] || { printf '[]'; return 0; }
+
+    for ref in "${refs[@]}"; do
+        [ -n "$ref" ] || continue
+        local_d=""
+        remote_d=""
+        pull=null
+        st="$(status_obj 0 "Ok")"
+
+        if docker_available; then
+            local_d="$(image_repo_digest "$ref" 2>/dev/null)" || local_d=""
+        fi
+
+        if [ "$check" -eq 1 ]; then
+            if ! buildx_available; then
+                st="$(status_obj "$E_IMAGE" "Failed" "docker buildx is not available")"
+            elif ! remote_d="$(image_remote_digest "$ref" 2>/dev/null)"; then
+                remote_d=""
+                st="$(status_obj "$E_IMAGE" "Failed" "cannot read the registry digest for '$ref'")"
+            fi
+            if [ -n "$remote_d" ] && [ -n "$local_d" ]; then
+                if [ "$remote_d" = "$local_d" ]; then pull=false; else pull=true; fi
+            fi
+        fi
+
+        out="$(jq -c --arg id "$ref" --arg name "$(image_ref_repo "$ref")" \
+            --argjson st "$st" --arg l "$local_d" --arg r "$remote_d" \
+            --argjson pull "$pull" --argjson check "$check" \
+            '. + [ {id: $id, name: $name, status: $st}
+                   + (if $check == 1
+                      then {remote_digest: (if $r == "" then null else $r end),
+                            local_digest:  (if $l == "" then null else $l end),
+                            pull_available: $pull}
+                      else {local_digest: (if $l == "" then null else $l end)}
+                      end) ]' <<< "$out")"
+    done
+    printf '%s' "$out"
+}
+
+# rs_repo <key> <check_images> -- one repo's status document; returns the
+# repo-level code.
+#
+# Status is the FIRST hit of: the record's own checks, then any location, then
+# any image -- a walk over the document that was actually assembled, so it
+# cannot drift from what was collected.
+rs_repo() {
+    local key="$1" check="$2"
+    local rvout bad locs_doc='[]' images loc doc rc
+
+    rvout="$(rv_run "$key")" || true
+    bad="$(jq -c '[.checks.fields, .checks.keys, .checks.ssh]
+                  | map(select(.status == "Failed")) | .[0] // empty' <<< "$rvout")"
+
+    local -a locs=()
+    mapfile -t locs < <(repos_locations_list "$key")
+    for loc in "${locs[@]}"; do
+        rc=0
+        doc="$(fs_run "$loc")" || rc=$?
+        locs_doc="$(jq -c --argjson d "$doc" '. + [$d]' <<< "$locs_doc")"
+    done
+
+    images="$(rs_images "$key" "$check")"
+
+    local top
+    if [ -n "$bad" ]; then
+        top="$bad"
+    else
+        top="$(jq -c --argjson l "$locs_doc" --argjson i "$images" \
+            'first((( $l | map(.status) | map(select(.code != 0)) | .[0] ),
+                    ( $i | map(.status) | map(select(.code != 0)) | .[0] ))
+                   // empty)
+             // {code: 0, status: "Ok", description: ""}' <<< '{}')"
+    fi
+
+    jq -nc --arg k "$key" --argjson rec "$(jq -c --arg k "$key" '.repositories[$k]' "$REPOS_FILE")" \
+        --argjson st "$top" --argjson im "$images" --argjson lo "$locs_doc" \
+        '{id: $k}
+         + ($rec | {name, org, branch, visibility, foreign, origin})
+         + {status: $st, images: $im, locations: $lo}'
+
+    return "$(jq -r '.code' <<< "$top")"
+}
+
+# cmd_repo_status -- record, locations and image freshness for one repo or all.
+cmd_repo_status() {
+    local args=() all=0 check=0
+    local timeout="$STATUS_TIMEOUT_DEFAULT"
     while [ $# -gt 0 ]; do
         case "$1" in
-            -h|--help) help_repo_update; exit 0 ;;
+            -h|--help) help_repo_status; exit 0 ;;
             -a|--all) all=1; shift ;;
+            -i|--check-images) check=1; shift ;;
+            -t|--timeout)
+                [ $# -ge 2 ] || die "$E_ARGS" "--timeout requires a value"
+                timeout="$2"; shift 2 ;;
+            --timeout=*) timeout="${1#*=}"; shift ;;
+            --output-format)
+                [ $# -ge 2 ] || die "$E_ARGS" "--output-format requires a value"
+                output_format_set "$2"; shift 2 ;;
+            --output-format=*) output_format_set "${1#*=}"; shift ;;
             --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
             -*) die "$E_ARGS" "unknown flag: $1" ;;
             *) args+=("$1"); shift ;;
         esac
     done
     [ "${#args[@]}" -le 1 ] || die "$E_ARGS" "unexpected argument: ${args[1]}"
-    local target="${args[0]:-}"
+    timeout_validate "$timeout" "--timeout"
 
     precheck_common
     precheck_store
 
-    resolve_target "$target"
+    local doc rc=0
+    if [ "$all" -eq 1 ]; then
+        [ "${#args[@]}" -eq 0 ] || die "$E_ARGS" "--all takes no repo argument"
+        local -a keys=()
+        mapfile -t keys < <(repos_all_ids)
+        if [ "${#keys[@]}" -eq 0 ]; then
+            die "$E_NOTFOUND" "no repositories are registered"
+        fi
+        local k krc out='[]'
+        for k in "${keys[@]}"; do
+            krc=0
+            # A budget per repo, cleared afterwards, so one slow repo cannot
+            # eat the next one's time.
+            deadline_set "$timeout"
+            doc="$(rs_repo "$k" "$check")" || krc=$?
+            deadline_clear
+            [ "$krc" -eq 0 ] || rc=1
+            out="$(jq -c --argjson d "$doc" '. + [$d]' <<< "$out")"
+        done
+        render_output "$out"
+        exit "$rc"
+    fi
+
+    [ "${#args[@]}" -eq 1 ] || die "$E_ARGS" "this command needs a repo key or full repo name, or --all"
+    resolve_repo_target "${args[0]}"
     repos_resolve
 
-    local -a targets=()
-    if [ "$TARGET_KIND" = "path" ] && [ "$all" -ne 1 ]; then
-        targets=("$TARGET_VALUE")
-        local loc
-        for loc in "${REC_LOCATIONS[@]}"; do
-            [ "$loc" = "$TARGET_VALUE" ] || warn "not updating other tracked location: $loc"
-        done
-    else
-        targets=("${REC_LOCATIONS[@]}")
-    fi
+    deadline_set "$timeout"
+    doc="$(rs_repo "$REC_KEY" "$check")" || rc=$?
+    deadline_clear
+    # A single repo is a single object, not an array of one: a caller asking
+    # about one repo should not have to unwrap it.
+    render_output "$doc"
+    exit "$rc"
+}
 
-    local -a failed=() succeeded=()
-    local loc
-    for loc in "${targets[@]}"; do
-        if [ ! -d "$loc" ] || [ ! -d "$loc/.git" ]; then
-            warn "skipping missing or non-git location: $loc"
-            continue
-        fi
-        if ( cd "$loc" && git fetch origin && git reset --hard "origin/$REC_BRANCH" && git clean -fd ); then
-            succeeded+=("$loc")
-        else
-            failed+=("$loc")
-        fi
+
+# cmd_repo_redeploy -- folder redeploy across every location of one record.
+#
+# Deliberately does NOT run the record's fields/keys/ssh checks the way repo
+# update does. Redeploy touches containers, not git and not key material, so a
+# record defect is not a reason to refuse -- and a repo whose record needs
+# repairing should still be able to restart its containers.
+cmd_repo_redeploy() {
+    local args=()
+    FR_PULL=0
+    FR_DRY=0
+    FR_PULL_TIMEOUT="$PULL_TIMEOUT_DEFAULT"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_repo_redeploy; exit 0 ;;
+            -i|--pull-images) FR_PULL=1; shift ;;
+            --dry-run) FR_DRY=1; shift ;;
+            -t|--pull-timeout)
+                [ $# -ge 2 ] || die "$E_ARGS" "--pull-timeout requires a value"
+                FR_PULL_TIMEOUT="$2"; shift 2 ;;
+            --pull-timeout=*) FR_PULL_TIMEOUT="${1#*=}"; shift ;;
+            --output-format)
+                [ $# -ge 2 ] || die "$E_ARGS" "--output-format requires a value"
+                output_format_set "$2"; shift 2 ;;
+            --output-format=*) output_format_set "${1#*=}"; shift ;;
+            --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) args+=("$1"); shift ;;
+        esac
     done
+    [ "${#args[@]}" -le 1 ] || die "$E_ARGS" "unexpected argument: ${args[1]}"
+    redeploy_check_flags
 
-    # Image collection happens once per invocation, regardless of --all:
-    #   TARGET_KIND=path         -> only that exact path, and only if it succeeded
-    #   TARGET_KIND=key|fullname -> first location in REC_LOCATIONS order that succeeded
-    local collect_loc="" l
-    if [ "$TARGET_KIND" = "path" ]; then
-        for l in "${succeeded[@]}"; do
-            [ "$l" = "$TARGET_VALUE" ] && collect_loc="$TARGET_VALUE"
-        done
-    else
-        for loc in "${REC_LOCATIONS[@]}"; do
-            for l in "${succeeded[@]}"; do
-                [ "$l" = "$loc" ] && collect_loc="$loc"
-            done
-            [ -n "$collect_loc" ] && break
-        done
-    fi
-    [ -z "$collect_loc" ] || images_update_record "$REC_KEY" "$collect_loc"
+    precheck_common
+    precheck_store
 
-    if [ "${#failed[@]}" -gt 0 ]; then
-        warn "update failed for:"
-        for loc in "${failed[@]}"; do
-            warn "  $loc"
-        done
-        exit "$E_IO"
+    resolve_repo_target "${args[0]:-}"
+    repos_resolve
+
+    if [ "${#REC_LOCATIONS[@]}" -eq 0 ]; then
+        ru_emit "$(status_obj "$E_NOTFOUND" "Failed" "Repository has no locations")" '[]'
+        exit "$E_NOTFOUND"
     fi
+
+    # --pull-timeout bounds each folder's pull, not a budget shared across
+    # them, so one location's behaviour never depends on how long the previous
+    # one took. fr_run sets the deadline per call.
+    local rc=0
+    fanout_run fr_run "$E_NOCOMPOSE,$E_NOTRUNNING" "${REC_LOCATIONS[@]}" || rc=$?
+
+    local n_ok n_fail top
+    n_ok="$(jq -r '[.[] | select(.status.status == "Ok")] | length' <<< "$FANOUT_DOC")"
+    n_fail="$(jq -r '[.[] | select(.status.status == "Failed")] | length' <<< "$FANOUT_DOC")"
+    case "$rc" in
+        0)
+            if [ "$FR_DRY" -eq 1 ]; then
+                top="$(status_obj 0 "Ok" "$n_ok location(s) would be redeployed")"
+            else
+                top="$(status_obj 0 "Ok" "Redeployed $n_ok location(s)")"
+            fi ;;
+        "$E_NOCOMPOSE"|"$E_NOTRUNNING")
+            # Every location was skipped. Reporting 0 here would say a repo
+            # with nothing deployable had just been deployed; the first skip's
+            # own code says WHY nothing happened.
+            top="$(status_obj "$rc" "Skipped" "$(jq -r '.[0].status.description' <<< "$FANOUT_DOC")")" ;;
+        *)
+            top="$(status_obj "$rc" "Failed" "$n_fail location(s) failed")" ;;
+    esac
+
+    ru_emit "$top" "$FANOUT_DOC"
+    exit "$rc"
+}
+
+
+# cmd_repo_update -- folder update across every location of one record.
+cmd_repo_update() {
+    local args=()
+    FU_DRY=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_repo_update; exit 0 ;;
+            --dry-run) FU_DRY=1; shift ;;
+            --output-format)
+                [ $# -ge 2 ] || die "$E_ARGS" "--output-format requires a value"
+                output_format_set "$2"; shift 2 ;;
+            --output-format=*) output_format_set "${1#*=}"; shift ;;
+            --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    [ "${#args[@]}" -le 1 ] || die "$E_ARGS" "unexpected argument: ${args[1]}"
+
+    precheck_common
+    precheck_store
+
+    resolve_repo_target "${args[0]:-}"
+    repos_resolve
+
+    # The record's own checks come from rv_run rather than a private copy, so
+    # they cannot drift from what `repo validate` reports. Only fields, keys
+    # and ssh are consulted: the location checks are fu_run's business, and a
+    # dead location is something to REPORT per location, not a reason to
+    # refuse the whole run.
+    local rvout bad
+    rvout="$(rv_run "$REC_KEY")" || true
+    bad="$(jq -c '[.checks.fields, .checks.keys, .checks.ssh]
+                  | map(select(.status == "Failed")) | .[0] // empty' <<< "$rvout")"
+    if [ -n "$bad" ]; then
+        ru_emit "$bad" '[]'
+        exit "$(jq -r '.code' <<< "$bad")"
+    fi
+
+    if [ "${#REC_LOCATIONS[@]}" -eq 0 ]; then
+        ru_emit "$(status_obj "$E_NOTFOUND" "Failed" "Repository has no locations")" '[]'
+        exit "$E_NOTFOUND"
+    fi
+
+    local rc=0
+    fanout_run fu_run "$E_NOUPDATE" "${REC_LOCATIONS[@]}" || rc=$?
+
+    # Best-effort, once per invocation, and never under --dry-run: nothing
+    # changed on disk there, so re-reading images would only risk a write.
+    # Inherited from fix 50-01 -- this is repo update's only store write, it
+    # warns rather than failing, and there is deliberately no early
+    # store-writability preflight, so an unwritable store surfaces after the
+    # git work rather than instead of it.
+    if [ -n "$FANOUT_ACTED" ] && [ "$FU_DRY" -eq 0 ]; then
+        images_update_record "$REC_KEY" "$FANOUT_ACTED"
+    fi
+
+    local n_ok n_fail top
+    n_ok="$(jq -r '[.[] | select(.status.status == "Ok")] | length' <<< "$FANOUT_DOC")"
+    n_fail="$(jq -r '[.[] | select(.status.status == "Failed")] | length' <<< "$FANOUT_DOC")"
+    case "$rc" in
+        0)
+            if [ "$FU_DRY" -eq 1 ]; then
+                top="$(status_obj 0 "Ok" "$n_ok location(s) would be updated")"
+            else
+                top="$(status_obj 0 "Ok" "Updated $n_ok location(s)")"
+            fi ;;
+        "$E_NOUPDATE")
+            top="$(status_obj "$E_NOUPDATE" "Skipped" "Every location is already up to date")" ;;
+        *)
+            top="$(status_obj "$rc" "Failed" "$n_fail location(s) failed")" ;;
+    esac
+
+    ru_emit "$top" "$FANOUT_DOC"
+    exit "$rc"
 }
 
 cmd_repo_info() {
@@ -1847,7 +2475,7 @@ cmd_repo_info() {
 
     # all three target forms, resolved exactly as repo update/delete resolve
     # theirs; no argument means the current folder
-    resolve_target "${args[0]:-}"
+    resolve_repo_target "${args[0]:-}"
     repos_resolve
 
     # `{id: $k} + record` puts id first: jq preserves insertion order, and so
@@ -1867,11 +2495,234 @@ folder_is_git() { [ -e "$1/.git" ]; }
 # not to exist, since "Not Found" is one of the answers.
 folder_resolve() { realpath -m -- "${1:-$PWD}"; }
 
-cmd_folder_status() {
+# cmd_folder_repo -- which repo owns this folder?
+#
+# The bridge between the two address spaces. `repo` commands stopped taking
+# paths in fix 50-04, so this is what a caller standing in a checkout pipes
+# into them.
+# FR_* -- set by both callers of fr_run, for the same reason FU_DRY is a
+# global: the fan-out helper calls every folder-level worker with one argument.
+FR_PULL=0
+FR_DRY=0
+FR_PULL_TIMEOUT="$PULL_TIMEOUT_DEFAULT"
+
+# fr_run <loc> -- rebuild and restart one compose project. Prints ONE status
+# object; returns its code. Never exits.
+fr_run() {
+    local loc="$1"
+
+    if [ ! -d "$loc" ]; then
+        status_obj "$E_NOTFOUND" "Failed" "Folder does not exist"
+        return "$E_NOTFOUND"
+    fi
+
+    # Order matters: "is this a compose project" is a filesystem test, so a
+    # folder that is not one never asks whether docker is even installed.
+    if ! images_is_compose_project "$loc"; then
+        # Skipped rather than Failed: at the repo level this is "nothing to
+        # deploy here", not a fault, and the two levels must agree on that or
+        # repo redeploy's skip rule would contradict its own locations.
+        status_obj "$E_NOCOMPOSE" "Skipped" "Not a docker compose project"
+        return "$E_NOCOMPOSE"
+    fi
+    if ! compose_available; then
+        status_obj "$E_PRECHECK" "Failed" "docker compose is not available"
+        return "$E_PRECHECK"
+    fi
+    if ! docker_daemon_ok; then
+        status_obj "$E_PRECHECK" "Failed" "the docker daemon is not reachable"
+        return "$E_PRECHECK"
+    fi
+
+    # 0 running, 1 stopped, 2 could not tell -- and the third must not be
+    # reported as the second, or an unreachable daemon would look like a
+    # deliberately stopped stack.
+    local cr=0
+    compose_running "$loc" || cr=$?
+    case "$cr" in
+        0) ;;
+        1)  status_obj "$E_NOTRUNNING" "Skipped" "No container is running"
+            return "$E_NOTRUNNING" ;;
+        *)  status_obj "$E_PRECHECK" "Failed" "cannot determine whether the project is running"
+            return "$E_PRECHECK" ;;
+    esac
+
+    if [ "$FR_DRY" -eq 1 ]; then
+        status_obj 0 "Ok" "Would redeploy"
+        return 0
+    fi
+
+    # Only the pull is bounded. build and up -d are deliberately unbounded: a
+    # build has no meaningful upper bound and killing one midway is worse than
+    # waiting for it.
+    if [ "$FR_PULL" -eq 1 ]; then
+        local prc=0
+        deadline_set "$FR_PULL_TIMEOUT"
+        ( cd "$loc" && run_bounded docker compose pull --ignore-pull-failures >&2 ) || prc=$?
+        deadline_clear
+        if [ "$prc" -eq "$TIMEOUT_EXIT" ]; then
+            status_obj "$E_IMAGE" "Failed" "image pull timed out after ${FR_PULL_TIMEOUT}s"
+            return "$E_IMAGE"
+        fi
+        if [ "$prc" -ne 0 ]; then
+            status_obj "$E_CMDOUTPUT" "Failed" "docker compose pull failed"
+            return "$E_CMDOUTPUT"
+        fi
+    fi
+
+    # stdout belongs to the document, so compose's own output goes to stderr.
+    if ! ( cd "$loc" && docker compose build >&2 ); then
+        status_obj "$E_CMDOUTPUT" "Failed" "docker compose build failed"
+        return "$E_CMDOUTPUT"
+    fi
+    if ! ( cd "$loc" && docker compose up -d >&2 ); then
+        status_obj "$E_CMDOUTPUT" "Failed" "docker compose up -d failed"
+        return "$E_CMDOUTPUT"
+    fi
+
+    status_obj 0 "Ok" "Redeployed"
+    return 0
+}
+
+# cmd_folder_redeploy -- rebuild and restart one compose project.
+cmd_folder_redeploy() {
     local args=()
+    FR_PULL=0
+    FR_DRY=0
+    FR_PULL_TIMEOUT="$PULL_TIMEOUT_DEFAULT"
     while [ $# -gt 0 ]; do
         case "$1" in
-            -h|--help) help_folder_status; exit 0 ;;
+            -h|--help) help_folder_redeploy; exit 0 ;;
+            -i|--pull-images) FR_PULL=1; shift ;;
+            --dry-run) FR_DRY=1; shift ;;
+            -t|--pull-timeout)
+                [ $# -ge 2 ] || die "$E_ARGS" "--pull-timeout requires a value"
+                FR_PULL_TIMEOUT="$2"; shift 2 ;;
+            --pull-timeout=*) FR_PULL_TIMEOUT="${1#*=}"; shift ;;
+            --output-format)
+                [ $# -ge 2 ] || die "$E_ARGS" "--output-format requires a value"
+                output_format_set "$2"; shift 2 ;;
+            --output-format=*) output_format_set "${1#*=}"; shift ;;
+            --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    [ "${#args[@]}" -le 1 ] || die "$E_ARGS" "unexpected argument: ${args[1]}"
+    redeploy_check_flags
+
+    precheck_common
+
+    local loc st rc=0
+    loc="$(folder_resolve "${args[0]:-}")"
+    st="$(fr_run "$loc")" || rc=$?
+    render_output "$(jq -nc --argjson s "$st" '{status: $s}')"
+    exit "$rc"
+}
+
+# timeout_validate <value> <flag_name> -- a whole number of seconds, > 0.
+timeout_validate() {
+    case "$1" in
+        ""|*[!0-9]*) die "$E_ARGS" "$2 must be a whole number of seconds" ;;
+    esac
+    [ "$1" -gt 0 ] || die "$E_ARGS" "$2 must be greater than zero"
+}
+
+# redeploy_check_flags -- shared flag validation for both redeploy commands.
+redeploy_check_flags() {
+    timeout_validate "$FR_PULL_TIMEOUT" "--pull-timeout"
+    # Nothing is pulled in a dry run, so asking for both is asking for
+    # something that cannot happen.
+    if [ "$FR_PULL" -eq 1 ] && [ "$FR_DRY" -eq 1 ]; then
+        die "$E_ARGS" "--pull-images cannot be combined with --dry-run"
+    fi
+}
+
+
+# FU_DRY -- set by both callers of fu_run. A global rather than a parameter
+# so the fan-out helper can call every folder-level worker the same way.
+FU_DRY=0
+
+# fu_run <loc> -- update one checkout. Prints ONE status object; returns its
+# code. Never exits, so `repo update` can call it per location the way
+# rv_run calls fv_run.
+fu_run() {
+    local loc="$1" fvout rc
+
+    # A folder we cannot vouch for is not one to run `reset --hard` in. The
+    # first failed check's own status object becomes this one, so the reason
+    # travels with the code.
+    fvout="$(fv_run "$loc")" || true
+    rc="$(fv_exit_code "$fvout")"
+    if [ "$rc" -ne 0 ]; then
+        jq -c '[.location, .worktree, .tracking, .origin]
+               | map(select(.status == "Failed")) | .[0]' <<< "$fvout"
+        return "$rc"
+    fi
+
+    local branch
+    if ! branch="$(adopt_current_branch "$loc")" || [ -z "$branch" ]; then
+        status_obj "$E_CMDOUTPUT" "Failed" "Cannot determine the current branch"
+        return "$E_CMDOUTPUT"
+    fi
+
+    # git writes progress to stderr and `reset`/`clean` write to stdout;
+    # stdout belongs to the document, so their chatter is sent to stderr.
+    if ! git -C "$loc" fetch origin >&2; then
+        status_obj "$E_CMDOUTPUT" "Failed" "git fetch failed"
+        return "$E_CMDOUTPUT"
+    fi
+
+    # Plumbing, not `git status | grep behind`: status output is localised,
+    # and on a DIVERGED branch it says "have diverged" with no "behind" in
+    # it -- so the one case reset --hard exists to repair would report
+    # nothing to do. rev-list counts what the remote has and we do not, which
+    # is non-zero for behind and diverged alike.
+    local behind
+    if ! behind="$(git -C "$loc" rev-list --count "HEAD..origin/$branch" 2>/dev/null)"; then
+        status_obj "$E_CMDOUTPUT" "Failed" "cannot compare against origin/$branch"
+        return "$E_CMDOUTPUT"
+    fi
+    case "$behind" in
+        ""|*[!0-9]*)
+            status_obj "$E_CMDOUTPUT" "Failed" "unexpected rev-list output: '$behind'"
+            return "$E_CMDOUTPUT" ;;
+    esac
+
+    if [ "$behind" -eq 0 ]; then
+        # 22 is a success in the everyday sense -- nothing was wrong, there
+        # was simply nothing to do -- so the status passes. It is distinct
+        # from 0 so a cron job can tell 'deployed' from 'no change' without
+        # parsing anything, and so the fan-out can count it as a skip.
+        status_obj "$E_NOUPDATE" "Skipped" "Already up to date"
+        return "$E_NOUPDATE"
+    fi
+
+    if [ "$FU_DRY" -eq 1 ]; then
+        status_obj 0 "Ok" "$behind commit(s) available"
+        return 0
+    fi
+
+    if ! git -C "$loc" reset --hard "origin/$branch" >&2; then
+        status_obj "$E_CMDOUTPUT" "Failed" "git reset --hard failed"
+        return "$E_CMDOUTPUT"
+    fi
+    if ! git -C "$loc" clean -fd >&2; then
+        status_obj "$E_CMDOUTPUT" "Failed" "git clean failed"
+        return "$E_CMDOUTPUT"
+    fi
+    status_obj 0 "Ok" "Updated $behind commit(s)"
+    return 0
+}
+
+# cmd_folder_update -- bring one checkout up to date, if it is behind.
+cmd_folder_update() {
+    local args=()
+    FU_DRY=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_folder_update; exit 0 ;;
+            --dry-run) FU_DRY=1; shift ;;
             --output-format)
                 [ $# -ge 2 ] || die "$E_ARGS" "--output-format requires a value"
                 output_format_set "$2"; shift 2 ;;
@@ -1886,25 +2737,247 @@ cmd_folder_status() {
     precheck_common
     precheck_store
 
-    local path status code=0
-    path="$(folder_resolve "${args[0]:-}")"
+    local loc st rc=0
+    loc="$(folder_resolve "${args[0]:-}")"
+    st="$(fu_run "$loc")" || rc=$?
+    render_output "$(jq -nc --argjson s "$st" '{status: $s}')"
+    exit "$rc"
+}
 
-    # ordered, first failure wins
-    if [ ! -d "$path" ]; then
-        status="$(status_obj "$E_NOTFOUND" "Not Found" "Folder doesnt exist")"
-        code=1
-    elif ! folder_is_git "$path"; then
-        status="$(status_obj "$E_GITFOLDER" "Not Git Folder" "Folder is not a git repo")"
-        code=1
-    elif [ -z "$(repos_find_by_location "$path")" ]; then
-        status="$(status_obj "$E_NOTFOUND" "Not Tracked" "Git repo is not tracked")"
-        code=1
-    else
-        status="$(status_obj 0 "Ok")"
+cmd_folder_repo() {
+    local args=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_folder_repo; exit 0 ;;
+            --output-format)
+                [ $# -ge 2 ] || die "$E_ARGS" "--output-format requires a value"
+                output_format_set "$2"; shift 2 ;;
+            --output-format=*) output_format_set "${1#*=}"; shift ;;
+            --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    [ "${#args[@]}" -le 1 ] || die "$E_ARGS" "unexpected argument: ${args[1]}"
+
+    precheck_common
+    precheck_store
+
+    local loc out rc
+    loc="$(folder_resolve "${args[0]:-}")"
+    out="$(fv_run "$loc")" || true
+    rc="$(fv_exit_code "$out")"
+
+    # 5 and 6 are the codes that mean there is no repo to name: the folder is
+    # missing, is not a work tree, or no record claims it. An origin mismatch
+    # (8) still resolves -- the record is identifiable, it merely disagrees,
+    # and `repo validate` is exactly where a caller would pipe it next.
+    case "$rc" in
+        5|6) exit "$rc" ;;
+    esac
+
+    local id
+    id="$(repos_find_by_location "$loc")"
+    render_output "$(jq -nc --arg id "$id" '{id: $id}')" "$PLAIN_ID"
+}
+
+# fs_update_available <loc> <branch> -- prints true/false; returns 1 if it
+# could not be determined.
+#
+# ls-remote, not fetch: a reporting command must not mutate .git. The
+# trade-off is that this compares the remote branch head against local HEAD
+# and so answers "different", not "behind/ahead/diverged" -- which is enough
+# here. folder update does the fetch and gets the exact answer.
+fs_update_available() {
+    local loc="$1" branch="$2" remote rhead lhead
+    remote="$(run_bounded git -C "$loc" ls-remote origin "refs/heads/$branch" 2>/dev/null)" || return 1
+    [ -n "$remote" ] || return 1
+    rhead="${remote%%$'\t'*}"
+    lhead="$(git -C "$loc" rev-parse HEAD 2>/dev/null)" || return 1
+    [ -n "$lhead" ] || return 1
+    if [ "$rhead" = "$lhead" ]; then printf 'false'; else printf 'true'; fi
+}
+
+# fs_images <loc> -- the live compose images as a JSON array.
+#
+# Enumerated from the compose CONFIG rather than from running containers, so
+# a declared-but-stopped service still appears; ps only supplies the
+# service-to-container mapping. That is also why `built` is trustworthy here
+# and is not offered by repo status: only the config knows about `build:`.
+#
+# The two ids compared are IMAGE IDS on both sides -- .Id against a
+# container's .Image -- never a repo digest. See the docker layer.
+fs_images() {
+    local loc="$1" cfg ps_json out='[]'
+    cfg="$(images_compose_config_json "$loc" 2>/dev/null)" || { printf '[]'; return 1; }
+    ps_json="$(compose_ps_json "$loc" 2>/dev/null)" || ps_json='[]'
+
+    local svc built ref cid local_id running_id st
+    while IFS=$'\t' read -r svc built ref; do
+        [ -n "$svc" ] || continue
+
+        # A build-only service has no image in the config; compose names the
+        # built image <project>-<service>, and ps is where that name shows up.
+        if [ -z "$ref" ]; then
+            ref="$(jq -r --arg s "$svc" 'map(select(.Service == $s)) | .[0].Image // ""' <<< "$ps_json")"
+        fi
+        cid="$(jq -r --arg s "$svc" \
+            'map(select(.Service == $s and .State == "running")) | .[0].ID // ""' <<< "$ps_json")"
+
+        local_id=""
+        running_id=""
+        if [ -n "$ref" ]; then
+            local_id="$(image_id_local "$ref" 2>/dev/null)" || local_id=""
+            if [ -n "$local_id" ]; then
+                st="$(status_obj 0 "Ok")"
+            else
+                st="$(status_obj "$E_IMAGE" "Failed" "Image '$ref' is not present locally")"
+            fi
+        else
+            st="$(status_obj 0 "Skipped" "Service '$svc' has no image yet")"
+        fi
+        [ -z "$cid" ] || running_id="$(container_image_id "$cid" 2>/dev/null)" || running_id=""
+
+        out="$(jq -c --arg id "$ref" --arg name "$(image_ref_repo "${ref:-}")" \
+            --argjson built "$built" --argjson st "$st" \
+            --arg local_id "$local_id" --arg running_id "$running_id" \
+            '. + [{
+                id: (if $id == "" then null else $id end),
+                name: (if $id == "" then null else $name end),
+                status: $st,
+                built: ($built == 1),
+                local_image_id: (if $local_id == "" then null else $local_id end),
+                running_image_id: (if $running_id == "" then null else $running_id end),
+                restart_pending: (
+                    if $local_id == "" or $running_id == "" then false
+                    else $local_id != $running_id end)
+            }]' <<< "$out")"
+    done < <(jq -r '.services // {} | to_entries[]
+                    | [.key, (if .value.build then 1 else 0 end), (.value.image // "")] | @tsv' <<< "$cfg")
+
+    printf '%s' "$out"
+}
+
+# fs_emit <path> <status> <update_available> <docker_running> <images> <code>
+#
+# Prints the document and RETURNS the code -- it does not exit, because
+# repo status nests one of these per location and cannot afford a worker that
+# leaves. fs_run is where the return becomes the caller's.
+fs_emit() {
+    jq -nc --arg p "$1" --argjson s "$2" --argjson u "$3" \
+        --argjson d "$4" --argjson i "$5" \
+        '{path: $p, status: $s, update_available: $u, docker_running: $d, images: $i}'
+    return "$6"
+}
+
+# fs_run <loc> -- the folder status document; returns its code.
+fs_run() {
+    local loc="$1" fvout rc
+
+    # 1. Nothing else can be assessed without a git work tree, so 5 and 6 end
+    #    the run with the remaining fields defaulted.
+    fvout="$(fv_run "$loc")" || true
+    rc="$(fv_exit_code "$fvout")"
+    case "$rc" in
+        5|6)
+            fs_emit "$loc" "$(jq -c '[.location, .worktree, .tracking, .origin]
+                                     | map(select(.status == "Failed")) | .[0]' <<< "$fvout")" \
+                    null null '[]' "$rc"
+            return ;;
+    esac
+
+    # 2. A network fault must not hide the container state, so this failure is
+    #    RECORDED and the run continues. Its code outranks whatever the later
+    #    steps report.
+    local tracked_rc=0 update_available=null branch
+    branch="$(adopt_current_branch "$loc" 2>/dev/null)" || branch=""
+    if [ -z "$branch" ]; then
+        tracked_rc="$E_CMDOUTPUT"
+    elif ! update_available="$(fs_update_available "$loc" "$branch")"; then
+        tracked_rc="$E_CMDOUTPUT"
+        update_available=null
     fi
 
-    render_output "$(jq -nc --argjson s "$status" '{status: $s}')"
-    exit "$code"
+    # 3. Not a compose project: docker is irrelevant to this folder and is
+    #    never asked about. docker_running stays NULL -- "does not apply" is a
+    #    different answer from "nothing is running".
+    if ! images_is_compose_project "$loc"; then
+        if [ "$tracked_rc" -ne 0 ]; then
+            fs_emit "$loc" "$(status_obj "$tracked_rc" "Failed" "Cannot determine whether the remote has updates")" \
+                    "$update_available" null '[]' "$tracked_rc"
+            return
+        fi
+        fs_emit "$loc" "$(status_obj 0 "Ok" "Not a docker compose project")" \
+                "$update_available" null '[]' 0
+        return
+    fi
+
+    # 4. A compose project we cannot ask about.
+    if ! compose_available || ! docker_daemon_ok; then
+        local code="$tracked_rc"
+        [ "$code" -ne 0 ] || code="$E_PRECHECK"
+        fs_emit "$loc" "$(status_obj "$E_PRECHECK" "Failed" "docker is not available")" \
+                "$update_available" null '[]' "$code"
+        return
+    fi
+
+    # 5. Container state and the live image list.
+    local running=false cr=0
+    compose_running "$loc" || cr=$?
+    case "$cr" in
+        0) running=true ;;
+        1) running=false ;;
+        *) fs_emit "$loc" "$(status_obj "$E_PRECHECK" "Failed" "cannot determine whether the project is running")" \
+                   "$update_available" null '[]' "$E_PRECHECK"
+           return ;;
+    esac
+
+    local images
+    images="$(fs_images "$loc")" || images='[]'
+
+    if [ "$tracked_rc" -ne 0 ]; then
+        fs_emit "$loc" "$(status_obj "$tracked_rc" "Failed" "Cannot determine whether the remote has updates")" \
+                "$update_available" "$running" "$images" "$tracked_rc"
+        return
+    fi
+    fs_emit "$loc" "$(status_obj 0 "Ok")" "$update_available" "$running" "$images" 0
+}
+
+cmd_folder_status() {
+    local args=()
+    local timeout="$STATUS_TIMEOUT_DEFAULT"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_folder_status; exit 0 ;;
+            -t|--timeout)
+                [ $# -ge 2 ] || die "$E_ARGS" "--timeout requires a value"
+                timeout="$2"; shift 2 ;;
+            --timeout=*) timeout="${1#*=}"; shift ;;
+            --output-format)
+                [ $# -ge 2 ] || die "$E_ARGS" "--output-format requires a value"
+                output_format_set "$2"; shift 2 ;;
+            --output-format=*) output_format_set "${1#*=}"; shift ;;
+            --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    [ "${#args[@]}" -le 1 ] || die "$E_ARGS" "unexpected argument: ${args[1]}"
+    timeout_validate "$timeout" "--timeout"
+
+    precheck_common
+    precheck_store
+
+    # Only when nobody set one already: repo status passes its per-repo
+    # deadline down, and that must OVERRIDE this default rather than stacking
+    # a second budget on top of it.
+    [ "$DEADLINE" -gt 0 ] || deadline_set "$timeout"
+
+    local loc doc rc=0
+    loc="$(folder_resolve "${args[0]:-}")"
+    doc="$(fs_run "$loc")" || rc=$?
+    render_output "$doc"
+    exit "$rc"
 }
 
 cmd_validate() {
@@ -1957,7 +3030,7 @@ cmd_repo_validate() {
     precheck_common
     precheck_store
 
-    resolve_target "${args[0]}"
+    resolve_repo_target "${args[0]}" "folder validate"
     [ "$TARGET_KIND" != "path" ] \
         || die "$E_ARGS" "repo validate takes a repo key or full repo name, not a path (use 'folder validate')"
     repos_resolve
@@ -1968,11 +3041,25 @@ cmd_repo_validate() {
     exit "$rc"
 }
 
+# fv_check_type_set <value> -- validate and assign, for the flag loop
+fv_check_type_set() {
+    local c
+    for c in "${FV_CHECKS[@]}"; do
+        if [ "$1" = "$c" ]; then CHECK_TYPE="$1"; return 0; fi
+    done
+    die "$E_ARGS" "invalid --check-type: '$1' (expected $(fv_checks_list))"
+}
+
 cmd_folder_validate() {
     local args=()
+    local CHECK_TYPE=""
     while [ $# -gt 0 ]; do
         case "$1" in
             -h|--help) help_folder_validate; exit 0 ;;
+            -c|--check-type)
+                [ $# -ge 2 ] || die "$E_ARGS" "--check-type requires a value"
+                fv_check_type_set "$2"; shift 2 ;;
+            --check-type=*) fv_check_type_set "${1#*=}"; shift ;;
             --output-format)
                 [ $# -ge 2 ] || die "$E_ARGS" "--output-format requires a value"
                 output_format_set "$2"; shift 2 ;;
@@ -1987,9 +3074,18 @@ cmd_folder_validate() {
     precheck_common
     precheck_store
 
-    local loc out rc=0
+    local loc out rc
     loc="$(folder_resolve "${args[0]:-}")"
-    out="$(fv_run "$loc")" || rc=1
+
+    if [ -n "$CHECK_TYPE" ]; then
+        # single mode: one bare status object, and its own code as the exit
+        out="$(fv_check "$CHECK_TYPE" "$loc")"
+        rc="$(jq -r 'if .status == "Failed" then .code else 0 end' <<< "$out")"
+    else
+        out="$(fv_run "$loc")" || true
+        rc="$(fv_exit_code "$out")"
+    fi
+
     render_output "$out"
     exit "$rc"
 }
@@ -2022,11 +3118,11 @@ cmd_folder_adopt() {
 
     local branch url
     branch="$(adopt_current_branch "$loc")" \
-        || die "$E_GITOUTPUT" "cannot determine the current branch of '$loc' (detached HEAD?)"
+        || die "$E_CMDOUTPUT" "cannot determine the current branch of '$loc' (detached HEAD?)"
     url="$(adopt_read_origin "$loc")" \
-        || die "$E_GITOUTPUT" "cannot read the 'origin' remote of '$loc'"
+        || die "$E_CMDOUTPUT" "cannot read the 'origin' remote of '$loc'"
     adopt_parse_origin "$url" \
-        || die "$E_GITOUTPUT" "unsupported origin URL: '$url'"
+        || die "$E_CMDOUTPUT" "unsupported origin URL: '$url'"
 
     # Only the id is validated. org, name and branch are recorded as they are:
     # adoption describes a repo that already exists, so rejecting, say, a
@@ -2119,6 +3215,53 @@ cmd_folder_adopt() {
     info "adopted '$repo_id' ($ORIGIN_VISIBILITY, foreign=$foreign) at $loc"
 }
 
+# cmd_repo_folders -- a record's locations, exactly as stored.
+#
+# Deliberately does no checking: whether a location still exists is
+# `folder validate`'s question, and pruning dead ones is `validate --fix`'s.
+# This is the plumbing the two fan-out commands walk, so it must report what
+# the store SAYS rather than what the disk currently agrees with.
+cmd_repo_folders() {
+    local args=() all=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) help_repo_folders; exit 0 ;;
+            -a|--all) all=1; shift ;;
+            --output-format)
+                [ $# -ge 2 ] || die "$E_ARGS" "--output-format requires a value"
+                output_format_set "$2"; shift 2 ;;
+            --output-format=*) output_format_set "${1#*=}"; shift ;;
+            --) shift; while [ $# -gt 0 ]; do args+=("$1"); shift; done ;;
+            -*) die "$E_ARGS" "unknown flag: $1" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    [ "${#args[@]}" -le 1 ] || die "$E_ARGS" "unexpected argument: ${args[1]}"
+
+    precheck_common
+    precheck_store
+
+    local doc
+    if [ "$all" -eq 1 ]; then
+        [ "${#args[@]}" -eq 0 ] || die "$E_ARGS" "--all takes no repo argument"
+        # to_entries keeps the store's key order, and locations[] keeps
+        # theirs, so the listing is stable between runs.
+        doc="$(jq -c '[.repositories | to_entries[] | .key as $k
+                       | .value.locations[]? | {id: $k, path: .path}]' "$REPOS_FILE")"
+    else
+        [ "${#args[@]}" -eq 1 ] || die "$E_ARGS" "this command needs a repo key or full repo name, or --all"
+        resolve_repo_target "${args[0]}"
+        repos_resolve
+        doc="$(jq -c --arg k "$REC_KEY" '[.repositories[$k].locations[]?
+                       | {id: $k, path: .path}]' "$REPOS_FILE")"
+    fi
+
+    # An existing repo with no locations is an empty array and exit 0.
+    # Emptiness is only an error where a caller was about to act on the list,
+    # which is repo update's and repo redeploy's business, not this one's.
+    render_output "$doc" "$PLAIN_ID_PATH"
+}
+
 cmd_repo_list() {
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -2150,7 +3293,7 @@ cmd_repo_keys() {
 }
 
 # ---------------------------------------------------------------------------
-# 15. Help screens
+# 17. Help screens
 # ---------------------------------------------------------------------------
 
 help_main() {
@@ -2162,28 +3305,41 @@ Usage:
 
   git-utils repo add <org/name[/branch]> [-n <key>]
   git-utils repo clone <repo> [<folder_name>]
-  git-utils repo update [<repo_or_path>] [-a]
-  git-utils repo delete [<repo_or_path>] [-f]
+  git-utils repo update <repo> [--dry-run]
+  git-utils repo redeploy <repo> [-i] [-t <s>] [--dry-run]
+  git-utils repo status (<repo> | -a) [-i] [-t <s>]
+  git-utils repo delete <repo> [-f] [--with-folders]
+  git-utils repo folders (<repo> | -a)
   git-utils repo list
   git-utils repo keys
-  git-utils repo info [<repo_or_path>]
+  git-utils repo info <repo>
   git-utils repo validate <repo> [--fix]
 
+  git-utils folder repo [<path>]
+  git-utils folder update [<path>] [--dry-run]
+  git-utils folder redeploy [<path>] [-i] [-t <s>] [--dry-run]
   git-utils folder status [<path>]
-  git-utils folder validate [<path>]
+  git-utils folder validate [<path>] [-c <check>]
   git-utils folder adopt [<path>] [-n <id>]
 
   git-utils validate [--fix]
 
-Repo commands accept a repo key, a full org/name/branch, or the path of a
-cloned folder. Folder commands always take a filesystem path.
+Repo commands take a repo key or a full org/name/branch -- never a path.
+Folder commands take a filesystem path. `git-utils folder repo <path>`
+bridges the two:
 
-repo info, repo validate, folder status, folder validate and validate
-accept --output-format json|text|yaml (default text).
+  git-utils repo info "$(git-utils folder repo)"
+
+Every command that emits a document accepts
+--output-format json|text|yaml|plain (default plain).
+
+`plain` is line-oriented output for pipes. Where a command defines no line
+form it is identical to `text`.
 
 Aliases:
-  git-utils repos ...   same as 'git-utils repo ...'
-  git-utils update ...  same as 'git-utils repo update ...'
+  git-utils repos ...              same as 'git-utils repo ...'
+  git-utils update ...             same as 'git-utils folder update ...'
+  git-utils folder repository ...  same as 'git-utils folder repo ...'
 
 There is no 'folders' alias; the folder group is spelled out in full.
 
@@ -2194,7 +3350,7 @@ EOF
 help_repo_info() {
     cat << 'EOF'
 git-utils repo info [<repo_key_or_full_name_or_path>]
-                    [--output-format json|text|yaml]
+                    [--output-format json|text|yaml|plain]
 
 Prints one repo record, with its id as the first field. With no argument
 the current folder is used.
@@ -2207,7 +3363,7 @@ EOF
 
 help_validate() {
     cat << 'EOF'
-git-utils validate [--fix] [--output-format json|text|yaml]
+git-utils validate [--fix] [--output-format json|text|yaml|plain]
 
 Checks the whole store: that it parses, that it is in a layout this
 script understands, that its schema version is one it knows, and then
@@ -2232,7 +3388,7 @@ EOF
 help_repo_validate() {
     cat << 'EOF'
 git-utils repo validate <repo_key_or_full_name> [--fix]
-                        [--output-format json|text|yaml]
+                        [--output-format json|text|yaml|plain]
 
 Checks one repo record. Prints the record with a 'checks' object added:
 
@@ -2258,20 +3414,27 @@ EOF
 
 help_folder_validate() {
     cat << 'EOF'
-git-utils folder validate [<path>] [--output-format json|text|yaml]
+git-utils folder validate [<path>] [-c|--check-type <check>]
+                          [--output-format json|text|yaml|plain]
 
 Checks one cloned folder against the store. With no argument the current
 folder is used. There is no --fix; nothing is repaired or written.
 
-  location  the folder exists
-  tracking  the folder is in some record's locations
-  origin    the folder's origin remote and current branch match the record
+  location  the folder exists                                    (5)
+  worktree  the folder is a git work tree                        (6)
+  tracking  the folder is in some record's locations             (5)
+  origin    its origin remote and branch match the record        (8)
+
+With --check-type only that one check runs and the output is a single
+status object rather than four.
 
 A check reads 'Skipped' when an earlier one already explains the problem,
-so a single fault is not reported twice.
+so a single fault is not reported twice. That holds in single mode too:
+--check-type origin on a folder that does not exist is Skipped, not a
+manufactured failure.
 
-Exits 0 when every check passes, 1 otherwise. The per-check codes appear
-in the output, not in the exit code.
+Exits with the first failed check's own code, in the order above, or 0
+when every check passes.
 EOF
 }
 
@@ -2302,22 +3465,111 @@ record, 10 unusable origin or detached HEAD, 3 deploy keys not found.
 EOF
 }
 
+help_folder_redeploy() {
+    cat << 'EOF'
+git-utils folder redeploy [<path>] [-i|--pull-images] [-t|--pull-timeout <s>]
+                          [--dry-run] [--output-format json|text|yaml|plain]
+
+Rebuilds and restarts one docker compose project. With no argument the
+current folder is used.
+
+  1. the folder exists                                          (5)
+  2. it is a compose project                                    (14)
+  3. docker and its daemon are available                        (1)
+  4. compose has at least one running container                 (16)
+  5. docker compose [pull] && build && up -d
+
+A STOPPED stack is never started: redeploy refreshes what is already
+running, and bringing something up is your decision, not this command's.
+
+-i pulls images first, with --ignore-pull-failures. Only the pull is
+bounded by --pull-timeout (default 300); build and up -d are unbounded,
+because a build has no meaningful upper bound and killing one midway is
+worse than waiting. A pull killed by the timeout exits 18, not 10.
+
+-i and --dry-run cannot be combined: nothing is pulled in a dry run.
+
+Compose profiles are not handled -- up -d uses the default profile set, so
+profile services that are running may be left untouched.
+EOF
+}
+
+help_folder_update() {
+    cat << 'EOF'
+git-utils folder update [<path>] [--dry-run]
+                        [--output-format json|text|yaml|plain]
+
+Updates one checkout, but only when it is actually behind its remote. With
+no argument the current folder is used. Also available as 'git-utils update'.
+
+  1. folder validate; a folder that does not check out is not reset
+  2. git fetch origin
+  3. if the remote has commits this checkout does not:
+     git reset --hard origin/<branch> && git clean -fd
+
+The branch comes from the checkout, which folder validate has already
+reconciled with the record.
+
+--dry-run stops after step 3's decision. It still fetches, so it writes to
+.git, but never touches the working tree.
+
+Exits 0 when it updated (or would, under --dry-run), 22 when already up to
+date, 10 on a git failure, or the failing check's code from folder validate.
+
+Note that 'reset --hard' and 'clean -fd' discard local commits and untracked
+files in the checkout. That is the intended behaviour for a deployment
+target; it is not a merge.
+EOF
+}
+
+help_folder_repo() {
+    cat << 'EOF'
+git-utils folder repo [<path>] [--output-format json|text|yaml|plain]
+
+Prints the id of the repo that owns a folder. With no argument the current
+folder is used.
+
+Repo commands take a repo key or full name, never a path, so this is how a
+checkout reaches them:
+
+  git-utils repo info "$(git-utils folder repo)"
+  git-utils repo validate "$(git-utils folder repo /srv/app)"
+
+Exits 5 when the folder does not exist or no record claims it, 6 when it is
+not a git work tree, and 0 otherwise -- including when the folder's origin
+disagrees with its record, since the repo is still identifiable.
+EOF
+}
+
 help_folder_status() {
     cat << 'EOF'
-git-utils folder status [<path>] [--output-format json|text|yaml]
+git-utils folder status [<path>] [-t|--timeout <s>]
+                        [--output-format json|text|yaml|plain]
 
-Reports whether a folder is a tracked git repo. With no argument the
-current folder is used. The argument is always a filesystem path, never
-a repo key.
+Reports one folder: whether its remote has anything new, whether its compose
+containers are running, and how the running containers compare with the
+images on disk. With no argument the current folder is used.
 
-Checks run in order and stop at the first failure:
+  update_available   true/false, or null when it could not be determined
+  docker_running     true/false, or null when this is not a compose project
+  images             one entry per compose service
 
-  code 5  Not Found        the folder does not exist
-  code 6  Not Git Folder   the folder is not a git repo
-  code 5  Not Tracked      the git repo is not in the store
+Nothing is changed. update_available uses `git ls-remote`, not a fetch, so
+.git is never written to -- the trade-off is that it answers "different",
+not "behind or ahead". folder update does the fetch and gets the exact
+answer.
 
-Exits 0 when the folder is a tracked git repo, 1 otherwise. The status
-code above appears in the output, not in the exit code.
+A remote that cannot be reached does NOT hide the container state: the
+failure is recorded, the run continues, and its code outranks the rest.
+
+restart_pending compares IMAGE IDS -- the image a container is running
+against the image its reference resolves to now -- so it means "pulled or
+rebuilt but not restarted". That is a different question from repo status's
+pull_available, which compares registry digests.
+
+Exits 5 or 6 when the folder is not a usable work tree, 10 when git could
+not be asked, 1 when docker could not be asked, and 0 otherwise --
+including when the folder is simply not a compose project.
 EOF
 }
 
@@ -2345,15 +3597,22 @@ EOF
 
 help_repo_delete() {
     cat << 'EOF'
-git-utils repo delete [<repo_key_or_full_name_or_path>] [-f|--force]
+git-utils repo delete <repo_key_or_full_name> [-f|--force] [--with-folders]
 
-Removes a tracked repo, its deploy key, and (if a path/current folder
-was given) the cloned folder itself. With no argument, the current
-folder is used.
+Removes a tracked repo and its deploy key. The checkouts are left alone
+unless --with-folders is given, in which case every recorded location is
+removed from disk as well.
+
+A path is not accepted; use: git-utils repo delete "$(git-utils folder repo)"
+
+--with-folders removes ALL of the record's locations, not one. Only
+recorded locations are ever touched, / and $HOME are refused outright, and
+if any location has untracked or ignored files you are asked once, naming
+them -- declining deletes nothing at all, not even the record.
 
 Key material is only removed when git-utils created it. An adopted
 (foreign) repo keeps its key pair and its ~/.ssh/config block, and a
-public repo has none -- in both cases only the record and the folder go.
+public repo has none -- in both cases only the record goes.
 EOF
 }
 
@@ -2367,13 +3626,110 @@ folder to the repo name.
 EOF
 }
 
+help_repo_status() {
+    cat << 'EOF'
+git-utils repo status (<repo_key_or_full_name> | -a|--all)
+                      [-i|--check-images] [-t|--timeout <s>]
+                      [--output-format json|text|yaml|plain]
+
+Reports a repo: its record, one folder status per location, and its images.
+A single repo is a single object; --all is an array.
+
+  -i   also ask each image's registry for its current digest. Needs the
+       docker buildx plugin; without -i no registry call is made at all.
+
+Status is the first of: the record's own fields/keys/ssh checks, then any
+location with a non-zero code, then any image with a non-zero status.
+
+--timeout bounds ONE repo, not the whole command, so under --all the
+worst case is repos x timeout. Nothing is ever killed from outside: work
+that did not finish is represented in the document rather than missing from
+it, and a timed-out check is Failed -- an unknown reported as healthy is the
+failure this command exists to prevent.
+
+pull_available compares REGISTRY digests: is there something newer to pull.
+That is a different question from folder status's restart_pending, which
+compares image ids to ask whether a container is running what is on disk.
+
+There is no `built` field here. It cannot be derived from the store, and a
+field that is right most of the time is worse than no field.
+
+Exits with the repo's status code for a single repo; under --all, 1 if any
+repo has a non-zero status, 5 if no repositories are registered, else 0.
+EOF
+}
+
+
+help_repo_redeploy() {
+    cat << 'EOF'
+git-utils repo redeploy <repo_key_or_full_name> [-i|--pull-images]
+                        [-t|--pull-timeout <s>] [--dry-run]
+                        [--output-format json|text|yaml|plain]
+
+Runs folder redeploy on every location of one record. A path is not
+accepted; to redeploy a single checkout use:
+
+  git-utils folder redeploy <path>
+
+Every location is processed even after one fails. A location that is not a
+compose project (14) or whose stack is stopped (16) is SKIPPED, not failed:
+neither is a fault, and a repo that mixes a compose deployment with a plain
+checkout should not report failure for the plain one.
+
+  0   at least one location was redeployed, none failed
+  14  every location was skipped, the first because it is not a compose
+      project
+  16  every location was skipped, the first because nothing is running
+  3   at least one location failed
+  5   the record has no locations
+
+--pull-timeout applies PER folder, not as a budget shared across them.
+
+Unlike repo update this does not check the record's fields, keys or ssh
+config: redeploy touches containers, not git or key material.
+EOF
+}
+
 help_repo_update() {
     cat << 'EOF'
-git-utils repo update [<repo_key_or_full_name_or_path>] [-a|--all]
+git-utils repo update <repo_key_or_full_name> [--dry-run]
+                      [--output-format json|text|yaml|plain]
 
-Fetches and hard-resets a tracked repo to its remote branch. With no
-argument, the current folder is used. With a path and without --all,
-only that location is updated; --all updates every tracked location.
+Runs folder update on every location of one record. A path is not accepted;
+to update a single checkout use:
+
+  git-utils folder update <path>
+
+Every location is processed even after one fails, so one broken checkout does
+not hide the state of the others.
+
+  0   at least one location updated, none failed
+  22  every location was already up to date
+  3   at least one location failed
+  5   the record has no locations
+      otherwise the failing check's code from repo validate
+
+Images are collected once per run, from the first location that actually
+updated, and never under --dry-run. That write is best-effort: it warns on
+failure and does not change the exit code.
+EOF
+}
+
+help_repo_folders() {
+    cat << 'EOF'
+git-utils repo folders (<repo_key_or_full_name> | -a|--all)
+                       [--output-format json|text|yaml|plain]
+
+Prints a repo's locations, or every repo's, exactly as the store holds them.
+Nothing is checked: use folder validate for whether a location is healthy,
+and validate --fix to prune ones that no longer exist.
+
+The plain form is 'id path', one per line. A repo key cannot contain a
+space but a path can, so split on the FIRST space:
+
+  git-utils repo folders --all | while read -r id path; do ...; done
+
+A repo with no locations prints nothing and exits 0.
 EOF
 }
 
@@ -2394,7 +3750,7 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# 16. Argument router
+# 18. Argument router
 # ---------------------------------------------------------------------------
 
 main() {
@@ -2427,7 +3783,10 @@ main() {
                 add) shift; cmd_repo_add "$@" ;;
                 delete) shift; cmd_repo_delete "$@" ;;
                 clone) shift; cmd_repo_clone "$@" ;;
+                status) shift; cmd_repo_status "$@" ;;
+                redeploy) shift; cmd_repo_redeploy "$@" ;;
                 update) shift; cmd_repo_update "$@" ;;
+                folders) shift; cmd_repo_folders "$@" ;;
                 list) shift; cmd_repo_list "$@" ;;
                 keys) shift; cmd_repo_keys "$@" ;;
                 info) shift; cmd_repo_info "$@" ;;
@@ -2451,6 +3810,9 @@ main() {
                     help_main
                     exit 0
                     ;;
+                redeploy) shift; cmd_folder_redeploy "$@" ;;
+                update) shift; cmd_folder_update "$@" ;;
+                repo|repository) shift; cmd_folder_repo "$@" ;;
                 status) shift; cmd_folder_status "$@" ;;
                 adopt) shift; cmd_folder_adopt "$@" ;;
                 validate) shift; cmd_folder_validate "$@" ;;
@@ -2466,7 +3828,7 @@ main() {
             ;;
         update)
             shift
-            cmd_repo_update "$@"
+            cmd_folder_update "$@"
             ;;
         *)
             help_main
