@@ -45,4 +45,11 @@ if [ -n "${DOCKER_HOME:-}" ]; then
     # List all docker apps
     dls() { ls -1 "$DOCKER_HOME"; }
 
+
+    alias gur='git-utils folder redeploy'
 fi
+
+alias guu='git-utils update'
+
+gucd() {
+}
