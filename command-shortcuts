@@ -44,13 +44,88 @@ if [ -n "${DOCKER_HOME:-}" ]; then
 
     # List all docker apps
     dls() { ls -1 "$DOCKER_HOME"; }
-
-
-    alias gur='git-utils folder redeploy'
 fi
 
-alias guu='git-utils update'
+# --- git-utils -------------------------------------------------------------
+#
+# Guarded like the docker section, so these appear only where the tool they
+# drive is installed. The test is deliberately wider than a bare `command -v`:
+# the PATH export that `system-setup setup` writes is its OWN ~/.bashrc block,
+# and on a host whose shortcuts block was written first that export is sourced
+# after this file. Aliases and functions resolve the command when they are
+# called, not when they are defined, so the question worth asking is whether
+# git-utils is installed at all -- not whether PATH has caught up yet.
+#
+# `folder redeploy` lives here rather than in the docker section above because
+# it drives git-utils; on a folder that is not a compose project git-utils
+# says so itself, with a dedicated exit code.
 
-#gucd() {
-#}
+if command -v git-utils >/dev/null 2>&1 \
+    || [ -x /usr/local/sbin/git-utils ] || [ -x /usr/sbin/git-utils ]; then
 
+    # Everything git-utils can do, two characters shorter.
+    alias gu='git-utils'
+
+    alias guu='git-utils update'
+    alias gur='git-utils folder redeploy'
+
+    # Every tracked location, one path per line and nothing else.
+    guls() {
+      # `repo folders --all` is already the join of `repo list` and
+      # `repo folders`: every repo's locations, store order kept on both
+      # axes, printed as "<key> <path>".
+      local list
+      list="$(git-utils repo folders --all)" || return
+      [ -n "$list" ] || return 0
+      # Drop the key and the single space after it -- and nothing more, since
+      # a path may contain spaces of its own.
+      printf '%s\n' "$list" | sed 's/^[^ ]* //'
+    }
+
+    # Find any repo whose KEY contains $1 and cd into its first location.
+    # eg gucd scrip
+    gucd() {
+      local pattern="${1:-}"
+      if [ -z "$pattern" ]; then
+        echo "usage: gucd <fragment of a repo key>" >&2
+        return 2
+      fi
+
+      # `repo list` prints "<key> <display url>". Only the key is matched, so
+      # the url is read past rather than grepped -- otherwise a fragment like
+      # "main" would hit the branch of every repo at once.
+      local list key matches=""
+      list="$(git-utils repo list)" || return
+      while read -r key _; do
+        [ -n "$key" ] || continue
+        # Quoted, so a key fragment containing * or ? stays literal.
+        case "${key,,}" in
+          *"${pattern,,}"*) matches+="$key"$'\n' ;;
+        esac
+      done <<< "$list"
+
+      if [ -z "$matches" ]; then
+        echo "gucd: no repo key matching '$pattern'" >&2
+        return 1
+      fi
+      matches="${matches%$'\n'}"
+      key="${matches%%$'\n'*}"
+
+      if [ "$(printf '%s\n' "$matches" | wc -l)" -gt 1 ]; then
+        echo "gucd: several repo keys match '$pattern', using $key" >&2
+        printf '%s\n' "$matches" | sed 's/^/  /' >&2
+      fi
+
+      # `repo folders` prints "<key> <path>" per location in stored order. A
+      # path may contain spaces, so split on the FIRST space and nothing else.
+      local folders first
+      folders="$(git-utils repo folders "$key")" || return
+      if [ -z "$folders" ]; then
+        echo "gucd: $key has no locations" >&2
+        return 1
+      fi
+      first="${folders%%$'\n'*}"
+
+      cd "${first#* }" || return
+    }
+fi
