@@ -68,6 +68,7 @@ if command -v git-utils >/dev/null 2>&1 \
 
     alias guu='git-utils update'
     alias gur='git-utils folder redeploy'
+    alias guur='git-utils update && git-utils folder redeploy'
 
     # Every tracked location, one path per line and nothing else.
     guls() {
