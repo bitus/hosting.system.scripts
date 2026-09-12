@@ -51,5 +51,6 @@ fi
 
 alias guu='git-utils update'
 
-gucd() {
-}
+#gucd() {
+#}
+
